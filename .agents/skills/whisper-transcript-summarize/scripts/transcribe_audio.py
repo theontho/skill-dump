@@ -335,7 +335,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.output_dir, mode=0o700, exist_ok=True)
     whisper_bin = detect_whisper_binary(args.whisper_bin)
     if whisper_bin is None:
         print(
