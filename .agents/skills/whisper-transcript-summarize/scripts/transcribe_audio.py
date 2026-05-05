@@ -30,7 +30,7 @@ _BRACKET_TIMESTAMP_RE = re.compile(
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SPEAKER_LABEL_RE = re.compile(
     r"^\s*(?:\[?\s*(speaker|spk|voice)[ _-]*(\d{1,2})\s*\]?|"
-    r"\[?\s*(male|female|man|woman)[ _-]*(speaker)?[ _-]*(\d{1,2})?\s*\]?)"
+    r"\[?\s*(female|male|woman|man)[ _-]*(speaker)?[ _-]*(\d{1,2})?\s*\]?)"
     r"\s*[:\-]\s*(.*)$",
     re.IGNORECASE,
 )
