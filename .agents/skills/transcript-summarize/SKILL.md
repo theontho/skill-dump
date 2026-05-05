@@ -24,15 +24,17 @@ Download, clean, and summarise videos from any URL supported by yt-dlp (YouTube,
 Run the helper script, passing the video URL(s):
 
 ```bash
-python .agents/skills/transcript-summarize/scripts/get_transcript.py <URL> [<URL> ...] --output-dir transcripts/
+python .agents/skills/transcript-summarize/scripts/get_transcript.py <URL> [<URL> ...] --output-dir transcripts/ --sub-langs en.*,en
 ```
 
 The script will:
 - Download subtitles (manual first, auto-generated as fallback) via `yt-dlp`
 - Convert SRT/VTT to plain text, removing timestamps and HTML tags
 - Deduplicate rolling-caption repeats
-- Insert blank lines before `>>` speaker-change indicators
+- Replace leading `>` / `>>` speaker-change indicators with `>[SPEAKER CHANGE]>` and insert blank lines before speaker changes
 - Save each result as `<VideoTitle>.txt` in `--output-dir`
+
+**Subtitle language rule:** Default to English subtitles (`--sub-langs en.*,en`). If the user explicitly asks for another language, or the user's request is written in another language, use that language's yt-dlp subtitle code instead (for example `--sub-langs es.*,es` for Spanish or `--sub-langs fr.*,fr` for French).
 
 **Install yt-dlp if missing:**
 ```bash
@@ -66,5 +68,5 @@ Keep the tone neutral and factual. If the transcript is too short or garbled to 
 ## Notes
 
 - Subtitles must exist for the video. Fully audio-only content (no CC) will return an empty transcript.
-- For non-English videos add `--sub-langs <lang>` (e.g. `--sub-langs es` for Spanish).
+- Use English subtitles unless the user specifies another language or asks in another language; then use the language of the request.
 - Multiple URLs can be processed in one call; each produces its own `.txt` file and its own summary.

@@ -5,11 +5,13 @@ Usage:
     python get_transcript.py <url> [<url> ...] [--output-dir DIR]
 
 The script downloads subtitles via yt-dlp, deduplicates rolling-caption SRT/VTT
-entries into clean plain text, adds blank lines before '>>' speaker-change
-indicators, and saves each transcript as <VideoTitle>.txt in the output directory.
+entries into clean plain text, normalizes speaker-change indicators to
+'>[SPEAKER CHANGE]>' with blank-line separation, and saves each transcript as
+<VideoTitle>.txt in the output directory.
 """
 
 import argparse
+import html
 import os
 import re
 import shutil
@@ -67,7 +69,7 @@ _VTT_TIMESTAMP_CLEAN_RE = re.compile(
 
 
 def _strip_tags(text: str) -> str:
-    return _HTML_TAG_RE.sub("", text).strip()
+    return html.unescape(_HTML_TAG_RE.sub("", text)).strip()
 
 
 def parse_srt(content: str) -> list[str]:
@@ -149,19 +151,29 @@ def format_transcript(lines: list[str]) -> str:
     """
     Join lines into a readable transcript.
 
-    Lines starting with '>>' denote a speaker change; a blank line is inserted
-    before each such line (except the very first line) so that speaker turns are
-    visually separated.
+    Lines starting with '>' or '>>' denote a speaker change. They are normalized
+    to '>[SPEAKER CHANGE]>' and a blank line is inserted before each speaker turn
+    (except the very first line) so that speaker turns are visually separated.
     """
     out: list[str] = []
     for line in lines:
-        if line.startswith(">>"):
+        speaker_line = normalize_speaker_change(line)
+        if speaker_line:
             if out:
                 out.append("")      # blank line before each speaker change
-            out.append(line)
+            out.append(speaker_line)
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def normalize_speaker_change(line: str) -> str | None:
+    """Return a normalized speaker-change line, or None for regular text."""
+    if line.startswith(">>"):
+        return ">[SPEAKER CHANGE]>" + line[2:].lstrip()
+    if line.startswith(">"):
+        return ">[SPEAKER CHANGE]>" + line[1:].lstrip()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +195,7 @@ def download_transcript(
     url: str,
     output_dir: str,
     js_runtime: str | None,
+    sub_langs: str,
 ) -> str | None:
     """
     Download, clean, and save a transcript for *url*.
@@ -198,7 +211,7 @@ def download_transcript(
             # Prefer manual subs; fall back to auto-generated
             "--write-subs",
             "--write-auto-subs",
-            "--sub-langs", "en.*,en",
+            "--sub-langs", sub_langs,
             "--sub-format", "srt/vtt/best",
             "--convert-subs", "srt",
             "--output", os.path.join(tmpdir, "%(title)s.%(ext)s"),
@@ -284,6 +297,15 @@ def main() -> None:
         default=".",
         help="Directory to save .txt transcript files (default: current directory).",
     )
+    parser.add_argument(
+        "--sub-langs",
+        default="en.*,en",
+        help=(
+            "Subtitle language selector passed to yt-dlp. Defaults to English "
+            "('en.*,en'). Use the language of the request when the user asks "
+            "in another language or explicitly requests one."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -300,7 +322,7 @@ def main() -> None:
     any_failed = False
     for url in args.urls:
         print(f"\nProcessing: {url}")
-        result = download_transcript(url, args.output_dir, js_runtime)
+        result = download_transcript(url, args.output_dir, js_runtime, args.sub_langs)
         if result is None:
             any_failed = True
 
