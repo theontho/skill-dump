@@ -77,6 +77,20 @@ continuing
             "Speaker 1: Hello\ncontinuing\nSpeaker 2: Reply",
         )
 
+    def test_clean_transcript_reuses_unidentified_gender_labels(self) -> None:
+        raw = """
+Female speaker: First line
+Female speaker: Second line
+Male speaker: Reply
+"""
+
+        self.assertEqual(
+            transcribe_audio.clean_transcript(raw),
+            "Speaker 1 (female): First line\n"
+            "Speaker 1 (female): Second line\n"
+            "Speaker 2 (male): Reply",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

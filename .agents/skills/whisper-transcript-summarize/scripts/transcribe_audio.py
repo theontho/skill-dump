@@ -169,7 +169,7 @@ def _normalize_speaker_label(
     gender: str | None,
     speaker_map: dict[str, int],
 ) -> str:
-    raw_key = raw_id or str(len(speaker_map) + 1)
+    raw_key = raw_id or f"unknown:{gender or 'speaker'}"
     if raw_key not in speaker_map:
         speaker_map[raw_key] = min(len(speaker_map) + 1, SPEAKER_LIMIT)
     label = f"Speaker {speaker_map[raw_key]}"
@@ -297,6 +297,7 @@ def transcribe_url(
         with os.fdopen(output_fd, "w", encoding="utf-8") as fh:
             fh.write(cleaned)
             fh.write("\n")
+        os.chmod(output_path, 0o600)
 
         print(f"Saved: {output_path}")
         return output_path
