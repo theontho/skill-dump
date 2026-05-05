@@ -13,7 +13,7 @@ Download the actual audio stream from URLs supported by `yt-dlp`, transcribe it 
 
 ## When to Use
 
-- User asks to summarise or transcribe a video/audio URL when subtitles are unavailable or should not be trusted
+- User asks to summarize or transcribe a video/audio URL when subtitles are unavailable or should not be trusted
 - User wants an audio-derived transcript rather than platform captions
 - User asks for multilingual or speaker-aware transcription
 - User asks for a summary translated into the language of their request
@@ -100,6 +100,6 @@ Include:
 ## Notes
 
 - Speaker diarization depends on the installed Whisper binary/model. If unsupported, the script still produces a clean transcript without reliable speaker IDs.
-- Do not infer gender from voice unless the transcription/diarization tool explicitly provides a label or the user supplies known speaker metadata. Preserve provided labels, but call them approximate when summarising.
+- Do not infer gender from voice unless the transcription/diarization tool explicitly provides a label or the user supplies known speaker metadata. Preserve provided labels, but call them approximate when summarizing.
 - For long recordings, choose a larger multilingual model for quality and expect longer runtime.
 - Multiple URLs can be processed in one call; each produces its own original-language transcript and summary.

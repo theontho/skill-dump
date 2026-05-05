@@ -164,7 +164,11 @@ def _strip_markup(line: str) -> str:
     return line.strip()
 
 
-def _speaker_name(raw_id: str | None, gender: str | None, speaker_map: dict[str, int]) -> str:
+def _normalize_speaker_label(
+    raw_id: str | None,
+    gender: str | None,
+    speaker_map: dict[str, int],
+) -> str:
     raw_key = raw_id or str(len(speaker_map) + 1)
     if raw_key not in speaker_map:
         speaker_map[raw_key] = min(len(speaker_map) + 1, SPEAKER_LIMIT)
@@ -200,7 +204,7 @@ def clean_transcript(raw_text: str, max_speakers: int = SPEAKER_LIMIT) -> str:
             _, speaker_id, gender_only, _, gender_speaker_id, text = speaker_match.groups()
             speaker_id = speaker_id or gender_speaker_id
             gender = gender_only
-            speaker = _speaker_name(speaker_id, gender, speaker_map)
+            speaker = _normalize_speaker_label(speaker_id, gender, speaker_map)
             text = _SPEAKER_TURN_RE.sub("", text).strip()
             line = f"{speaker}: {text}" if text else f"{speaker}:"
         else:
@@ -288,6 +292,7 @@ def transcribe_url(
             return None
 
         output_path = os.path.join(output_dir, f"{safe_title}.txt")
+        # Transcripts can contain private speech; keep new files readable only by the current user.
         output_fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(output_fd, "w", encoding="utf-8") as fh:
             fh.write(cleaned)
@@ -335,6 +340,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # New transcript directories default to owner-only access because transcripts may contain private speech.
     os.makedirs(args.output_dir, mode=0o700, exist_ok=True)
     whisper_bin = detect_whisper_binary(args.whisper_bin)
     if whisper_bin is None:
