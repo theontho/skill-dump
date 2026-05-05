@@ -23,7 +23,7 @@ SPEAKER_LIMIT = 5
 
 _BAD_FILENAME_CHARS_RE = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
 _SRT_INDEX_RE = re.compile(r"^\d+$")
-_SRT_TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}[,\.]\d{3}\s+-->\s+")
+_SRT_TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s+-->\s+")
 _BRACKET_TIMESTAMP_RE = re.compile(
     r"^\s*\[[0-9:. ,]+(?:-->|-+>)[0-9:. ,]+\]\s*",
 )
@@ -288,8 +288,9 @@ def transcribe_url(
             return None
 
         output_path = os.path.join(output_dir, f"{safe_title}.txt")
-        with open(output_path, "w", encoding="utf-8") as fh:
-            fh.write(cleaned)  # lgtm[py/clear-text-storage-sensitive-data] user-requested transcript export
+        output_fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(output_fd, "w", encoding="utf-8") as fh:
+            fh.write(cleaned)
             fh.write("\n")
 
         print(f"Saved: {output_path}")
