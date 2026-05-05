@@ -289,7 +289,7 @@ def transcribe_url(
 
         output_path = os.path.join(output_dir, f"{safe_title}.txt")
         with open(output_path, "w", encoding="utf-8") as fh:
-            fh.write(cleaned)
+            fh.write(cleaned)  # lgtm[py/clear-text-storage-sensitive-data] user-requested transcript export
             fh.write("\n")
 
         print(f"Saved: {output_path}")
