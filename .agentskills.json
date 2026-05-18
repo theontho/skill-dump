@@ -1,0 +1,43 @@
+{
+  "manifest_version": 1,
+  "package": {
+    "name": "skill-dump",
+    "description": "a dumping ground for various skills I make",
+    "version": "0.1.0",
+    "generated_at": "2026-05-18T14:30:24.061-07:00",
+    "source": "github.com/theontho/skill-dump"
+  },
+  "skills": [
+    {
+      "id": "ghostty-theme-tools",
+      "name": "ghostty-theme-tools",
+      "description": "Transform Ghostty theme colors, apply Ghostty/cmux/Terminal.app light/dark themes, and convert Ghostty themes into VS Code/Cursor/VSCodium color customizations. WHEN: Ghostty theme, VS Code theme from Ghostty, terminal theme, cmux theme, Apple Classic Black, red night tint, color palette transform.",
+      "license": "MIT",
+      "path": "skills/ghostty-theme-tools/SKILL.md",
+      "sha256": "a6bc78de822abc4cbab0f35aed81713e40350209ed5e4dc21f651c41508c2724",
+      "metadata": {
+        "author": "theontho",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "id": "transcript-summarize",
+      "name": "transcript-summarize",
+      "description": "Downloads video transcripts via subtitles using yt-dlp, deduplicates and cleans them into plain-text files, then produces an AI summary of each video. WHEN: \"summarize video\", \"video summary\", \"transcript summary\", \"summarize YouTube\", \"get transcript\", \"video transcript\", \"watch summary\".",
+      "license": "MIT",
+      "path": "skills/transcript-summarize/SKILL.md",
+      "sha256": "57f8c656a07b5b88c57a45d8e5dd9252e03b0b2cc920320364e6dcfcc599bdfb",
+      "metadata": {
+        "author": "theontho",
+        "version": "1.0.0"
+      }
+    },
+    {
+      "id": "web-to-markdown",
+      "name": "web-to-markdown",
+      "description": "High-quality conversion of web pages or mirrored HTML sites to clean Markdown. Use when the user wants to preserve document structure like blockquotes and relative links while stripping boilerplate (nav, scripts, styles).",
+      "path": "skills/web-to-markdown/SKILL.md",
+      "sha256": "bc14c22f2054d07124b8525a6fff10a7f314a8eb91ad112fd62204e0f4760b11"
+    }
+  ]
+}

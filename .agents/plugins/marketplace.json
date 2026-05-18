@@ -1,0 +1,20 @@
+{
+  "name": "theontho-skill-dump",
+  "interface": {
+    "displayName": "theontho/skill-dump"
+  },
+  "plugins": [
+    {
+      "name": "skill-dump",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

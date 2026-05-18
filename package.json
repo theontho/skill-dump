@@ -1,0 +1,17 @@
+{
+  "name": "skill-dump",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A dumping ground for reusable agent skills.",
+  "scripts": {
+    "skills:new": "node scripts/manage-skills.mjs new",
+    "skills:sync": "node scripts/manage-skills.mjs sync",
+    "skills:check": "node scripts/manage-skills.mjs sync --check",
+    "skills:list": "node scripts/manage-skills.mjs list",
+    "skills:discover": "npx skills add . --list --full-depth",
+    "skills:install:claude": "npx skills add . --skill '*' --agent claude-code --full-depth -y",
+    "skills:install:copilot": "npx skills add . --skill '*' --agent github-copilot --full-depth -y",
+    "skills:install:codex": "npx skills add . --skill '*' --agent codex --full-depth -y",
+    "skills:install:all": "npx skills add . --skill '*' --agent '*' --full-depth -y"
+  }
+}
