@@ -390,19 +390,51 @@ def read_settings(path: Path) -> dict[str, object]:
     return settings
 
 
-def build_settings_patch(vscode_theme: dict[str, object], base_theme: str | None) -> dict[str, object]:
-    patch: dict[str, object] = {
-        "workbench.colorCustomizations": vscode_theme["colors"],
-        "editor.tokenColorCustomizations": {
-            "textMateRules": vscode_theme["tokenColors"],
-        },
-        "editor.semanticTokenColorCustomizations": {
-            "enabled": True,
-            "rules": vscode_theme["semanticTokenColors"],
-        },
+def theme_key(theme_name: str) -> str:
+    return f"[{theme_name}]"
+
+
+def build_settings_patch(
+    vscode_theme: dict[str, object],
+    base_theme: str | None,
+    *,
+    theme_scope: str | None = None,
+    preferred_light_theme: str | None = None,
+) -> dict[str, object]:
+    token_customizations = {
+        "textMateRules": vscode_theme["tokenColors"],
     }
+    semantic_customizations = {
+        "enabled": True,
+        "rules": vscode_theme["semanticTokenColors"],
+    }
+
+    if theme_scope:
+        scope = theme_key(theme_scope)
+        patch: dict[str, object] = {
+            "workbench.colorCustomizations": {
+                scope: vscode_theme["colors"],
+            },
+            "editor.tokenColorCustomizations": {
+                scope: token_customizations,
+            },
+            "editor.semanticTokenColorCustomizations": {
+                scope: semantic_customizations,
+            },
+        }
+    else:
+        patch = {
+            "workbench.colorCustomizations": vscode_theme["colors"],
+            "editor.tokenColorCustomizations": token_customizations,
+            "editor.semanticTokenColorCustomizations": semantic_customizations,
+        }
+
     if base_theme is not None:
         patch["workbench.colorTheme"] = base_theme
+        patch["workbench.preferredDarkColorTheme"] = base_theme
+    if preferred_light_theme:
+        patch["window.autoDetectColorScheme"] = True
+        patch["workbench.preferredLightColorTheme"] = preferred_light_theme
     return patch
 
 
@@ -491,6 +523,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--base-theme",
         help="Built-in VS Code theme to use as the base under the customizations. Default: Default Dark Modern.",
     )
+    parser.add_argument(
+        "--theme-scope",
+        help="Theme name to scope color customizations under. Defaults to --base-theme when setting a theme.",
+    )
+    parser.add_argument(
+        "--global-customizations",
+        action="store_true",
+        help="Write customizations globally instead of scoping them to a single theme.",
+    )
+    parser.add_argument(
+        "--preferred-light-theme",
+        help="Set VS Code's preferred light theme and enable automatic color scheme detection.",
+    )
     parser.add_argument("--no-set-theme", action="store_true", help="Do not change workbench.colorTheme.")
     parser.add_argument("--keep-old-extension", action="store_true", help="Do not remove a previously generated local extension.")
     parser.add_argument("--preview", action="store_true", help="Print the settings patch instead of writing settings.json.")
@@ -504,7 +549,13 @@ def main(argv: list[str]) -> int:
     ghostty_theme = parse_ghostty_theme(args.theme)
     vscode_theme = build_vscode_theme(ghostty_theme, theme_name)
     base_theme = None if args.no_set_theme else args.base_theme or default_base_theme(args.app)
-    settings_patch = build_settings_patch(vscode_theme, base_theme)
+    theme_scope = None if args.global_customizations else args.theme_scope or base_theme
+    settings_patch = build_settings_patch(
+        vscode_theme,
+        base_theme,
+        theme_scope=theme_scope,
+        preferred_light_theme=args.preferred_light_theme,
+    )
 
     if args.preview:
         print(json.dumps(settings_patch, indent=2))
@@ -515,6 +566,10 @@ def main(argv: list[str]) -> int:
     print(f"updated {settings_path}")
     if base_theme is not None:
         print(f"base theme {base_theme}")
+    if theme_scope:
+        print(f"theme scope {theme_scope}")
+    if args.preferred_light_theme:
+        print(f"preferred light theme {args.preferred_light_theme}")
 
     if not args.keep_old_extension:
         removed = remove_generated_extension(default_extension_root(args.app), slug)

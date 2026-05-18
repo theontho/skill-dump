@@ -14,7 +14,7 @@
       "description": "Transform Ghostty theme colors, apply Ghostty/cmux/Terminal.app light/dark themes, and convert Ghostty themes into VS Code/Cursor/VSCodium color customizations. WHEN: Ghostty theme, VS Code theme from Ghostty, terminal theme, cmux theme, Apple Classic Black, red night tint, color palette transform.",
       "license": "MIT",
       "path": "skills/ghostty-theme-tools/SKILL.md",
-      "sha256": "a6bc78de822abc4cbab0f35aed81713e40350209ed5e4dc21f651c41508c2724",
+      "sha256": "dfee965451d3d083b3ce6a798e0366a90f8df66a91b856e37ed069024fbd4286",
       "metadata": {
         "author": "theontho",
         "version": "1.0.0"

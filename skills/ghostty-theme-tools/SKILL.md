@@ -66,6 +66,17 @@ python3 .agents/skills/ghostty-theme-tools/scripts/ghostty-theme-to-vscode.py \
 
 Use `--app cursor`, `--app insiders`, or `--app codium` for those editors. Use `--settings PATH` when the user provides a specific settings file. Add `--no-set-theme` to avoid changing `workbench.colorTheme`.
 
+By default, the script scopes generated color customizations to the selected dark base theme so they do not affect light mode. To make VS Code switch to Gruvbox Light when the OS is in light mode:
+
+```bash
+python3 .agents/skills/ghostty-theme-tools/scripts/ghostty-theme-to-vscode.py \
+  ".agents/skills/ghostty-theme-tools/themes/Apple Classic Black" \
+  --app code \
+  --preferred-light-theme "Gruvbox Light Medium"
+```
+
+Use `--global-customizations` only when the custom colors should apply to every VS Code theme.
+
 ### Use the standalone VS Code theme file
 
 Copy or reference:
