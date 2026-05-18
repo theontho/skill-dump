@@ -1,0 +1,11 @@
+{
+  "name": "skill-dump",
+  "description": "Reusable agent skills for transcript summaries, web-to-Markdown conversion, and Ghostty theme tooling.",
+  "version": "0.1.0",
+  "author": {
+    "name": "theontho"
+  },
+  "repository": "https://github.com/theontho/skill-dump",
+  "license": "MIT",
+  "skills": "./skills/"
+}

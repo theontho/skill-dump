@@ -1,0 +1,29 @@
+{
+  "name": "theontho-skill-dump",
+  "owner": {
+    "name": "theontho"
+  },
+  "description": "Marketplace catalog for theontho/skill-dump agent skills.",
+  "version": "0.1.0",
+  "plugins": [
+    {
+      "name": "skill-dump",
+      "source": "./",
+      "description": "Reusable agent skills for transcript summaries, web-to-Markdown conversion, and Ghostty theme tooling.",
+      "version": "0.1.0",
+      "author": {
+        "name": "theontho"
+      },
+      "repository": "https://github.com/theontho/skill-dump",
+      "license": "MIT",
+      "keywords": [
+        "agent-skills",
+        "claude-code",
+        "transcripts",
+        "markdown",
+        "ghostty"
+      ],
+      "category": "productivity"
+    }
+  ]
+}

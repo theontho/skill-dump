@@ -1,0 +1,30 @@
+{
+  "name": "skill-dump",
+  "version": "0.1.0",
+  "description": "Reusable agent skills for transcript summaries, web-to-Markdown conversion, and Ghostty theme tooling.",
+  "author": {
+    "name": "theontho"
+  },
+  "repository": "https://github.com/theontho/skill-dump",
+  "license": "MIT",
+  "keywords": [
+    "agent-skills",
+    "codex",
+    "transcripts",
+    "markdown",
+    "ghostty"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Skill Dump",
+    "shortDescription": "Reusable skills for transcripts, Markdown conversion, and Ghostty themes.",
+    "longDescription": "A small collection of reusable agent skills packaged for Codex.",
+    "developerName": "theontho",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/theontho/skill-dump"
+  }
+}
