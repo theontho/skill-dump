@@ -1,0 +1,27 @@
+palette = 0=#000000
+palette = 1=#da1d04
+palette = 2=#0aa700
+palette = 3=#e1af04
+palette = 4=#884318
+palette = 5=#e32f93
+palette = 6=#10a98f
+palette = 7=#e7b193
+palette = 8=#795d4d
+palette = 9=#ff664f
+palette = 10=#76da4d
+palette = 11=#ffe04f
+palette = 12=#bc5b22
+palette = 13=#ff6ebd
+palette = 14=#7cdcba
+palette = 15=#ffe3bd
+background = #000000
+foreground = #bc7203
+cursor-color = #e7b193
+cursor-text = #a27d68
+selection-background = #785104
+selection-foreground = #7ac402
+
+# Split styling
+unfocused-split-opacity = 0.4
+unfocused-split-fill = #1a0702
+split-divider-color = #5f2f22
