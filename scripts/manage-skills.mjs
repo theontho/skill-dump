@@ -335,9 +335,19 @@ function parseOptions(args) {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--description" || arg === "-d") {
-      options.description = args[++index];
+      const value = args[index + 1];
+      if (!value || value.startsWith("-")) {
+        fail(`Missing value for ${arg}.\n\n${usage()}`);
+      }
+      options.description = value;
+      index += 1;
     } else if (arg === "--license") {
-      options.license = args[++index];
+      const value = args[index + 1];
+      if (!value || value.startsWith("-")) {
+        fail(`Missing value for ${arg}.\n\n${usage()}`);
+      }
+      options.license = value;
+      index += 1;
     } else {
       positional.push(arg);
     }
