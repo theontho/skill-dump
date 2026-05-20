@@ -21,7 +21,13 @@ Download, clean, and summarise videos from any URL supported by yt-dlp (YouTube,
 
 ### 1 — Download and clean the transcript
 
-Run the helper script using `uv`, passing the video URL(s):
+You can use the convenience script at the root of the skill:
+
+```bash
+/Users/mac/.gemini/skills/transcript-summarize/get_transcript.sh <URL> [<URL> ...] --output-dir transcripts/ --sub-langs en.*,en
+```
+
+Alternatively, run the helper script directly using `uv`:
 
 ```bash
 uv run --project /Users/mac/.gemini/skills/transcript-summarize /Users/mac/.gemini/skills/transcript-summarize/scripts/get_transcript.py <URL> [<URL> ...] --output-dir transcripts/ --sub-langs en.*,en
