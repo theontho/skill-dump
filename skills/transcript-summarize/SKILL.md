@@ -21,25 +21,34 @@ Download, clean, and summarise videos from any URL supported by yt-dlp (YouTube,
 
 ### 1 — Download and clean the transcript
 
-Run the helper script, passing the video URL(s):
+Run the helper script using `uv`, passing the video URL(s):
 
 ```bash
-python .agents/skills/transcript-summarize/scripts/get_transcript.py <URL> [<URL> ...] --output-dir transcripts/ --sub-langs en.*,en
+uv run --project /Users/mac/.gemini/skills/transcript-summarize /Users/mac/.gemini/skills/transcript-summarize/scripts/get_transcript.py <URL> [<URL> ...] --output-dir transcripts/ --sub-langs en.*,en
 ```
 
 The script will:
-- Download subtitles (manual first, auto-generated as fallback) via `yt-dlp`
-- Convert SRT/VTT to plain text, removing timestamps and HTML tags
-- Deduplicate rolling-caption repeats
-- Replace leading `>` / `>>` speaker-change indicators with `>[SPEAKER CHANGE]>` and insert blank lines before speaker changes
-- Save each result as `<VideoTitle>.txt` in `--output-dir`
+- Download subtitles (manual first, auto-generated as fallback) via `yt-dlp`.
+- **Fallback:** If no subtitles are found, it downloads the audio and transcribes it using `faster-whisper`.
+- Convert SRT/VTT to plain text, removing timestamps and HTML tags.
+- Deduplicate rolling-caption repeats.
+- Replace leading `>` / `>>` speaker-change indicators (or detected speakers from diarization) with `>[SPEAKER CHANGE]> \n` and insert blank lines before speaker changes.
+- Save each result as `<VideoTitle>.txt` in `--output-dir`.
 
 **Subtitle language rule:** Default to English subtitles (`--sub-langs en.*,en`). If the user explicitly asks for another language, or the user's request is written in another language, use that language's yt-dlp subtitle code instead (for example `--sub-langs es.*,es` for Spanish or `--sub-langs fr.*,fr` for French).
 
-**Install yt-dlp if missing:**
+### Prerequisites
+
+**Install system dependencies (ffmpeg and uv):**
 ```bash
-pip install yt-dlp
+# macOS
+brew install ffmpeg uv
+# Ubuntu/Debian
+sudo apt install ffmpeg
+curl -LsSf https://astral-sh.uv/install.sh | sh
 ```
+
+**Python dependencies:** Managed automatically by `uv` via `pyproject.toml`.
 
 **Node.js and JS runtime:** If [Node.js](https://nodejs.org) is installed, the script detects it automatically and configures yt-dlp to use it for JavaScript deobfuscation, which increases success on sites with dynamic player challenges (e.g. newer YouTube builds).  Without Node.js, the script falls back to JS-free player clients (`ios`, `mweb`).  Install Node.js to maximise reliability:
 ```bash
