@@ -38,6 +38,12 @@ The installer never overwrites files it did not create; pass `--force` to move t
 (`NAME.skill-dump-bak.TIME`). Anything removed from the repo is removed from installed computers on their next update.
 Local changes in the installed clone pause updates until they are committed or discarded.
 
+### Adopting it on a computer that already has these tools
+
+Have an agent follow [ADOPTING.md](ADOPTING.md). It surveys the computer,
+folds any newer features, fixes or platform support from the local copies back into this repo, migrates to the
+managed install and verifies it.
+
 ### Adding a tool
 
 Create `tools/<name>/` with the program, a `README.md`, and a `tool.conf`:
