@@ -498,8 +498,9 @@ cmd_status() {
   [[ -f $STATE_DIR/last-update ]] && echo "update:   $(cat "$STATE_DIR/last-update")"
   echo "options:  skip=${SKIP:-none} only=${ONLY:-all} skills=$SKILLS agent-instructions=$AGENT_INSTRUCTIONS auto-update=$AUTO_UPDATE"
   if have_systemd_user; then
-    echo "timer:    $(systemctl --user is-enabled skill-dump-update.timer 2>/dev/null || echo not installed)," \
-      "next $(systemctl --user show skill-dump-update.timer -P NextElapseUSecRealtime 2>/dev/null || echo '?')"
+    local next
+    next=$(systemctl --user list-timers skill-dump-update.timer --no-legend 2>/dev/null | awk '{ print $1, $2, $3, $4 }')
+    echo "timer:    $(systemctl --user is-enabled skill-dump-update.timer 2>/dev/null || echo not installed), next ${next:-?}"
   fi
   echo "tools:"
   local tool installed
