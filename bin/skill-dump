@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+# skill-dump: install and auto-update the tools, skills and agent instructions
+# in this repository on the current computer.
+set -euo pipefail
+
+SD_HOME=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)
+BIN_DIR=${SKILL_DUMP_BIN_DIR:-$HOME/.local/bin}
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/skill-dump
+CONFIG=$CONFIG_DIR/config
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/skill-dump
+UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+LAUNCHD_LABEL=com.theontho.skill-dump.update
+LAUNCHD_PLIST=$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist
+MARKER="Managed by skill-dump"
+BEGIN_MARK="<!-- BEGIN skill-dump: generated from github.com/theontho/skill-dump; edits inside this block are overwritten -->"
+END_MARK="<!-- END skill-dump -->"
+
+usage() {
+  cat <<EOF
+skill-dump - install and auto-update this repository's tools, skills and agent instructions
+
+USAGE
+  skill-dump install [--skip TOOL,...] [--only TOOL,...] [--no-skills]
+                     [--no-agent-instructions] [--no-auto-update] [--force]
+  skill-dump update [--no-pull]   Pull the latest commits (fast-forward only), then install.
+  skill-dump status               Show the install, its tools and the update schedule.
+  skill-dump list                 List the tools in this repository.
+  skill-dump uninstall            Remove everything skill-dump installed (keeps this checkout).
+
+Install options are saved in $CONFIG and reused by automatic updates.
+Use "--skip ''" or "--only ''" to clear a saved choice. --force replaces
+unmanaged files that are in the way (they are kept as NAME.skill-dump-bak.TIME).
+
+Installed from: $SD_HOME
+EOF
+}
+
+log() { printf 'skill-dump: %s\n' "$*"; }
+warn() { printf 'skill-dump: warning: %s\n' "$*" >&2; }
+die() { printf 'skill-dump: error: %s\n' "$*" >&2; exit 1; }
+
+sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi
+}
+
+have_systemd_user() {
+  [[ $(uname -s) == Linux ]] && command -v systemctl >/dev/null 2>&1 &&
+    systemctl --user show-environment >/dev/null 2>&1
+}
+
+in_list() { # in_list WORD "a,b c" -> exit 0 if WORD is in the comma/space list
+  local word=$1 item
+  for item in ${2//,/ }; do [[ $item == "$word" ]] && return 0; done
+  return 1
+}
+
+# --- lock ------------------------------------------------------------------
+
+LOCK_DIR=$STATE_DIR/lock
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  local tries=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    local pid
+    pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    ((tries++ < 300)) || die "another skill-dump run holds $LOCK_DIR"
+    sleep 1
+  done
+  echo $$ >"$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+}
+
+# --- config ----------------------------------------------------------------
+
+SKIP="" ONLY="" SKILLS=yes AGENT_INSTRUCTIONS=yes AUTO_UPDATE=yes
+load_config() {
+  # shellcheck source=/dev/null
+  [[ -f $CONFIG ]] && . "$CONFIG"
+  return 0
+}
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  {
+    echo "# skill-dump install options (rewritten by 'skill-dump install')"
+    printf 'SKIP=%q\nONLY=%q\nSKILLS=%q\nAGENT_INSTRUCTIONS=%q\nAUTO_UPDATE=%q\n' \
+      "$SKIP" "$ONLY" "$SKILLS" "$AGENT_INSTRUCTIONS" "$AUTO_UPDATE"
+  } >"$CONFIG"
+}
+
+# --- managed paths ---------------------------------------------------------
+
+MANIFEST=$STATE_DIR/manifest
+NEW_MANIFEST=()
+FORCE=no
+
+was_managed() { [[ -f $MANIFEST ]] && grep -Fxq "$1" "$MANIFEST"; }
+
+ours() { # is PATH something we may replace or remove?
+  local path=$1
+  was_managed "$path" && return 0
+  if [[ -L $path ]]; then
+    case $(readlink "$path") in "$SD_HOME"/*) return 0 ;; esac
+  elif [[ -f $path ]] && grep -Fq "$MARKER" "$path" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+make_room() { # make_room PATH -> exit 0 if PATH may be (re)written
+  local path=$1
+  [[ -e $path || -L $path ]] || return 0
+  ours "$path" && return 0
+  if [[ $FORCE == yes ]]; then
+    local backup
+    backup="$path.skill-dump-bak.$(date +%Y%m%d-%H%M%S)"
+    mv "$path" "$backup"
+    log "moved unmanaged $path to $backup"
+    return 0
+  fi
+  warn "not replacing unmanaged $path (remove it or rerun with --force)"
+  return 1
+}
+
+ensure_link() { # ensure_link TARGET LINK
+  local target=$1 link=$2
+  mkdir -p "$(dirname "$link")"
+  if [[ -L $link && $(readlink "$link") == "$target" ]]; then
+    NEW_MANIFEST+=("$link")
+    return 0
+  fi
+  make_room "$link" || return 0
+  rm -rf "$link"
+  ln -s "$target" "$link"
+  NEW_MANIFEST+=("$link")
+  log "linked $link -> $target"
+}
+
+short_host() { local h; h=$(uname -n); echo "${h%%.*}"; }
+
+render() { # render FILE -> stdout with {{PLACEHOLDERS}} filled in
+  local text
+  text=$(cat "$1")
+  text=${text//'{{SKILL_DUMP_HOME}}'/$SD_HOME}
+  text=${text//'{{HOME}}'/$HOME}
+  text=${text//'{{USER}}'/$(id -un)}
+  text=${text//'{{HOST}}'/$(short_host)}
+  printf '%s\n' "$text"
+}
+
+CHANGED_UNITS=()
+write_rendered() { # write_rendered SOURCE DEST [COMMENT_PREFIX] (no prefix: SOURCE carries the marker)
+  local src=$1 dest=$2 prefix=${3-} tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp=$(mktemp)
+  {
+    [[ -z $prefix ]] || printf '%s %s from %s; edits are overwritten.\n' "$prefix" "$MARKER" "${src#"$SD_HOME"/}"
+    render "$src"
+  } >"$tmp"
+  if [[ -f $dest ]] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    NEW_MANIFEST+=("$dest")
+    return 0
+  fi
+  if ! make_room "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv "$tmp" "$dest"
+  chmod 644 "$dest"
+  NEW_MANIFEST+=("$dest")
+  CHANGED_UNITS+=("$(basename "$dest")")
+  log "wrote $dest"
+}
+
+remove_stale() {
+  [[ -f $MANIFEST ]] || return 0
+  local path keep
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    keep=no
+    for p in "${NEW_MANIFEST[@]+"${NEW_MANIFEST[@]}"}"; do [[ $p == "$path" ]] && keep=yes && break; done
+    [[ $keep == yes ]] && continue
+    [[ -e $path || -L $path ]] || continue
+    if [[ -L $path ]] || { [[ -f $path ]] && grep -Fq "$MARKER" "$path"; }; then
+      case $path in
+        "$UNIT_DIR"/*) have_systemd_user && systemctl --user disable --now "$(basename "$path")" >/dev/null 2>&1 || true ;;
+        "$LAUNCHD_PLIST") launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true ;;
+      esac
+      rm -f "$path"
+      log "removed $path"
+    fi
+  done <"$MANIFEST"
+}
+
+# --- tools -----------------------------------------------------------------
+
+tool_dirs() {
+  local dir
+  for dir in "$SD_HOME"/tools/*/; do
+    [[ -f $dir/tool.conf ]] && basename "$dir"
+  done
+}
+
+load_tool() { # sets DESCRIPTION BINS UNITS RESTART_ON_CHANGE REQUIRES OS
+  DESCRIPTION="" BINS="" UNITS="" RESTART_ON_CHANGE="" REQUIRES="" OS=""
+  # shellcheck source=/dev/null
+  . "$SD_HOME/tools/$1/tool.conf"
+}
+
+missing_requirement() { # prints the first unmet requirement of the loaded tool
+  local req
+  if [[ -n $OS ]] && ! in_list "$(uname -s)" "$OS"; then
+    echo "runs on $OS only"
+    return
+  fi
+  for req in $REQUIRES; do
+    case $req in
+      systemctl) have_systemd_user || { echo "needs a systemd user session"; return; } ;;
+      *) command -v "$req" >/dev/null 2>&1 || { echo "needs $req"; return; } ;;
+    esac
+  done
+}
+
+tool_hash() {
+  (cd "$SD_HOME/tools/$1" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' | LC_ALL=C sort |
+    while IFS= read -r f; do printf '%s ' "$f"; sha <"$f"; done) | sha
+}
+
+stored() { # stored FILE KEY -> value
+  [[ -f $1 ]] && awk -v k="$2" '$1 == k { print $2 }' "$1"
+  return 0
+}
+
+INSTALLED_TOOLS=()
+ENABLE_UNITS=()
+RESTART_UNITS=()
+
+install_tools() {
+  local tool reason pair name file unit old_hash new_hash
+  : >"$STATE_DIR/hashes.new"
+  for tool in $(tool_dirs); do
+    load_tool "$tool"
+    if [[ -n $ONLY ]] && ! in_list "$tool" "$ONLY"; then
+      log "skipping $tool (not in --only)"
+      continue
+    fi
+    if in_list "$tool" "$SKIP"; then
+      log "skipping $tool (--skip)"
+      continue
+    fi
+    reason=$(missing_requirement)
+    if [[ -n $reason ]]; then
+      # Keep an installed tool if a requirement is only missing from this
+      # environment (for example a timer's short PATH).
+      if [[ -n $(stored "$STATE_DIR/hashes" "$tool") && $reason != "runs on"* ]]; then
+        warn "$tool $reason here; keeping the existing install"
+      else
+        log "skipping $tool ($reason)"
+        continue
+      fi
+    fi
+    INSTALLED_TOOLS+=("$tool")
+    for pair in $BINS; do
+      name=${pair%%=*} file=${pair#*=}
+      [[ -x $SD_HOME/tools/$tool/$file ]] || chmod +x "$SD_HOME/tools/$tool/$file"
+      ensure_link "$SD_HOME/tools/$tool/$file" "$BIN_DIR/$name"
+    done
+    old_hash=$(stored "$STATE_DIR/hashes" "$tool")
+    new_hash=$(tool_hash "$tool")
+    echo "$tool $new_hash" >>"$STATE_DIR/hashes.new"
+    for unit in $UNITS; do
+      write_rendered "$SD_HOME/tools/$tool/$unit" "$UNIT_DIR/$unit" "#" || continue
+      ENABLE_UNITS+=("$unit")
+      if in_list "$unit" "$RESTART_ON_CHANGE" &&
+        { [[ $old_hash != "$new_hash" ]] || in_list "$unit" "${CHANGED_UNITS[*]+"${CHANGED_UNITS[*]}"}"; }; then
+        RESTART_UNITS+=("$unit")
+      fi
+    done
+  done
+}
+
+install_auto_update() {
+  [[ $AUTO_UPDATE == yes ]] || return 0
+  if have_systemd_user; then
+    local unit
+    for unit in skill-dump-update.service skill-dump-update.timer; do
+      write_rendered "$SD_HOME/systemd/$unit" "$UNIT_DIR/$unit" "#" || return 0
+    done
+    ENABLE_UNITS+=(skill-dump-update.timer)
+  elif [[ $(uname -s) == Darwin ]]; then
+    local before=${#CHANGED_UNITS[@]}
+    mkdir -p "$STATE_DIR"
+    write_rendered "$SD_HOME/launchd/$LAUNCHD_LABEL.plist" "$LAUNCHD_PLIST" || return 0
+    if ((${#CHANGED_UNITS[@]} > before)); then
+      launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    fi
+    launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 ||
+      launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" || warn "could not load $LAUNCHD_PLIST"
+  else
+    warn "no systemd user session or launchd: run 'skill-dump update' yourself to get updates"
+  fi
+}
+
+apply_units() {
+  have_systemd_user || return 0
+  systemctl --user daemon-reload
+  local unit
+  for unit in "${ENABLE_UNITS[@]+"${ENABLE_UNITS[@]}"}"; do
+    systemctl --user enable --now --quiet "$unit" || warn "could not enable $unit"
+  done
+  for unit in "${RESTART_UNITS[@]+"${RESTART_UNITS[@]}"}"; do
+    if systemctl --user is-active --quiet "$unit"; then
+      systemctl --user restart "$unit" && log "restarted $unit"
+    fi
+  done
+}
+
+# --- skills ----------------------------------------------------------------
+
+skill_roots() {
+  echo "$HOME/.agents/skills"
+  [[ -d $HOME/.claude ]] && echo "$HOME/.claude/skills"
+  return 0
+}
+
+install_skills() {
+  [[ $SKILLS == yes ]] || return 0
+  local dir root
+  for dir in "$SD_HOME"/skills/*/; do
+    [[ -f $dir/SKILL.md ]] || continue
+    for root in $(skill_roots); do
+      ensure_link "${dir%/}" "$root/$(basename "$dir")"
+    done
+  done
+}
+
+# --- agent instructions ----------------------------------------------------
+
+instruction_targets() {
+  [[ -d $HOME/.copilot ]] && echo "$HOME/.copilot/copilot-instructions.md"
+  [[ -d $HOME/.claude ]] && echo "$HOME/.claude/CLAUDE.md"
+  [[ -d $HOME/.codex ]] && echo "$HOME/.codex/AGENTS.md"
+  [[ -d $HOME/.gemini ]] && echo "$HOME/.gemini/GEMINI.md"
+  [[ -d ${XDG_CONFIG_HOME:-$HOME/.config}/opencode ]] && echo "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/AGENTS.md"
+  return 0
+}
+
+upsert_block() { # upsert_block FILE BLOCK_FILE (empty BLOCK_FILE removes the block)
+  local file=$1 block=$2 tmp
+  [[ -f $file || -s $block ]] || return 0
+  tmp=$(mktemp)
+  touch "$file"
+  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" -v blockfile="$block" '
+    function emit(  line) {
+      while ((getline line < blockfile) > 0) print line
+      close(blockfile)
+      done = 1
+    }
+    $0 == begin { inblock = 1; if (!done) emit(); next }
+    $0 == end { inblock = 0; next }
+    !inblock { print }
+    END {
+      if (!done) {
+        if (NR > 0) print ""
+        emit()
+      }
+    }' "$file" >"$tmp"
+  if [[ ! -s $block ]]; then # drop the blank separator lines left behind
+    awk '/[^[:space:]]/ { while (blank-- > 0) print ""; blank = 0; print; next } { blank++ }' "$tmp" >"$tmp.trim"
+    mv "$tmp.trim" "$tmp"
+  fi
+  if ! grep -q '[^[:space:]]' "$tmp"; then
+    rm -f "$tmp" "$file"
+    log "removed empty $file"
+  elif cmp -s "$tmp" "$file"; then
+    rm -f "$tmp"
+  else
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+    log "updated agent instructions in $file"
+  fi
+}
+
+install_agent_instructions() {
+  local block target tool host
+  block=$(mktemp)
+  if [[ $AGENT_INSTRUCTIONS == yes ]]; then
+    host=$(short_host)
+    {
+      echo "$BEGIN_MARK"
+      for tool in "${INSTALLED_TOOLS[@]+"${INSTALLED_TOOLS[@]}"}"; do
+        [[ -f $SD_HOME/tools/$tool/agents.md ]] && { echo; render "$SD_HOME/tools/$tool/agents.md"; }
+      done
+      [[ -f $SD_HOME/agents/hosts/$host.md ]] && { echo; render "$SD_HOME/agents/hosts/$host.md"; }
+      echo
+      render "$SD_HOME/agents/skill-dump.md"
+      echo "$END_MARK"
+    } >"$block"
+  fi
+  for target in $(instruction_targets); do
+    upsert_block "$target" "$block"
+  done
+  rm -f "$block"
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_install() {
+  local from_update=no
+  load_config
+  while (($#)); do
+    case $1 in
+      --skip) SKIP=${2-}; shift ;;
+      --skip=*) SKIP=${1#*=} ;;
+      --only) ONLY=${2-}; shift ;;
+      --only=*) ONLY=${1#*=} ;;
+      --no-skills) SKILLS=no ;;
+      --skills) SKILLS=yes ;;
+      --no-agent-instructions) AGENT_INSTRUCTIONS=no ;;
+      --agent-instructions) AGENT_INSTRUCTIONS=yes ;;
+      --no-auto-update) AUTO_UPDATE=no ;;
+      --auto-update) AUTO_UPDATE=yes ;;
+      --force) FORCE=yes ;;
+      --from-update) from_update=yes ;;
+      -h | --help) usage; return 0 ;;
+      *) die "unknown install option: $1" ;;
+    esac
+    shift
+  done
+  acquire_lock
+  [[ $from_update == yes ]] || save_config
+
+  install_tools
+  ensure_link "$SD_HOME/bin/skill-dump" "$BIN_DIR/skill-dump"
+  install_skills
+  install_auto_update
+  remove_stale
+  apply_units
+  install_agent_instructions
+
+  printf '%s\n' "${NEW_MANIFEST[@]}" | LC_ALL=C sort -u >"$MANIFEST"
+  mv "$STATE_DIR/hashes.new" "$STATE_DIR/hashes"
+  { echo "home $SD_HOME"; echo "commit $(git -C "$SD_HOME" rev-parse --short HEAD 2>/dev/null || echo unknown)"; echo "time $(date '+%Y-%m-%dT%H:%M:%S%z')"; } >"$STATE_DIR/installed"
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *) warn "$BIN_DIR is not on PATH; add it to your shell profile" ;;
+  esac
+  log "installed ${INSTALLED_TOOLS[*]-no tools} from $SD_HOME"
+}
+
+cmd_update() {
+  local pull=yes result
+  while (($#)); do
+    case $1 in
+      --no-pull) pull=no ;;
+      -h | --help) usage; return 0 ;;
+      *) die "unknown update option: $1" ;;
+    esac
+    shift
+  done
+  mkdir -p "$STATE_DIR"
+  result="no pull"
+  if [[ $pull == yes ]]; then
+    if ! git -C "$SD_HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      result="not a git checkout"
+    elif [[ -n $(git -C "$SD_HOME" status --porcelain --untracked-files=no) ]]; then
+      result="local changes; not pulling"
+    elif ! git -C "$SD_HOME" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+      result="no upstream branch; not pulling"
+    elif ! git -C "$SD_HOME" fetch --quiet; then
+      result="fetch failed"
+    else
+      local before after
+      before=$(git -C "$SD_HOME" rev-parse --short HEAD)
+      if git -C "$SD_HOME" merge --ff-only --quiet '@{u}'; then
+        after=$(git -C "$SD_HOME" rev-parse --short HEAD)
+        if [[ $before == "$after" ]]; then result="up to date at $after"; else result="updated $before -> $after"; fi
+      else
+        result="cannot fast-forward (branch has diverged)"
+      fi
+    fi
+  fi
+  log "$result"
+  echo "$(date '+%Y-%m-%dT%H:%M:%S%z') $result" >"$STATE_DIR/last-update"
+  # Run the (possibly new) installer from the updated checkout.
+  exec "$SD_HOME/bin/skill-dump" install --from-update
+}
+
+cmd_status() {
+  load_config
+  echo "home:     $SD_HOME ($(git -C "$SD_HOME" rev-parse --short HEAD 2>/dev/null || echo '?') on $(git -C "$SD_HOME" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))"
+  [[ -f $STATE_DIR/installed ]] && echo "install:  $(tr '\n' ' ' <"$STATE_DIR/installed")"
+  [[ -f $STATE_DIR/last-update ]] && echo "update:   $(cat "$STATE_DIR/last-update")"
+  echo "options:  skip=${SKIP:-none} only=${ONLY:-all} skills=$SKILLS agent-instructions=$AGENT_INSTRUCTIONS auto-update=$AUTO_UPDATE"
+  if have_systemd_user; then
+    echo "timer:    $(systemctl --user is-enabled skill-dump-update.timer 2>/dev/null || echo not installed)," \
+      "next $(systemctl --user show skill-dump-update.timer -P NextElapseUSecRealtime 2>/dev/null || echo '?')"
+  fi
+  echo "tools:"
+  local tool installed
+  for tool in $(tool_dirs); do
+    load_tool "$tool"
+    installed="-"
+    [[ -n $(stored "$STATE_DIR/hashes" "$tool") ]] && installed="installed"
+    printf '  %-20s %-10s %s\n' "$tool" "$installed" "$DESCRIPTION"
+  done
+}
+
+cmd_list() {
+  local tool
+  for tool in $(tool_dirs); do
+    load_tool "$tool"
+    printf '%-20s %s\n' "$tool" "$DESCRIPTION"
+  done
+}
+
+cmd_uninstall() {
+  acquire_lock
+  NEW_MANIFEST=()
+  remove_stale
+  INSTALLED_TOOLS=()
+  AGENT_INSTRUCTIONS=no
+  install_agent_instructions
+  have_systemd_user && systemctl --user daemon-reload
+  rm -f "$MANIFEST" "$STATE_DIR/hashes" "$STATE_DIR/installed" "$STATE_DIR/last-update"
+  log "uninstalled; this checkout ($SD_HOME) and $CONFIG were kept"
+}
+
+case ${1-} in
+  install) shift; cmd_install "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  status) cmd_status ;;
+  list) cmd_list ;;
+  uninstall) cmd_uninstall ;;
+  -h | --help | help | "") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

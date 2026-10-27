@@ -1,0 +1,10 @@
+[Unit]
+Description=Update skill-dump tools, skills and agent instructions from GitHub
+Documentation=file://{{SKILL_DUMP_HOME}}/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart={{SKILL_DUMP_HOME}}/bin/skill-dump update

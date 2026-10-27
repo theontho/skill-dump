@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-coord: CPU/RAM leases and messages for the agents on this computer
+Documentation=file://{{SKILL_DUMP_HOME}}/tools/agent-coord/README.md
+
+[Service]
+ExecStart=/usr/bin/env python3 {{SKILL_DUMP_HOME}}/tools/agent-coord/agent_coord.py serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

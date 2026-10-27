@@ -1,0 +1,39 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/copilot-real"
+SOCKET="copilot-persistent"
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+  exec "$REAL" "$@"
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help|--version|-p|--prompt|--acp)
+      exec "$REAL" "$@"
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  help|version|update)
+    exec "$REAL" "$@"
+    ;;
+esac
+
+cwd=$(pwd -P)
+hash=$(printf '%s' "$cwd" | sha256sum | cut -c1-12)
+base=$(basename "$cwd" | tr -cs '[:alnum:]_.-' '-')
+base=${base:0:24}
+session="copilot-${base:-session}-$hash"
+
+systemctl --user start copilot-tmux.service
+
+if ! tmux -L "$SOCKET" has-session -t "=$session" 2>/dev/null; then
+  command=$(printf '%q ' "$REAL" "$@")
+  tmux -L "$SOCKET" new-session -d -s "$session" -c "$cwd" "$command"
+  tmux -L "$SOCKET" set-option -t "=$session" remain-on-exit on
+fi
+
+exec tmux -L "$SOCKET" attach-session -t "=$session"

@@ -26,7 +26,7 @@
       "description": "Downloads video transcripts via subtitles using yt-dlp, deduplicates and cleans them into plain-text files, then produces an AI summary of each video. WHEN: \"summarize video\", \"video summary\", \"transcript summary\", \"summarize YouTube\", \"get transcript\", \"video transcript\", \"watch summary\".",
       "license": "MIT",
       "path": "skills/transcript-summarize/SKILL.md",
-      "sha256": "57f8c656a07b5b88c57a45d8e5dd9252e03b0b2cc920320364e6dcfcc599bdfb",
+      "sha256": "af750b2477e7db3914ccb89e1a026b188a8adbb93afd40c585db0cf4a16c73c3",
       "metadata": {
         "author": "theontho",
         "version": "1.0.0"

@@ -1,5 +1,59 @@
 # skill-dump
-a dumping ground for various skills I make
+a dumping ground for various skills I make, plus the command-line tooling my agents use on every computer.
+
+## Install on a computer (tools, skills and agent instructions, auto-updating)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theontho/skill-dump/main/install.sh | bash
+```
+
+This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install`, which:
+
+- links each tool in `tools/` into `~/.local/bin` and installs its systemd user units;
+- links every skill in `skills/` into `~/.agents/skills` and `~/.claude/skills`;
+- writes a managed block of usage notes for the installed tools into the agents' global instruction files
+  (`~/.copilot/copilot-instructions.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, ... for agents that are present),
+  plus `agents/hosts/<hostname>.md` when one exists for that computer;
+- installs an hourly `skill-dump-update.timer` (launchd agent on macOS) that fast-forwards the clone and reinstalls.
+  Pushing to `main` therefore updates every computer within about an hour. Services whose tool changed are restarted.
+
+| Tool | What it does | Needs |
+| --- | --- | --- |
+| `agent-coord` | CPU/RAM/disk leases, named locks and messages between agents | Linux, systemd user session, python3 |
+| `sudo-session` | Share a time-limited, audited sudo credential with fresh agent shells | python3, tmux, sudo |
+| `op-session` | Persistent 1Password CLI session for fresh agent shells | tmux |
+| `copilot-persistent` | `copilot` wrapper that keeps interactive sessions in a tmux service | Linux, systemd user session, tmux, mise |
+
+Tools whose requirements are missing are skipped. Choose tools with `--skip` / `--only`
+(saved in `~/.config/skill-dump/config` and reused by updates):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theontho/skill-dump/main/install.sh | bash -s -- --skip copilot-persistent
+skill-dump status          # what is installed, last update, next check
+skill-dump update          # pull and apply now
+skill-dump uninstall
+```
+
+The installer never overwrites files it did not create; pass `--force` to move them aside
+(`NAME.skill-dump-bak.TIME`). Anything removed from the repo is removed from installed computers on their next update.
+Local changes in the installed clone pause updates until they are committed or discarded.
+
+### Adding a tool
+
+Create `tools/<name>/` with the program, a `README.md`, and a `tool.conf`:
+
+```sh
+DESCRIPTION="One line for skill-dump list/status"
+BINS="command-name=file-in-this-dir"   # space-separated; linked into ~/.local/bin
+UNITS="name.service"                   # optional systemd user units, enabled and started
+RESTART_ON_CHANGE="name.service"       # optional; restarted when this tool's files change
+REQUIRES="python3 tmux systemctl"      # commands needed (systemctl = a systemd user session)
+OS="Linux"                             # optional; uname -s values
+```
+
+Unit files may use `{{SKILL_DUMP_HOME}}`, `{{HOME}}`, `{{USER}}` and `{{HOST}}`. An optional `agents.md`
+is added to the agents' global instructions on computers that install the tool. Run `npm run tools:test` and
+`npm run tools:lint` before pushing.
 
 ## Use with agent skill CLIs
 
