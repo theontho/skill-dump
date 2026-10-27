@@ -3,7 +3,13 @@
 # in this repository on the current computer.
 set -euo pipefail
 
-SD_HOME=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)
+source_path=${BASH_SOURCE[0]}
+while [[ -L $source_path ]]; do
+  source_dir=$(cd "$(dirname "$source_path")" && pwd)
+  source_path=$(readlink "$source_path")
+  [[ $source_path == /* ]] || source_path=$source_dir/$source_path
+done
+SD_HOME=$(cd "$(dirname "$source_path")/.." && pwd -P)
 BIN_DIR=${SKILL_DUMP_BIN_DIR:-$HOME/.local/bin}
 CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/skill-dump
 CONFIG=$CONFIG_DIR/config

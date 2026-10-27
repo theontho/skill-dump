@@ -1,3 +1,7 @@
 # 1Password CLI sessions (op-session)
 
-- Use `op-session start`, then `op-session exec op ...` from any fresh agent shell for repeated 1Password CLI access; `op-session status` and `op-session stop` check or revoke it.
+- Check `op-session status` first: exit 0 means the local lease is active, 2 means approval is pending, and 1 means inactive. Resume a pending approval; do not stop it or start another.
+- Authenticate once with `op-session start` in an interactive terminal, or `op-session start --terminal` from an agent. The default lease is one hour. Longer leases require explicit authorization. Route every subsequent CLI call, including scripts, through `op-session OP_ARGUMENT ...` or `op-session run -- OP_ARGUMENT ...`. The legacy `op-session exec op ...` form remains supported.
+- Verify reuse with two non-secret `op-session whoami` calls from separate fresh shells. Status alone does not prove vault access. Keep the grant throughout related work, then call `op-session stop` once.
+- On macOS, enable **Keep 1Password in the menu bar** and leave the app running. App lock, quit or restart can revoke CLI authorization; never weaken security locks. Keepalives use the authorized foreground pane, not a background process without a TTY.
+- Diagnose failures from stderr, `op-session status`, and `{{HOME}}/.local/state/copilot-agent-sessions/audit.log` before requesting another approval. Never print secrets as diagnostics.

@@ -20,8 +20,8 @@ REAL_POPEN = subprocess.Popen
 class SessionTests(unittest.TestCase):
     @contextlib.contextmanager
     def broker(self, duration=60):
-        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-            runtime = Path(directory) / "runtime"
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            runtime = Path(directory).resolve() / "runtime"
             errors = []
 
             def run_sudo(args, **kwargs):
@@ -51,9 +51,14 @@ class SessionTests(unittest.TestCase):
                 thread.start()
                 try:
                     deadline = time.monotonic() + 3
-                    while not session.ADDRESS.exists() and not errors:
+                    while not errors:
                         if time.monotonic() >= deadline:
                             self.fail("Broker did not start")
+                        try:
+                            if session.request({"action": "status"})["code"] == 0:
+                                break
+                        except (FileNotFoundError, ConnectionRefusedError):
+                            pass
                         time.sleep(0.01)
                     if errors:
                         raise errors[0]
@@ -62,7 +67,7 @@ class SessionTests(unittest.TestCase):
                     if session.ADDRESS.exists():
                         try:
                             session.request({"action": "stop"})
-                        except (FileNotFoundError, ConnectionRefusedError):
+                        except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
                             pass
                     thread.join(3)
                     self.assertFalse(thread.is_alive(), "Broker failed to stop")
@@ -180,6 +185,62 @@ class SessionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "predates extension support"):
                     session.main()
 
+    def test_terminal_start_preserves_pending_approval_and_waits_for_broker(self):
+        with (patch.object(session, "pending", return_value=True),
+              patch.object(session, "request", side_effect=[
+                  FileNotFoundError(), FileNotFoundError(), {"code": 0, "remaining": 3600},
+              ]),
+              patch.object(session.time, "sleep"),
+              patch.object(session.subprocess, "Popen") as launch):
+            self.assertEqual(session.start_in_terminal(3600), 0)
+            launch.assert_not_called()
+    def test_macos_terminal_launch_and_pending_status(self):
+        with (patch.object(session.sys, "platform", "darwin"),
+              patch.dict(os.environ, {"AGENT_SESSION_TERMINAL_WAIT": "0"}, clear=True),
+              patch.object(session, "pending", return_value=False),
+              patch.object(session, "request", side_effect=FileNotFoundError),
+              patch.object(session.subprocess, "run") as launch):
+            self.assertEqual(session.start_in_terminal(43200), 2)
+            command = launch.call_args.args[0]
+            self.assertEqual(command[0], "osascript")
+            self.assertEqual(
+                session.shlex.split(command[-1]),
+                ["env", sys.executable, str(session.ROOT), "start", "--duration", "43200s"],
+            )
+        with (patch.object(sys, "argv", ["sudo-session", "status"]),
+              patch.object(session, "request", side_effect=FileNotFoundError),
+              patch.object(session, "pending", return_value=True)):
+            self.assertEqual(session.main(), 2)
+
+    def test_macos_does_not_invoke_linux_legacy_grant_cleanup(self):
+        with (patch.object(session.sys, "platform", "darwin"),
+              patch.object(session.subprocess, "run") as run):
+            session.remove_legacy_grant()
+            run.assert_not_called()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "legacy packet sockets are Linux-only")
+    def test_running_linux_packet_session_remains_usable_after_upgrade(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            address = Path(directory) / "control.sock"
+            with session.socket.socket(session.socket.AF_UNIX, session.socket.SOCK_SEQPACKET) as server:
+                server.bind(str(address))
+                server.listen(1)
+                requests = []
+
+                def legacy():
+                    connection, _ = server.accept()
+                    with connection:
+                        requests.append(session.json.loads(connection.recv(65536)))
+                        connection.send(session.json.dumps({"code": 0, "remaining": 60}).encode())
+
+                thread = threading.Thread(target=legacy, daemon=True)
+                thread.start()
+                with patch.object(session, "ADDRESS", address):
+                    self.assertEqual(session.request({"action": "status"}), {"code": 0, "remaining": 60})
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(requests, [{"action": "status"}])
+
     def test_stop_remains_responsive_during_command_and_allows_it_to_finish(self):
         with self.broker():
             replies = []
@@ -204,7 +265,8 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(replies, [{"code": 0}])
 
     def test_legacy_grant_is_removed_before_fresh_authentication(self):
-        with (patch.object(session, "audit"),
+        with (patch.object(session.sys, "platform", "linux"),
+              patch.object(session, "audit"),
               patch.object(session.subprocess, "run") as run):
             run.return_value = subprocess.CompletedProcess([], 0)
             session.remove_legacy_grant()

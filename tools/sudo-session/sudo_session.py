@@ -3,6 +3,7 @@
 
 import argparse
 import array
+import errno
 import fcntl
 import getpass
 import json
@@ -12,23 +13,32 @@ import re
 import select
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import time
 
 
 ROOT = Path(__file__).resolve()
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "sudo-session"
+STATE_ROOT = Path(os.environ.get(
+    "AGENT_SESSION_STATE_HOME",
+    str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) /
+        "copilot-agent-sessions"),
+))
+RUNTIME = Path(os.environ.get(
+    "XDG_RUNTIME_DIR",
+    f"/run/user/{os.getuid()}" if sys.platform.startswith("linux") else str(STATE_ROOT),
+)) / "sudo-session"
 ADDRESS = RUNTIME / "control.sock"
 SUDO = "/usr/bin/sudo"
-TMUX = ["tmux", "-L", "sudo-session", "-f", "/dev/null"]
+TMUX = ["tmux", "-L", os.environ.get("SUDO_SESSION_TMUX_SOCKET", "sudo-session"), "-f", "/dev/null"]
 DURATION = 3600
 
 HELP = """\
 sudo-session - share a time-limited sudo credential across agent shells
 
 USAGE
-  sudo-session start [--ssh] [--duration DURATION]
+  sudo-session start [--ssh] [--terminal] [--duration DURATION]
   sudo-session extend --duration DURATION
   sudo-session status
   sudo-session run [--] COMMAND [ARG ...]
@@ -39,6 +49,8 @@ USAGE
 
 COMMANDS
   start     Authenticate directly with sudo in a private local or SSH terminal.
+            From a non-interactive agent, use --terminal to open Terminal.app
+            on macOS, or a Linux desktop terminal. The person approves there.
             Default lifetime: 1h. --duration accepts positive whole numbers
             with s (seconds), m (minutes), h (hours), or d (days).
             No suffix means seconds. Examples: 90s, 30m, 12h, 1d.
@@ -88,10 +100,12 @@ SCOPE AND EXPIRY
   user can also use this session. Longer lifetimes increase that exposure.
   Credentials are refreshed while active, then invalidated on stop/expiry.
   Reboot or loss of the authentication terminal ends the session.
-  Session audit log: journalctl -t sudo-session
+  Session audit log: ~/.local/state/copilot-agent-sessions/audit.log
+                    and journalctl -t sudo-session on Linux.
 
 EXIT STATUS
-  status: 0 when active, 1 when stopped. stop is safe when already stopped.
+  status: 0 active, 2 approval pending, 1 stopped. Do not restart pending approval.
+  stop is safe when already stopped.
   run/exec: the command's exit status; helper errors are printed to stderr.
 """
 
@@ -131,6 +145,7 @@ def start_parser(prog="sudo-session start"):
         ),
     )
     parser.add_argument("--ssh", action="store_true", help="mark an SSH-terminal login (no desktop needed)")
+    parser.add_argument("--terminal", action="store_true", help="open a real terminal for approval")
     parser.add_argument(
         "--duration", type=parse_duration, default=DURATION, metavar="DURATION",
         help="session lifetime, e.g. 90s, 30m, 12h, 1d; default: 1h; bare numbers mean seconds",
@@ -156,35 +171,90 @@ def extend_parser():
 
 
 def audit(message):
-    subprocess.run(["logger", "-t", "sudo-session", "--", message], check=True)
+    STATE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(STATE_ROOT / "audit.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "a") as stream:
+        stream.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} kind=sudo {message}\n")
+    if sys.platform.startswith("linux"):
+        subprocess.run(["logger", "-t", "sudo-session", "--", message], check=True)
 
 
 def prepare_runtime():
-    RUNTIME.mkdir(mode=0o700, parents=False, exist_ok=True)
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = RUNTIME.lstat()
     if RUNTIME.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise RuntimeError(f"Unsafe runtime directory: {RUNTIME}")
 
 
-def request(payload, descriptors=()):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
-        connection.connect(str(ADDRESS))
-        ancillary = []
-        if descriptors:
-            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", descriptors))]
-        data = json.dumps(payload).encode()
-        if len(data) > 65536:
-            raise RuntimeError("Command request exceeds 64 KiB")
-        connection.sendmsg([data], ancillary)
-        reply = connection.recv(65536)
-        if not reply:
+def receive_exact(connection, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
             raise RuntimeError("Credential session disconnected before returning a result")
-        return json.loads(reply)
+        data.extend(chunk)
+    return bytes(data)
+
+
+def send_payload(connection, payload, descriptors=()):
+    data = json.dumps(payload).encode()
+    if len(data) > 65536:
+        raise ValueError("Command request exceeds 64 KiB")
+    ancillary = []
+    if descriptors:
+        ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", descriptors))]
+    header = struct.pack("!I", len(data))
+    sent = connection.sendmsg([header], ancillary)
+    connection.sendall(header[sent:] + data)
+
+
+def receive_payload(connection, descriptors):
+    header, ancillary, flags, _ = connection.recvmsg(4, socket.CMSG_SPACE(3 * descriptors.itemsize))
+    for level, kind, value in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            descriptors.frombytes(value[:len(value) - len(value) % descriptors.itemsize])
+    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+        raise ValueError("Truncated command request")
+    header += receive_exact(connection, 4 - len(header))
+    size = struct.unpack("!I", header)[0]
+    if size > 65536:
+        raise ValueError("Command request exceeds 64 KiB")
+    return json.loads(receive_exact(connection, size))
+
+
+def request(payload, descriptors=()):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        try:
+            connection.connect(str(ADDRESS))
+        except OSError as error:
+            # Keep already-running Linux sessions usable during an upgrade.
+            if error.errno != errno.EPROTOTYPE or not sys.platform.startswith("linux"):
+                raise
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as legacy:
+                legacy.connect(str(ADDRESS))
+                data = json.dumps(payload).encode()
+                if len(data) > 65536:
+                    raise ValueError("Command request exceeds 64 KiB")
+                ancillary = []
+                if descriptors:
+                    ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", descriptors))]
+                legacy.sendmsg([data], ancillary)
+                reply = legacy.recv(65536)
+                if not reply:
+                    raise RuntimeError("Credential session disconnected before returning a result")
+                return json.loads(reply)
+        send_payload(connection, payload, descriptors)
+        received = array.array("i")
+        try:
+            return receive_payload(connection, received)
+        finally:
+            for descriptor in received:
+                os.close(descriptor)
 
 
 def respond(connection, payload):
     try:
-        connection.send(json.dumps(payload).encode())
+        send_payload(connection, payload)
     except (BrokenPipeError, ConnectionResetError):
         audit("Client disconnected before receiving command result")
     finally:
@@ -192,6 +262,8 @@ def respond(connection, payload):
 
 
 def remove_legacy_grant():
+    if not sys.platform.startswith("linux"):
+        return
     unit = f"sudo-session-expire-{os.getuid()}.timer"
     timer = subprocess.run(["systemctl", "is-active", "--quiet", unit])
     if timer.returncode not in (0, 3, 4):
@@ -224,7 +296,7 @@ def serve(duration=None):
         refresh = time.monotonic() + 30
         jobs = []
         active = True
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             server.bind(str(ADDRESS))
             os.chmod(ADDRESS, 0o600)
@@ -241,14 +313,15 @@ def serve(duration=None):
                     active = False
                 if not active and server.fileno() != -1:
                     server.close()
-                    ADDRESS.unlink(missing_ok=True)
                     subprocess.run([SUDO, "-k"], check=True)
+                    ADDRESS.unlink(missing_ok=True)
                     audit("Revoked credential session; already-running commands may finish")
-                for process, connection in jobs[:]:
+                for process, connection, command in jobs[:]:
                     code = process.poll()
                     if code is not None:
+                        audit(f"command={command} exit={code}")
                         respond(connection, {"code": code})
-                        jobs.remove((process, connection))
+                        jobs.remove((process, connection, command))
                 if not active:
                     time.sleep(0.1)
                     continue
@@ -258,15 +331,7 @@ def serve(duration=None):
                 connection.settimeout(2)
                 descriptors = array.array("i")
                 try:
-                    data, ancillary, flags, _ = connection.recvmsg(
-                        65536, socket.CMSG_SPACE(3 * descriptors.itemsize)
-                    )
-                    for level, kind, value in ancillary:
-                        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                            descriptors.frombytes(value[:len(value) - len(value) % descriptors.itemsize])
-                    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
-                        raise ValueError("Truncated command request")
-                    payload = json.loads(data)
+                    payload = receive_payload(connection, descriptors)
                     if not isinstance(payload, dict):
                         raise ValueError("Invalid command request")
                     action = payload.get("action")
@@ -309,10 +374,10 @@ def serve(duration=None):
                             [SUDO, "-n", "--", *args], cwd=cwd,
                             stdin=descriptors[0], stdout=descriptors[1], stderr=descriptors[2],
                         )
-                        jobs.append((process, connection))
+                        jobs.append((process, connection, Path(args[0]).name))
                     else:
                         raise ValueError("Unknown session action")
-                except (ValueError, OSError) as error:
+                except (ValueError, OSError, RuntimeError) as error:
                     respond(connection, {"code": 1, "error": str(error)})
                 finally:
                     for descriptor in descriptors:
@@ -330,6 +395,7 @@ def start(duration=DURATION):
             "Start from a private SSH terminal:\n"
             f"  ssh -t {getpass.getuser()}"
             f"@{socket.gethostname()} sudo-session start --ssh --duration {duration}s\n"
+            "Or open a real terminal from an agent: sudo-session start --terminal\n"
             "Never send the password through agent chat."
         )
     prepare_runtime()
@@ -349,6 +415,61 @@ def start(duration=DURATION):
     return subprocess.call([*TMUX, "new-session", "-A", "-s", "auth", command])
 
 
+def pending():
+    return subprocess.run(
+        [*TMUX, "has-session", "-t", "auth"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def start_in_terminal(duration):
+    try:
+        result = request({"action": "status"})
+    except (FileNotFoundError, ConnectionRefusedError):
+        result = {"code": 1}
+    if result["code"] == 0:
+        print(f"active ({format_duration(result['remaining'])} remaining)")
+        return 0
+    wait = os.environ.get("AGENT_SESSION_TERMINAL_WAIT", "300")
+    if not wait.isdecimal():
+        raise RuntimeError("AGENT_SESSION_TERMINAL_WAIT must be a whole number of seconds")
+    if not pending():
+        command = [sys.executable, str(ROOT), "start", "--duration", f"{duration}s"]
+        environment = {name: os.environ[name] for name in (
+            "AGENT_SESSION_STATE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "SUDO_SESSION_TMUX_SOCKET",
+        ) if name in os.environ}
+        shell_command = shlex.join(["env", *(f"{key}={value}" for key, value in environment.items()), *command])
+        launcher = os.environ.get("AGENT_SESSION_TERMINAL")
+        if launcher:
+            subprocess.Popen(
+                [*shlex.split(launcher), "bash", "-c", shell_command],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        elif sys.platform == "darwin":
+            subprocess.run([
+                "osascript", "-e", "on run argv", "-e", 'tell application "Terminal"',
+                "-e", "activate", "-e", "do script (item 1 of argv)",
+                "-e", "end tell", "-e", "end run", shell_command,
+            ], check=True)
+        else:
+            raise RuntimeError("Set AGENT_SESSION_TERMINAL to a terminal launcher, such as 'alacritty -e'")
+        print("Opened a terminal for sudo approval; never enter a password in agent chat.", flush=True)
+    deadline = time.monotonic() + int(wait)
+    while True:
+        try:
+            result = request({"action": "status"})
+        except (FileNotFoundError, ConnectionRefusedError):
+            result = {"code": 1}
+        if result["code"] == 0:
+            print(f"active ({format_duration(result['remaining'])} remaining)")
+            return 0
+        if time.monotonic() >= deadline:
+            print("Sudo approval is pending in the existing terminal; check sudo-session status.")
+            return 2
+        time.sleep(0.2)
+
+
 def main():
     args = sys.argv[1:]
     action = args.pop(0) if args else "help"
@@ -361,6 +482,8 @@ def main():
         return 0
     if action == "start":
         options = start_parser().parse_args(args)
+        if options.terminal:
+            return start_in_terminal(options.duration)
         return start(options.duration)
     if action == "extend":
         options = extend_parser().parse_args(args)
@@ -388,6 +511,11 @@ def main():
         try:
             reply = request({"action": action})
         except (FileNotFoundError, ConnectionRefusedError):
+            if action == "status" and pending():
+                print("Sudo approval is pending in the existing terminal; do not restart it.")
+                return 2
+            if action == "stop" and pending():
+                subprocess.run([*TMUX, "kill-session", "-t", "auth"], check=True)
             print("stopped")
             return 1 if action == "status" else 0
         if reply.get("error"):

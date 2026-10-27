@@ -21,8 +21,8 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 | Tool | What it does | Needs |
 | --- | --- | --- |
 | `agent-coord` | CPU/RAM/disk leases, named locks and messages between agents | Linux, systemd user session, python3 |
-| `sudo-session` | Share a time-limited, audited sudo credential with fresh agent shells | python3, tmux, sudo |
-| `op-session` | Persistent 1Password CLI session for fresh agent shells | tmux |
+| `sudo-session` | Share a time-limited, audited sudo credential with fresh agent shells | macOS/Linux, python3, tmux, sudo |
+| `op-session` | Persistent 1Password CLI session for fresh agent shells | macOS/Linux, tmux, op, jq |
 | `copilot-persistent` | `copilot` wrapper that keeps interactive sessions in a tmux service | Linux, systemd user session, tmux, mise |
 
 Tools whose requirements are missing are skipped. Choose tools with `--skip` / `--only`
@@ -38,6 +38,13 @@ skill-dump uninstall
 The installer never overwrites files it did not create; pass `--force` to move them aside
 (`NAME.skill-dump-bak.TIME`). Anything removed from the repo is removed from installed computers when they next sync.
 `skill-dump update` won't pull while the installed clone has local changes.
+
+The credential helpers share one implementation per tool across macOS and Linux:
+`start --terminal` opens a real approval terminal for non-interactive agents,
+pending approval is preserved, and grants default to one hour. Sudo retains
+command streams, working directories and active-session extension; 1Password
+keepalives use the authorized foreground TTY. Run `npm run tools:test:credentials`
+on either platform; the full `npm run tools:test` also needs Linux for agent-coord.
 
 ### Adopting it on a computer that already has these tools
 

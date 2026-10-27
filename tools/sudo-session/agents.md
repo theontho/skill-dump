@@ -4,3 +4,4 @@
 - Run privileged commands from any fresh agent shell with `sudo-session run -- COMMAND [ARG ...]` (or `sudo-session COMMAND [ARG ...]`). Do not invoke mutating privileged commands bare.
 - Check or revoke access with `sudo-session status` and `sudo-session stop`.
 - Keep untrusted downloaded code outside privileged sessions and never execute it through `sudo-session`.
+- On macOS or from a non-interactive agent, use `sudo-session start --terminal` to open a real terminal for the person's approval. Check `sudo-session status` first: exit 2 means approval is pending in the existing terminal, not permission to restart it. Keep one grant throughout related work, then stop once.

@@ -9,6 +9,18 @@
   },
   "skills": [
     {
+      "id": "credential-sessions",
+      "name": "credential-sessions",
+      "description": "Use for op-session or sudo-session authentication, persistent credential grants across fresh agent shells, repeated 1Password approval prompts, authorization loss, and credential-helper diagnosis or installation.",
+      "license": "MIT",
+      "path": "skills/credential-sessions/SKILL.md",
+      "sha256": "a33ea675204f4bc0d1e5ffe27520f3eaa066c3f52b4864b287c22abfa49e04fe",
+      "metadata": {
+        "author": "theontho",
+        "version": "1.0.0"
+      }
+    },
+    {
       "id": "ghostty-theme-tools",
       "name": "ghostty-theme-tools",
       "description": "Transform Ghostty theme colors, apply Ghostty/cmux/Terminal.app light/dark themes, and convert Ghostty themes into VS Code/Cursor/VSCodium color customizations. WHEN: Ghostty theme, VS Code theme from Ghostty, terminal theme, cmux theme, Apple Classic Black, red night tint, color palette transform.",

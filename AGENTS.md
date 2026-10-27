@@ -27,3 +27,7 @@ Use `npm run skills:check` to verify manifests, plugin metadata, hashes, and ada
 # Machine tooling
 
 `tools/<name>/` holds command-line tools (agent-coord, sudo-session, op-session, copilot-persistent) that `bin/skill-dump install` links into `~/.local/bin` on every computer; `install.sh` bootstraps a clone at `~/.local/share/skill-dump` whose git hooks (`githooks/`) reinstall after every pull or checkout; there is no background update service. Each tool declares its commands, units and requirements in `tools/<name>/tool.conf`, and may add global agent guidance in `tools/<name>/agents.md` (host-specific notes go in `agents/hosts/<hostname>.md`). Never edit installed copies in `~/.local/bin`, `~/.config/systemd/user` or the agents' instruction files; change the repo and push, then sync with `skill-dump update`. Verify with `npm run tools:test` and `npm run tools:lint`. To adopt the tooling on a computer (including porting its newer tool versions or platform support into this repo), follow `ADOPTING.md`.
+
+The credential helpers support macOS and Linux without separate platform forks.
+`npm run tools:test:credentials` runs their isolated fake-credential tests on either
+platform; the full tooling suite additionally needs Linux for agent-coord.

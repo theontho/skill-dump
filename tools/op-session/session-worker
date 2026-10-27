@@ -1,0 +1,133 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ "$#" -ne 5 || "$1" != op ]]; then
+  echo "usage: session-worker op SESSION STATE_DIR DURATION_SECONDS TMUX_SOCKET" >&2
+  exit 64
+fi
+
+KIND=$1
+SESSION=$2
+STATE_DIR=$3
+DURATION_SECONDS=$4
+SOCKET=$5
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+[[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] || {
+  echo "duration must be an integer" >&2
+  exit 64
+}
+
+umask 077
+export HISTFILE=/dev/null
+set +o history
+auth_stage="waiting for terminal"
+auth_status() {
+  auth_stage=$1
+  printf '%s\n' "$auth_stage" > "$STATE_DIR/auth-status"
+}
+auth_failure() {
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    printf '%s failed (exit %s)\n' "$auth_stage" "$rc" > "$STATE_DIR/auth-status"
+  fi
+}
+trap auth_failure EXIT
+auth_status "$auth_stage"
+
+while ! tmux -L "$SOCKET" list-clients -t "$SESSION" -F '#{client_pid}' \
+  2>/dev/null | grep -q .; do
+  sleep 0.1
+done
+
+echo "Authenticate once to open a $((DURATION_SECONDS / 3600))-hour 1Password CLI session."
+account_urls=()
+auth_status "listing 1Password accounts"
+account_json=$(op account list --format json)
+while IFS= read -r account_url; do
+  account_urls+=("$account_url")
+done < <(printf '%s' "$account_json" | jq -r '.[].url')
+account_json=""
+auth_status "1Password sign-in"
+if [[ "${#account_urls[@]}" -eq 1 ]]; then
+  export OP_ACCOUNT="${account_urls[0]}"
+  signin_output=$(op signin --account "${account_urls[0]}")
+elif [[ "${#account_urls[@]}" -gt 1 ]]; then
+  echo "Choose the 1Password account for this session:" >&2
+  select account_url in "${account_urls[@]}"; do
+    if [[ -n "$account_url" ]]; then
+      export OP_ACCOUNT="$account_url"
+      break
+    fi
+    echo "Enter a number from the account list." >&2
+  done
+  [[ -n "${OP_ACCOUNT:-}" ]] || exit 77
+  signin_output=$(op signin --account "$OP_ACCOUNT")
+else
+  echo "No 1Password accounts are available; add an account in the desktop app." >&2
+  exit 77
+fi
+if [[ "$signin_output" == export\ OP_SESSION_* ]]; then
+  assignment=${signin_output#export }
+  session_name=${assignment%%=*}
+  session_value=${assignment#*=}
+  if [[ "$session_value" == \"*\" || "$session_value" == \'*\' ]]; then
+    session_value=${session_value:1:${#session_value}-2}
+  fi
+  if [[ ! "$session_name" =~ ^OP_SESSION_[A-Za-z0-9_]+$ ||
+    ! "$session_value" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    echo "Unexpected 1Password session assignment; refusing to evaluate it." >&2
+    exit 65
+  fi
+  export "$session_name=$session_value"
+elif [[ -n "$signin_output" ]]; then
+  echo "Unexpected 1Password sign-in output; session was not established." >&2
+  exit 65
+fi
+signin_output=""
+session_value=""
+auth_status "validating 1Password authentication"
+op whoami >/dev/null
+
+expiry=$(($(date +%s) + DURATION_SECONDS))
+printf '%s\n' "$TMUX_PANE" > "$STATE_DIR/target.tmp"
+mv "$STATE_DIR/target.tmp" "$STATE_DIR/target"
+printf '%s\n' "$expiry" > "$STATE_DIR/expires.tmp"
+mv "$STATE_DIR/expires.tmp" "$STATE_DIR/expires"
+printf '%s\n' "$$" > "$STATE_DIR/ready"
+auth_status "authenticated"
+trap - EXIT
+
+(
+  reason="expired"
+  while true; do
+    remaining=$((expiry - $(date +%s)))
+    [[ "$remaining" -gt 0 ]] || break
+    sleep_for=45
+    [[ "$remaining" -ge "$sleep_for" ]] || sleep_for=$remaining
+    sleep "$sleep_for"
+    [[ "$(date +%s)" -lt "$expiry" ]] || break
+    [[ ! -d "$STATE_DIR/send.lock" ]] || continue
+    # Dispatch through the pane: background jobs lose their stdin TTY.
+    rc=0
+    AGENT_SESSION_STATE_HOME="$(dirname "$STATE_DIR")" \
+    AGENT_SESSION_TMUX_SOCKET="$SOCKET" \
+      "$SCRIPT_DIR/session-helper" op whoami >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 75 ]] || continue
+    if [[ "$rc" -ne 0 ]]; then
+      reason="1Password keepalive failed (exit $rc); app lock, exit or restart can revoke authorization"
+      break
+    fi
+  done
+  auth_status "$reason"
+  printf '%s kind=%s action=end reason=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$KIND" "$reason" \
+    >> "$(dirname "$STATE_DIR")/audit.log"
+  rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target"
+  tmux -L "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+) >/dev/null 2>&1 &
+
+tmux -L "$SOCKET" detach-client -s "$SESSION"
+printf '\033]0;%s-session\007' "$KIND"
+PS1="[$KIND-session] \\w \\$ "
+export PS1
+exec bash --noprofile --norc -i

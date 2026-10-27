@@ -1,88 +1,11 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
-session="${OP_SESSION_NAME:-copilot-op}"
-runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-lock_file="${runtime_dir}/op-session.lock"
-
-session_target() {
-  tmux list-panes -t "$session" -F '#{session_name}:#{window_index}.#{pane_index}' |
-    head -n 1
-}
-
-start_session() {
-  if tmux has-session -t "$session" 2>/dev/null; then
-    return
-  fi
-
-  tmux new-session -d -s "$session" -c "$HOME" 'exec bash --noprofile --norc'
-  target="$(session_target)"
-  tmux send-keys -t "$target" -l 'set +o history'
-  tmux send-keys -t "$target" Enter
-}
-
-case "${1:-}" in
-  start)
-    start_session
-    printf '1Password CLI session ready: %s\n' "$session"
-    ;;
-  stop)
-    tmux kill-session -t "$session" 2>/dev/null || true
-    printf '1Password CLI session stopped: %s\n' "$session"
-    ;;
-  status)
-    if tmux has-session -t "$session" 2>/dev/null; then
-      printf 'running\n'
-    else
-      printf 'stopped\n'
-      exit 1
-    fi
-    ;;
-  exec)
-    shift
-    if (($# == 0)); then
-      printf 'usage: op-session exec COMMAND [ARG ...]\n' >&2
-      exit 2
-    fi
-
-    start_session
-    target="$(session_target)"
-    exec 9>"$lock_file"
-    flock 9
-
-    request_id="$$-${RANDOM}"
-    output_file="${runtime_dir}/op-session-${request_id}.out"
-    status_file="${runtime_dir}/op-session-${request_id}.status"
-    cleanup() {
-      rm -f "$output_file" "$status_file"
-    }
-    trap cleanup EXIT
-    install -m 600 /dev/null "$output_file"
-
-    printf -v command '%q ' "$@"
-    printf -v output_path '%q' "$output_file"
-    printf -v status_path '%q' "$status_file"
-    payload="( ${command}) >${output_path} 2>&1; printf '%s' \"\$?\" >${status_path}"
-
-    tmux send-keys -t "$target" -l "$payload"
-    tmux send-keys -t "$target" Enter
-
-    timeout="${OP_SESSION_TIMEOUT:-120}"
-    deadline=$((SECONDS + timeout))
-    while [[ ! -f "$status_file" ]]; do
-      if ((SECONDS >= deadline)); then
-        printf 'Timed out after %s seconds waiting for the persistent op session.\n' "$timeout" >&2
-        exit 124
-      fi
-      sleep 0.1
-    done
-
-    cat "$output_file"
-    exit "$(cat "$status_file")"
-    ;;
-  *)
-    printf 'usage: op-session {start|status|exec COMMAND [ARG ...]|stop}\n' >&2
-    exit 2
-    ;;
-esac
+source_path=${BASH_SOURCE[0]}
+while [[ -L $source_path ]]; do
+  source_dir=$(cd "$(dirname "$source_path")" && pwd)
+  source_path=$(readlink "$source_path")
+  [[ $source_path == /* ]] || source_path=$source_dir/$source_path
+done
+script_dir=$(cd "$(dirname "$source_path")" && pwd)
+exec "$script_dir/session-helper" op "$@"

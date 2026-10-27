@@ -1,0 +1,569 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ "$#" -lt 1 ]]; then
+  echo "session-helper requires a session kind" >&2
+  exit 64
+fi
+
+KIND=$1
+shift
+
+case "$KIND" in
+  op) ;;
+  *)
+    echo "unsupported session kind: $KIND" >&2
+    exit 64
+    ;;
+esac
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+WORKER=${AGENT_SESSION_WORKER:-"$SCRIPT_DIR/session-worker"}
+STATE_ROOT=${AGENT_SESSION_STATE_HOME:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/copilot-agent-sessions"}
+STATE_DIR="$STATE_ROOT/$KIND"
+SOCKET=${AGENT_SESSION_TMUX_SOCKET:-"copilot-agent-sessions-$UID"}
+SESSION="copilot-$KIND-$UID"
+DURATION_SECONDS=3600
+LOCK_DIR="$STATE_DIR/send.lock"
+LOCK_HELD=false
+
+usage() {
+  cat <<'EOF'
+usage:
+  op-session start [-d|--duration 1h|4h|12h|24h] [--terminal]
+  op-session status
+  op-session shell
+  op-session stop
+  op-session run -- OP_ARGUMENT [ARG ...]
+  op-session exec COMMAND [ARG ...]
+  op-session OP_ARGUMENT [ARG ...]
+
+Commands run as: op OP_ARGUMENT [ARG ...]
+The legacy exec form runs COMMAND verbatim in the authenticated pane.
+Authentication is retained in one tmux PTY for one hour by default.
+Use start --duration 4h for an explicitly authorized four-hour grant.
+Use start --duration 12h for an explicitly authorized 12-hour grant.
+Use start --duration 24h for an explicitly authorized 24-hour grant.
+The grant can end earlier if 1Password invalidates authentication.
+Starting an existing session does not extend its expiration.
+Status reports pending authentication without cancelling it.
+EOF
+  agent_usage
+}
+
+agent_usage() {
+  cat <<EOF
+
+AI agents and other non-interactive harnesses:
+  Agent tool calls usually have no TTY, and many harnesses kill every process
+  a command started once it returns. Plain \`start\` refuses to run there, and
+  wrapping it in \`script\` or a pty only appears to work: the tmux server
+  holding the grant is reaped together with the tool call. Instead:
+    $KIND-session status            # exit 0 active, 2 approval pending, 1 inactive
+    $KIND-session start --terminal  # start it in a real terminal window
+  --terminal opens Terminal.app (macOS) or a desktop terminal (Linux; set
+  AGENT_SESSION_TERMINAL="alacritty -e" or similar to choose one) running
+  \`$KIND-session start\`, so the session belongs to that terminal rather than
+  the harness. The person approves there (Touch ID, password or 1Password).
+  The command waits up to AGENT_SESSION_TERMINAL_WAIT seconds (default 300)
+  and exits 0 once active, or 2 if approval is still pending; then check
+  status again instead of opening another window. Once active, every fresh
+  non-interactive tool call can use \`$KIND-session run -- ...\`.
+  Keep the session through related work; stop it once at the end. Never ask
+  for, type, print or log the password or secrets yourself.
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "required command not found: $1" >&2
+    exit 69
+  }
+}
+
+ensure_state_dir() {
+  umask 077
+  mkdir -p "$STATE_DIR"
+  chmod 0700 "$STATE_ROOT" "$STATE_DIR"
+  touch "$STATE_ROOT/audit.log"
+  chmod 0600 "$STATE_ROOT/audit.log"
+}
+
+has_tmux_session() {
+  tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null
+}
+
+get_target() {
+  local target target_session
+
+  target=
+  if [[ -f "$STATE_DIR/target" ]]; then
+    IFS= read -r target < "$STATE_DIR/target" || true
+  fi
+  if [[ "$target" =~ ^%[0-9]+$ ]]; then
+    target_session=$(
+      tmux -L "$SOCKET" display-message -p -t "$target" '#{session_name}' \
+        2>/dev/null || true
+    )
+    if [[ "$target_session" == "$SESSION" ]]; then
+      printf '%s\n' "$target"
+      return
+    fi
+  fi
+
+  target=$(
+    tmux -L "$SOCKET" list-panes -t "$SESSION" -F '#{pane_id}' \
+      2>/dev/null | head -n 1
+  )
+  [[ "$target" =~ ^%[0-9]+$ ]] || return 1
+  printf '%s\n' "$target" > "$STATE_DIR/target"
+  printf '%s\n' "$target"
+}
+
+read_expiry() {
+  local expiry_file="$STATE_DIR/expires"
+  local expiry
+
+  [[ -f "$expiry_file" ]] || return 1
+  IFS= read -r expiry < "$expiry_file"
+  [[ "$expiry" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$expiry"
+}
+
+is_active() {
+  local expiry now
+
+  has_tmux_session || return 1
+  expiry=$(read_expiry) || return 1
+  now=$(date +%s)
+  [[ "$now" -lt "$expiry" ]]
+}
+
+format_epoch() {
+  local epoch=$1
+
+  if date -r "$epoch" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null; then
+    return
+  fi
+  date -d "@$epoch" '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+audit() {
+  local action=$1
+  local detail=${2:-}
+
+  printf '%s kind=%s action=%s%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "$KIND" \
+    "$action" \
+    "$detail" >> "$STATE_ROOT/audit.log"
+}
+
+release_lock() {
+  if [[ "$LOCK_HELD" == true ]]; then
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=false
+  fi
+}
+
+acquire_lock() {
+  local attempt=0 owner
+
+  while [[ "$attempt" -lt 100 ]]; do
+    attempt=$((attempt + 1))
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      LOCK_HELD=true
+      return
+    fi
+
+    owner=
+    if [[ -f "$LOCK_DIR/pid" ]]; then
+      IFS= read -r owner < "$LOCK_DIR/pid" || true
+    fi
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$LOCK_DIR/pid"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.1
+  done
+
+  echo "session is busy; detach its interactive shell and retry" >&2
+  exit 75
+}
+
+cleanup_stale_session() {
+  local expiry
+
+  if has_tmux_session && expiry=$(read_expiry) &&
+    [[ "$(date +%s)" -ge "$expiry" ]]; then
+    printf '%s\n' "expired" > "$STATE_DIR/auth-status"
+    audit "end" " reason=expired"
+    tmux -L "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
+  fi
+  if ! has_tmux_session; then
+    rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target"
+  fi
+}
+
+quote_command() {
+  local quoted=()
+  local arg
+
+  for arg in "$@"; do
+    printf -v arg '%q' "$arg"
+    quoted+=("$arg")
+  done
+  printf '%s ' "${quoted[@]}"
+}
+
+terminal_command() {
+  local words=()
+
+  # A new terminal window does not inherit this environment; pass overrides on.
+  [[ -z "${AGENT_SESSION_WORKER:-}" ]] ||
+    words+=("AGENT_SESSION_WORKER=$(printf '%q' "$AGENT_SESSION_WORKER")")
+  [[ -z "${AGENT_SESSION_STATE_HOME:-}" ]] ||
+    words+=("AGENT_SESSION_STATE_HOME=$(printf '%q' "$AGENT_SESSION_STATE_HOME")")
+  [[ -z "${AGENT_SESSION_TMUX_SOCKET:-}" ]] ||
+    words+=("AGENT_SESSION_TMUX_SOCKET=$(printf '%q' "$AGENT_SESSION_TMUX_SOCKET")")
+  [[ -z "${XDG_STATE_HOME:-}" ]] ||
+    words+=("XDG_STATE_HOME=$(printf '%q' "$XDG_STATE_HOME")")
+  [[ "${#words[@]}" -eq 0 ]] || words=(env "${words[@]}")
+  words+=("$(printf '%q' "$SCRIPT_DIR/session-helper")" "$KIND" start)
+  words+=(--duration "$((DURATION_SECONDS / 3600))h")
+  printf '%s; echo "This window can be closed once the session is active."\n' "${words[*]}"
+}
+
+launch_terminal() {
+  local command candidate
+  local prefix=()
+
+  command=$(terminal_command)
+  if [[ -n "${AGENT_SESSION_TERMINAL:-}" ]]; then
+    read -r -a prefix <<< "$AGENT_SESSION_TERMINAL"
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    command -v osascript >/dev/null 2>&1 || return 1
+    osascript \
+      -e 'on run argv' \
+      -e 'tell application "Terminal"' \
+      -e 'activate' \
+      -e 'do script (item 1 of argv)' \
+      -e 'end tell' \
+      -e 'end run' \
+      "$command" >/dev/null
+    return
+  elif [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+    for candidate in ghostty alacritty kitty foot xterm; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        prefix=("$candidate" -e)
+        break
+      fi
+    done
+  fi
+  [[ "${#prefix[@]}" -gt 0 ]] || return 1
+  # Detach so the terminal, and the tmux server it starts, outlive this call.
+  if command -v setsid >/dev/null 2>&1; then
+    prefix=(setsid "${prefix[@]}")
+  fi
+  nohup "${prefix[@]}" bash -c "$command" </dev/null >/dev/null 2>&1 &
+}
+
+start_in_terminal() {
+  local deadline
+  local wait_seconds=${AGENT_SESSION_TERMINAL_WAIT:-300}
+
+  cleanup_stale_session
+  if is_active; then
+    status_session
+    return
+  fi
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || {
+    echo "AGENT_SESSION_TERMINAL_WAIT must be a whole number of seconds" >&2
+    exit 64
+  }
+  if has_tmux_session; then
+    echo "$KIND authorization is already pending; approve it in the open terminal window." >&2
+  elif ! launch_terminal; then
+    echo "could not open a terminal window for $KIND-session start" >&2
+    echo "Ask the person to run '$KIND-session start' in their own terminal," >&2
+    echo "or set AGENT_SESSION_TERMINAL to a launcher such as 'alacritty -e'." >&2
+    exit 69
+  else
+    echo "Opened a terminal window running '$KIND-session start'; waiting up to ${wait_seconds}s for approval there."
+  fi
+  deadline=$(($(date +%s) + wait_seconds))
+  while ! is_active; do
+    if [[ "$(date +%s)" -ge "$deadline" ]]; then
+      echo "$KIND authorization is still pending in the terminal window." >&2
+      echo "Do not open another one; re-check with: $KIND-session status" >&2
+      exit 2
+    fi
+    sleep 2
+  done
+  status_session
+}
+
+start_session() {
+  local worker_command
+
+  cleanup_stale_session
+  if is_active; then
+    status_session
+    return
+  fi
+
+  [[ -t 0 && -t 1 ]] || {
+    echo "$KIND-session start must run once in an interactive terminal" >&2
+    echo "From an agent or other non-interactive harness, run" >&2
+    echo "  $KIND-session start --terminal" >&2
+    echo "to open a real terminal window for approval; see $KIND-session --help." >&2
+    exit 64
+  }
+  [[ -x "$WORKER" ]] || {
+    echo "session worker is not executable: $WORKER" >&2
+    exit 69
+  }
+
+  if ! has_tmux_session; then
+    rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/auth-status"
+    worker_command=$(quote_command \
+      "$WORKER" "$KIND" "$SESSION" "$STATE_DIR" "$DURATION_SECONDS" "$SOCKET")
+    tmux -L "$SOCKET" new-session -d -s "$SESSION" "$worker_command"
+  fi
+
+  TMUX='' tmux -L "$SOCKET" attach-session -t "$SESSION" || true
+
+  if ! is_active; then
+    cleanup_stale_session
+    echo "authentication did not establish a $KIND session" >&2
+    [[ ! -f "$STATE_DIR/auth-status" ]] || cat "$STATE_DIR/auth-status" >&2
+    exit 77
+  fi
+
+  audit "start" " duration_seconds=$DURATION_SECONDS"
+  status_session
+}
+
+status_session() {
+  local expiry now remaining
+
+  cleanup_stale_session
+  if ! is_active; then
+    if has_tmux_session; then
+      echo "$KIND authentication is in progress; run: $KIND-session start"
+      [[ ! -f "$STATE_DIR/auth-status" ]] || cat "$STATE_DIR/auth-status"
+      return 2
+    fi
+    echo "$KIND session is not active"
+    [[ ! -f "$STATE_DIR/auth-status" ]] || cat "$STATE_DIR/auth-status"
+    return 1
+  fi
+
+  expiry=$(read_expiry)
+  now=$(date +%s)
+  remaining=$((expiry - now))
+  printf '%s session active; expires %s (%ss remaining)\n' \
+    "$KIND" "$(format_epoch "$expiry")" "$remaining"
+}
+
+stop_session() {
+  cleanup_stale_session
+  if ! has_tmux_session; then
+    echo "$KIND session is not active"
+    return
+  fi
+
+  acquire_lock
+  trap 'release_lock' EXIT HUP INT TERM
+  tmux -L "$SOCKET" kill-session -t "$SESSION"
+  rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target" "$STATE_DIR/auth-status"
+  audit "stop"
+  release_lock
+  trap - EXIT HUP INT TERM
+  echo "$KIND session stopped"
+}
+
+attach_shell() {
+  is_active || {
+    echo "$KIND session is not active; run: $KIND-session start" >&2
+    exit 77
+  }
+  [[ -t 0 && -t 1 ]] || {
+    echo "$KIND-session shell requires an interactive terminal" >&2
+    exit 64
+  }
+
+  acquire_lock
+  trap 'release_lock' EXIT HUP INT TERM
+  TMUX='' tmux -L "$SOCKET" attach-session -t "$SESSION"
+  release_lock
+  trap - EXIT HUP INT TERM
+}
+
+run_request() {
+  local request_id request_script output_file status_file status_tmp
+  local rc command_name target
+  local command=()
+
+  [[ "$#" -gt 0 ]] || {
+    usage >&2
+    exit 64
+  }
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  [[ "$#" -gt 0 ]] || {
+    usage >&2
+    exit 64
+  }
+
+  is_active || {
+    echo "$KIND session is not active; run once interactively: $KIND-session start" >&2
+    exit 77
+  }
+
+  command_name=$1
+  if [[ "$action" == "exec" ]]; then
+    command=("$@")
+  else
+    command=(op "$@")
+  fi
+
+  request_id="$(date +%s)-$$-$RANDOM"
+  request_script="$STATE_DIR/request-$request_id.sh"
+  output_file="$STATE_DIR/request-$request_id.output"
+  status_file="$STATE_DIR/request-$request_id.status"
+  status_tmp="$status_file.tmp"
+
+  cleanup_request() {
+    local path
+
+    for path in \
+      "${request_script:-}" \
+      "${output_file:-}" \
+      "${status_file:-}" \
+      "${status_tmp:-}"; do
+      [[ -n "$path" ]] && rm -f "$path"
+    done
+  }
+  trap 'cleanup_request; release_lock' EXIT HUP INT TERM
+
+  {
+    echo '#!/bin/bash'
+    echo 'set +e'
+    printf '( cd -- %q && ' "$PWD"
+    printf '%q ' "${command[@]}"
+    printf ') > %q 2>&1\n' "$output_file"
+    echo 'rc=$?'
+    printf "printf '%%s\\\\n' \"\$rc\" > %q\n" "$status_tmp"
+    printf 'mv %q %q\n' "$status_tmp" "$status_file"
+    printf "exit \"\$rc\"\n"
+  } > "$request_script"
+  chmod 0700 "$request_script"
+
+  acquire_lock
+  target=$(get_target)
+  tmux -L "$SOCKET" send-keys -t "$target" -l -- "bash $(printf '%q' "$request_script")"
+  tmux -L "$SOCKET" send-keys -t "$target" Enter
+
+  while [[ ! -f "$status_file" ]]; do
+    if ! has_tmux_session; then
+      [[ -f "$output_file" ]] && cat "$output_file"
+      echo "$KIND session ended before the command completed" >&2
+      exit 75
+    fi
+    sleep 0.1
+  done
+
+  [[ -f "$output_file" ]] && cat "$output_file"
+  IFS= read -r rc < "$status_file"
+  [[ "$rc" =~ ^[0-9]+$ ]] || rc=70
+  audit "run" " command=${command_name##*/} exit=$rc"
+  cleanup_request
+  release_lock
+  trap - EXIT HUP INT TERM
+  return "$rc"
+}
+
+require_command tmux
+ensure_state_dir
+
+action=${1:-help}
+case "$action" in
+  start)
+    shift
+    terminal_start=false
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        --terminal)
+          terminal_start=true
+          shift
+          ;;
+        -d | --duration)
+          [[ "$#" -ge 2 ]] || {
+            usage >&2
+            exit 64
+          }
+          case "$2" in
+            1h) DURATION_SECONDS=3600 ;;
+            4h) DURATION_SECONDS=14400 ;;
+            12h) DURATION_SECONDS=43200 ;;
+            24h) DURATION_SECONDS=86400 ;;
+            *)
+              echo "$KIND-session duration must be 1h, 4h, 12h or 24h" >&2
+              exit 64
+              ;;
+          esac
+          shift 2
+          ;;
+        *)
+          usage >&2
+          exit 64
+          ;;
+      esac
+    done
+    require_command "$KIND"
+    if [[ "$terminal_start" == true ]]; then
+      start_in_terminal
+    else
+      start_session
+    fi
+    ;;
+  status)
+    shift
+    [[ "$#" -eq 0 ]] || {
+      usage >&2
+      exit 64
+    }
+    status_session
+    ;;
+  shell)
+    shift
+    [[ "$#" -eq 0 ]] || {
+      usage >&2
+      exit 64
+    }
+    attach_shell
+    ;;
+  stop)
+    shift
+    [[ "$#" -eq 0 ]] || {
+      usage >&2
+      exit 64
+    }
+    stop_session
+    ;;
+  run|exec)
+    shift
+    run_request "$@"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    run_request "$@"
+    ;;
+esac

@@ -1,4 +1,4 @@
-# Remote sudo sessions
+# Sudo sessions on macOS and Linux
 
 Use `sudo-session --help` for a complete command reference, security scope,
 examples, and exit status information. `sudo-session start --help` documents
@@ -13,6 +13,18 @@ ssh -t USER@HOST sudo-session start --ssh
 Enter the sudo password at sudo's terminal prompt. Once it reports an active
 session, press **Ctrl-b**, then **d** to detach. SSH can then disconnect.
 Use the host's reachable name or address for `USER@HOST`.
+
+From a non-interactive agent harness, open a real terminal for approval:
+
+```sh
+sudo-session status
+sudo-session start --terminal
+```
+
+macOS uses Terminal.app. On Linux, set `AGENT_SESSION_TERMINAL` to a launcher
+such as `alacritty -e`. `AGENT_SESSION_TERMINAL_WAIT` controls the approval wait
+(default 300 seconds). Status exits 0 when active, 2 when approval is pending,
+or 1 when stopped. Resume pending approval; do not restart it.
 
 ## Session lifetime
 
@@ -74,7 +86,16 @@ does not kill commands already running.
 Bare `sudo` in unrelated terminals is not unlocked. Reboot or loss of the
 authentication terminal ends the session. Reattach with
 `tmux -L sudo-session attach -t auth`; detach with Ctrl-b, d instead of Ctrl-c
-to keep it alive. View lifecycle audit records with `journalctl -t sudo-session`.
+to keep it alive. Lifecycle records are in
+`~/.local/state/copilot-agent-sessions/audit.log`, and additionally
+`journalctl -t sudo-session` on Linux.
+
+The command broker uses framed Unix stream sockets and descriptor passing on
+both systems, preserving separate stdin/stdout/stderr without shell evaluation.
+Existing Linux packet-socket sessions remain usable during upgrades.
+`XDG_RUNTIME_DIR` selects its runtime root; otherwise Linux uses `/run/user/UID`
+and macOS uses the private state directory. `SUDO_SESSION_TMUX_SOCKET` isolates
+test sessions.
 
 This replaces the previous desktop `pkexec` helper and does not create a
 passwordless sudoers rule. If the old helper's expiry timer is active, startup
