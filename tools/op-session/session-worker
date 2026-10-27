@@ -40,6 +40,16 @@ while ! tmux -L "$SOCKET" list-clients -t "$SESSION" -F '#{client_pid}' \
 done
 
 echo "Authenticate once to open a 1Password CLI session for ${DURATION_SECONDS}s."
+if [[ "${AGENT_SESSION_OP_AUTH:-app}" == cli ]]; then
+  # Use the CLI's own password sign-in; works without the desktop app (SSH).
+  export OP_BIOMETRIC_UNLOCK_ENABLED=false
+  auth_status "listing 1Password CLI accounts"
+  if [[ "$(op account list --format json | jq length)" -eq 0 ]]; then
+    echo "Add your 1Password account to the CLI (sign-in address, email, Secret Key, password):"
+    auth_status "adding 1Password account to the CLI"
+    op account add
+  fi
+fi
 account_urls=()
 auth_status "listing 1Password accounts"
 account_json=$(op account list --format json)

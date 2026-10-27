@@ -25,14 +25,16 @@ SOCKET=${AGENT_SESSION_TMUX_SOCKET:-"copilot-agent-sessions-$UID"}
 SESSION="copilot-$KIND-$UID"
 DURATION_SECONDS=3600
 DURATION_EXPLICIT=false
+# auth: app (desktop-app approval) or cli (password in this terminal).
+AUTH_MODE=auto
 LOCK_DIR="$STATE_DIR/send.lock"
 LOCK_HELD=false
 
 usage() {
   cat <<'EOF'
 usage:
-  op-session start [-d|--duration DURATION] [--terminal]
-  op-session extend -d|--duration DURATION [--terminal]
+  op-session start [-d|--duration DURATION] [--terminal] [--cli|--app]
+  op-session extend -d|--duration DURATION [--terminal] [--cli|--app]
   op-session status
   op-session shell
   op-session stop
@@ -49,7 +51,10 @@ start --duration on an active session extends it to at least DURATION from
 now; extend on an inactive session starts one. Neither shortens a grant.
 start without --duration leaves an active session unchanged.
 The grant can end earlier if 1Password invalidates authentication.
-If the 1Password desktop app is not running, start launches it.
+--app approves in the 1Password desktop app (default locally); if the app is
+not running, start launches it. --cli signs in with the account password in
+this terminal (default over SSH); the first time it also asks for the email
+and Secret Key to add the account to the CLI.
 Status reports pending authentication without cancelling it.
 EOF
   agent_usage
@@ -419,9 +424,13 @@ start_session() {
   }
 
   if ! has_tmux_session; then
-    ensure_op_app
+    if [[ "$AUTH_MODE" == auto ]]; then
+      AUTH_MODE=app
+      [[ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] || AUTH_MODE=cli
+    fi
+    [[ "$AUTH_MODE" == cli ]] || ensure_op_app
     rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/auth-status" "$STATE_DIR/extendable"
-    worker_command=$(quote_command \
+    worker_command=$(quote_command env "AGENT_SESSION_OP_AUTH=$AUTH_MODE" \
       "$WORKER" "$KIND" "$SESSION" "$STATE_DIR" "$DURATION_SECONDS" "$SOCKET")
     tmux -L "$SOCKET" new-session -d -s "$SESSION" "$worker_command"
   fi
@@ -593,6 +602,11 @@ case "$action" in
       case "$1" in
         --terminal)
           terminal_start=true
+          AUTH_MODE=app
+          shift
+          ;;
+        --cli | --app)
+          AUTH_MODE=${1#--}
           shift
           ;;
         -d | --duration)

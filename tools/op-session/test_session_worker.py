@@ -35,9 +35,15 @@ tty = os.ttyname(0) if os.isatty(0) else None
 args = sys.argv[1:]
 root = Path(os.environ["TEST_ROOT"])
 with (root/"op-calls.jsonl").open("a") as f:
-    f.write(json.dumps({"args":args,"tty":tty})+"\\n")
-if args[:2] == ["account","list"]:
-    if os.environ.get("TEST_APP_MARKER") and not Path(os.environ["TEST_APP_MARKER"]).exists():
+    f.write(json.dumps({"args":args,"tty":tty,
+                        "app":os.environ.get("OP_BIOMETRIC_UNLOCK_ENABLED","true")})+"\\n")
+cli_only = os.environ.get("OP_BIOMETRIC_UNLOCK_ENABLED") == "false"
+if args[:2] == ["account","list"] and cli_only and not (root/"cli-account").exists():
+    print("[]")
+elif args[:2] == ["account","add"]:
+    (root/"cli-account").touch()
+elif args[:2] == ["account","list"]:
+    if not cli_only and os.environ.get("TEST_APP_MARKER") and not Path(os.environ["TEST_APP_MARKER"]).exists():
         print("cannot connect to 1Password app", file=sys.stderr)
         sys.exit(1)
     print('[{"url":"example.1password.test"}]')
@@ -243,6 +249,18 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.finish_start()
         self.assertTrue(marker.exists())
         self.assertEqual(self.run_helper("vault", "list").returncode, 0)
+
+    def test_ssh_start_uses_cli_password_signin_and_adds_account_once(self):
+        self.env["SSH_CONNECTION"] = "192.0.2.1 50000 192.0.2.2 22"
+        self.env["TEST_APP_MARKER"] = str(self.temporary / "never")
+        self.begin_start()
+        self.finish_start()
+        self.assertEqual(self.run_helper("vault", "list").returncode, 0)
+        worker_calls = [c for c in self.calls() if c["app"] == "false"]
+        self.assertEqual(sum(c["args"][:2] == ["account", "add"] for c in worker_calls), 1)
+        self.assertEqual(sum(c["args"][:1] == ["signin"] for c in worker_calls), 1)
+        self.assertIn(["vault", "list"], [c["args"] for c in worker_calls])
+        self.assertFalse((self.temporary / "never").exists())
 
     def test_noninteractive_start_explains_terminal_flow(self):
         result = self.run_helper("start")

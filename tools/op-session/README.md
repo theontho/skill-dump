@@ -20,7 +20,12 @@ Default leases last one hour. Explicitly authorized longer leases accept
 now, and `extend` on an inactive grant starts one; neither shortens a grant,
 and `start` without `--duration` leaves an active grant unchanged. If the
 1Password desktop app is unreachable (e.g. it exited after a package upgrade),
-`start` launches it (`AGENT_SESSION_OP_APP` overrides the launcher). `status` never cancels pending approval; resume its existing
+`start` launches it (`AGENT_SESSION_OP_APP` overrides the launcher).
+
+Over SSH (or with `--cli`), `start` skips the desktop app and signs in with the
+account password in the terminal (`OP_BIOMETRIC_UNLOCK_ENABLED=false`). The
+first time, it runs `op account add`, which asks for the sign-in address,
+email, Secret Key and password. `--app` forces desktop-app approval. `status` never cancels pending approval; resume its existing
 terminal rather than opening another. `shell` attaches to the authorized pane.
 
 The worker selects a configured account, signs in once, validates it, and
