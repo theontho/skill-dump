@@ -1,0 +1,4 @@
+#!/bin/sh
+# Reinstall skill-dump after switching branches or commits in this checkout.
+[ "$3" = 1 ] && [ "$1" != "$2" ] || exit 0
+exec "$(git rev-parse --show-toplevel)/bin/skill-dump" install --from-git-hook

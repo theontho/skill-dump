@@ -14,8 +14,9 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 - writes a managed block of usage notes for the installed tools into the agents' global instruction files
   (`~/.copilot/copilot-instructions.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, ... for agents that are present),
   plus `agents/hosts/<hostname>.md` when one exists for that computer;
-- installs an hourly `skill-dump-update.timer` (launchd agent on macOS) that fast-forwards the clone and reinstalls.
-  Pushing to `main` therefore updates every computer within about an hour. Services whose tool changed are restarted.
+- sets git hooks in the clone (`core.hooksPath=githooks`), so every `git pull` or checkout there reinstalls.
+  There is no background update service: sync a computer with `skill-dump update` (or `git pull` in the clone).
+  Services whose tool changed are restarted.
 
 | Tool | What it does | Needs |
 | --- | --- | --- |
@@ -25,18 +26,18 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 | `copilot-persistent` | `copilot` wrapper that keeps interactive sessions in a tmux service | Linux, systemd user session, tmux, mise |
 
 Tools whose requirements are missing are skipped. Choose tools with `--skip` / `--only`
-(saved in `~/.config/skill-dump/config` and reused by updates):
+(saved in `~/.config/skill-dump/config` and reused when a pull reinstalls):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/theontho/skill-dump/main/install.sh | bash -s -- --skip copilot-persistent
-skill-dump status          # what is installed, last update, next check
-skill-dump update          # pull and apply now
+skill-dump status          # what is installed and when it last synced
+skill-dump update          # git pull (fast-forward only) and reinstall
 skill-dump uninstall
 ```
 
 The installer never overwrites files it did not create; pass `--force` to move them aside
-(`NAME.skill-dump-bak.TIME`). Anything removed from the repo is removed from installed computers on their next update.
-Local changes in the installed clone pause updates until they are committed or discarded.
+(`NAME.skill-dump-bak.TIME`). Anything removed from the repo is removed from installed computers when they next sync.
+`skill-dump update` won't pull while the installed clone has local changes.
 
 ### Adopting it on a computer that already has these tools
 

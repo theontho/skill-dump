@@ -1,9 +1,10 @@
 # Adopt skill-dump on a computer
 
-skill-dump (github.com/theontho/skill-dump) installs shared agent tooling on every computer and keeps it updated:
+skill-dump (github.com/theontho/skill-dump) installs shared agent tooling on every computer:
 `tools/<name>/` programs are linked into `~/.local/bin`, their systemd user units are installed, `skills/` are linked into
 `~/.agents/skills` and `~/.claude/skills`, and a managed block of usage notes is written into each agent's global
-instruction file. An hourly timer (launchd on macOS) fast-forwards the installed clone and reinstalls.
+instruction file. Git hooks in the installed clone reinstall after every `git pull` or checkout there; `skill-dump update` pulls
+(fast-forward only) and reinstalls. There is no background update service.
 
 Adopting it on a computer has two goals:
 
@@ -15,9 +16,9 @@ Adopting it on a computer has two goals:
 ## Ground rules
 
 - The installed clone (`~/.local/share/skill-dump`) is a deployment. Never edit it, `~/.local/bin` links, rendered unit
-  files or the managed instruction blocks; local changes in the clone pause its updates. Make changes in a separate dev
+  files or the managed instruction blocks; `skill-dump update` won't pull while the clone has local changes. Make changes in a separate dev
   checkout (for example `~/src/skill-dump`).
-- Commit improvements, but **do not push without the user's approval**. Every computer pulls `main` within an hour.
+- Commit improvements, but **do not push without the user's approval**. Every computer gets `main` the next time it syncs.
 - Move rather than copy-and-keep: once something is in the repo and installed, delete the old copy. Don't leave
   compatibility symlinks. Back up configuration before deleting it.
 - Read `README.md` and `AGENTS.md` in the repo first. They describe `tool.conf`, placeholders and the validation commands.
@@ -76,7 +77,7 @@ Work in the dev checkout:
     `XDG_STATE_HOME` to a temporary directory, and `unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS` so the real
     systemd user manager is unreachable.
   - Test the update path with a bare clone as origin:
-    `SKILL_DUMP_REPO=$T/origin.git bash install.sh`, push a change to `$T/origin.git`, then `skill-dump update`.
+    `SKILL_DUMP_REPO=$T/origin.git bash install.sh`, push a change to `$T/origin.git`, then both `git pull` in the installed clone and `skill-dump update` must reinstall.
 - Commit with a clear message, report the changes to the user, and ask before pushing. If the computer's install
   needs these changes, wait until they are pushed before step 4.
 
@@ -101,8 +102,8 @@ Work in the dev checkout:
 
 ## 5. Verify
 
-- `skill-dump status`: correct commit, tools installed, timer enabled with a next run time.
-- `systemctl --user is-active agent-coord copilot-tmux skill-dump-update.timer` (only for installed tools). Unit
+- `skill-dump status`: correct commit, tools installed, and `hooks: reinstall on git pull/checkout`.
+- `systemctl --user is-active agent-coord copilot-tmux` (only for installed tools). Unit
   `ExecStart` lines point into `~/.local/share/skill-dump`.
 - Each command works: `agent-coord status` still shows its earlier leases, `sudo-session status`, `op-session status`
   and `copilot --version`.

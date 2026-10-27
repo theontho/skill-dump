@@ -14,6 +14,6 @@
     "skills:install:codex": "npx skills add . --skill '*' --agent codex --full-depth -y",
     "skills:install:all": "npx skills add . --skill '*' --agent '*' --full-depth -y",
     "tools:test": "cd tools/agent-coord && python3 -m unittest -q test_agent_coord && cd ../sudo-session && python3 -m unittest -q test_sudo_session",
-    "tools:lint": "shellcheck bin/skill-dump install.sh tools/copilot-persistent/copilot tools/copilot-persistent/copilot-real"
+    "tools:lint": "shellcheck bin/skill-dump install.sh githooks/* tools/copilot-persistent/copilot tools/copilot-persistent/copilot-real"
   }
 }

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Reinstall skill-dump after a pull or merge in this checkout.
+exec "$(git rev-parse --show-toplevel)/bin/skill-dump" install --from-git-hook
