@@ -165,6 +165,10 @@ class SessionTests(unittest.TestCase):
               patch.object(session, "start", return_value=0) as start):
             self.assertEqual(session.main(), 0)
             start.assert_called_once_with(43200)
+        with (patch.object(sys, "argv", ["sudo-session", "start", "-d", "24h"]),
+              patch.object(session, "start", return_value=0) as start):
+            self.assertEqual(session.main(), 0)
+            start.assert_called_once_with(86400)
         with (patch.object(session.sys.stdin, "isatty", return_value=True),
               patch.object(session.sys.stdout, "isatty", return_value=True),
               patch.object(session, "prepare_runtime"),

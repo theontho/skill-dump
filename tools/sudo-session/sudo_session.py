@@ -38,8 +38,8 @@ HELP = """\
 sudo-session - share a time-limited sudo credential across agent shells
 
 USAGE
-  sudo-session start [--ssh] [--terminal] [--duration DURATION]
-  sudo-session extend --duration DURATION
+  sudo-session start [--ssh] [--terminal] [-d|--duration DURATION]
+  sudo-session extend -d|--duration DURATION
   sudo-session status
   sudo-session run [--] COMMAND [ARG ...]
   sudo-session exec [--] COMMAND [ARG ...]
@@ -51,7 +51,7 @@ COMMANDS
   start     Authenticate directly with sudo in a private local or SSH terminal.
             From a non-interactive agent, use --terminal to open Terminal.app
             on macOS, or a Linux desktop terminal. The person approves there.
-            Default lifetime: 1h. --duration accepts positive whole numbers
+            Default lifetime: 1h. -d/--duration accepts positive whole numbers
             with s (seconds), m (minutes), h (hours), or d (days).
             No suffix means seconds. Examples: 90s, 30m, 12h, 1d.
             --ssh is an optional marker; both modes need a real terminal.
@@ -73,6 +73,7 @@ COMMANDS
 EXAMPLES
   sudo-session start                          # authenticate for one hour
   sudo-session start --duration 12h            # authenticate for twelve hours
+  sudo-session start -d 24h                    # short form
   ssh -t USER@HOST sudo-session start --ssh --duration 12h
   sudo-session status
   sudo-session extend --duration 12h           # at least 12 hours from now
@@ -147,7 +148,7 @@ def start_parser(prog="sudo-session start"):
     parser.add_argument("--ssh", action="store_true", help="mark an SSH-terminal login (no desktop needed)")
     parser.add_argument("--terminal", action="store_true", help="open a real terminal for approval")
     parser.add_argument(
-        "--duration", type=parse_duration, default=DURATION, metavar="DURATION",
+        "-d", "--duration", type=parse_duration, default=DURATION, metavar="DURATION",
         help="session lifetime, e.g. 90s, 30m, 12h, 1d; default: 1h; bare numbers mean seconds",
     )
     return parser
@@ -164,7 +165,7 @@ def extend_parser():
         ),
     )
     parser.add_argument(
-        "--duration", type=parse_duration, required=True, metavar="DURATION",
+        "-d", "--duration", type=parse_duration, required=True, metavar="DURATION",
         help="minimum remaining lifetime, e.g. 30m, 12h, 1d; bare numbers mean seconds",
     )
     return parser

@@ -38,7 +38,7 @@ ssh -t USER@HOST sudo-session start --ssh --duration 12h
 
 Durations accept positive whole numbers with `s`, `m`, `h`, or `d` suffixes
 (seconds, minutes, hours, days). Bare numbers mean seconds. Examples: `90s`,
-`30m`, `12h`, `1d`.
+`30m`, `12h`, `1d`. `-d` is short for `--duration` (e.g. `sudo-session start -d 24h`).
 
 To give an active session **at least twelve hours remaining from now**:
 
