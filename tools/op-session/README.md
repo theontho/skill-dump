@@ -7,15 +7,20 @@ and Linux, so fresh agent shells can reuse it without another sign-in.
 op-session status                # 0 active, 2 approval pending, 1 inactive
 op-session start                 # authenticate once in an interactive terminal
 op-session start --terminal      # open a real terminal from an agent harness
+op-session extend -d 12h         # at least 12h remaining; starts if inactive
 op-session vault list            # ordinary op arguments
 op-session run -- vault list     # explicit op-argument form
 op-session exec op vault list    # backward-compatible verbatim command form
 op-session stop
 ```
 
-Default leases last one hour. Explicitly authorized `--duration 4h`, `12h`
-and `24h` leases are supported (`-d` is an alias). Starting an existing grant
-does not extend it. `status` never cancels pending approval; resume its existing
+Default leases last one hour. Explicitly authorized longer leases accept
+`-d`/`--duration` with `s`, `m`, `h` or `d` (e.g. `30m`, `12h`, `1d`).
+`start --duration` on an active grant extends it to at least that long from
+now, and `extend` on an inactive grant starts one; neither shortens a grant,
+and `start` without `--duration` leaves an active grant unchanged. If the
+1Password desktop app is unreachable (e.g. it exited after a package upgrade),
+`start` launches it (`AGENT_SESSION_OP_APP` overrides the launcher). `status` never cancels pending approval; resume its existing
 terminal rather than opening another. `shell` attaches to the authorized pane.
 
 The worker selects a configured account, signs in once, validates it, and

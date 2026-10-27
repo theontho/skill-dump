@@ -39,7 +39,7 @@ while ! tmux -L "$SOCKET" list-clients -t "$SESSION" -F '#{client_pid}' \
   sleep 0.1
 done
 
-echo "Authenticate once to open a $((DURATION_SECONDS / 3600))-hour 1Password CLI session."
+echo "Authenticate once to open a 1Password CLI session for ${DURATION_SECONDS}s."
 account_urls=()
 auth_status "listing 1Password accounts"
 account_json=$(op account list --format json)
@@ -94,17 +94,22 @@ mv "$STATE_DIR/target.tmp" "$STATE_DIR/target"
 printf '%s\n' "$expiry" > "$STATE_DIR/expires.tmp"
 mv "$STATE_DIR/expires.tmp" "$STATE_DIR/expires"
 printf '%s\n' "$$" > "$STATE_DIR/ready"
+: > "$STATE_DIR/extendable"
 auth_status "authenticated"
 trap - EXIT
 
 (
   reason="expired"
   while true; do
+    # session-helper extend may move the expiry later.
+    IFS= read -r expiry < "$STATE_DIR/expires" 2>/dev/null || break
+    [[ "$expiry" =~ ^[0-9]+$ ]] || break
     remaining=$((expiry - $(date +%s)))
     [[ "$remaining" -gt 0 ]] || break
     sleep_for=45
     [[ "$remaining" -ge "$sleep_for" ]] || sleep_for=$remaining
     sleep "$sleep_for"
+    IFS= read -r expiry < "$STATE_DIR/expires" 2>/dev/null || break
     [[ "$(date +%s)" -lt "$expiry" ]] || break
     [[ ! -d "$STATE_DIR/send.lock" ]] || continue
     # Dispatch through the pane: background jobs lose their stdin TTY.
@@ -122,7 +127,7 @@ trap - EXIT
   printf '%s kind=%s action=end reason=%s\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$KIND" "$reason" \
     >> "$(dirname "$STATE_DIR")/audit.log"
-  rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target"
+  rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target" "$STATE_DIR/extendable"
   tmux -L "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
 ) >/dev/null 2>&1 &
 

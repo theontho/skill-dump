@@ -55,11 +55,12 @@ COMMANDS
             with s (seconds), m (minutes), h (hours), or d (days).
             No suffix means seconds. Examples: 90s, 30m, 12h, 1d.
             --ssh is an optional marker; both modes need a real terminal.
-            An existing active session is left unchanged, not extended.
+            On an active session, an explicit --duration extends it to at
+            least DURATION from now; without one it is left unchanged.
   extend    Give an active session at least DURATION remaining from now.
             Example: extend --duration 12h. Never shortens a longer session.
-            Uses the active sudo credential, logs the change, and cannot
-            revive a stopped or expired session.
+            Uses the active sudo credential and logs the change. With no
+            active session it falls back to start --duration DURATION.
   status    Show whether the session is active and how much time remains.
   run       Run a command through noninteractive sudo on the authenticated
             terminal. Arguments, working directory, stdin, stdout, stderr,
@@ -83,9 +84,9 @@ EXAMPLES
 
 CHANGING THE LIFETIME
   Active session: sudo-session extend --duration 12h
-  Stopped session: sudo-session start --duration 12h in a private terminal.
+  Or: sudo-session start --duration 12h (extends an active session).
+  Stopped session: either command authenticates in a private terminal.
   To shorten a lifetime, stop the session and authenticate again.
-  Starting again does not reset or extend an existing deadline.
 
 TERMINAL AND PASSWORD SAFETY
   Enter the password only at sudo's private terminal prompt, never in agent
@@ -140,15 +141,15 @@ def start_parser(prog="sudo-session start"):
         epilog=(
             "Examples: sudo-session start --duration 12h; "
             "ssh -t USER@HOST sudo-session start --ssh --duration 12h. "
-            "An existing session is not extended: use sudo-session extend "
-            "--duration 12h, or stop it and authenticate again to shorten its "
-            "lifetime. Never enter the password in agent chat."
+            "With --duration, an active session is extended (never shortened); "
+            "stop it and authenticate again to shorten its lifetime. "
+            "Never enter the password in agent chat."
         ),
     )
     parser.add_argument("--ssh", action="store_true", help="mark an SSH-terminal login (no desktop needed)")
     parser.add_argument("--terminal", action="store_true", help="open a real terminal for approval")
     parser.add_argument(
-        "-d", "--duration", type=parse_duration, default=DURATION, metavar="DURATION",
+        "-d", "--duration", type=parse_duration, default=None, metavar="DURATION",
         help="session lifetime, e.g. 90s, 30m, 12h, 1d; default: 1h; bare numbers mean seconds",
     )
     return parser
@@ -160,10 +161,12 @@ def extend_parser():
         description="Give an active session at least the requested time remaining from now.",
         epilog=(
             "Example: sudo-session extend --duration 12h. Does not shorten a "
-            "longer session or revive an expired one. Uses the active sudo "
-            "credential; no new password prompt. The change is audited."
+            "longer session. Uses the active sudo credential; no new password "
+            "prompt. The change is audited. With no active session it starts "
+            "one, like start --duration."
         ),
     )
+    parser.add_argument("--terminal", action="store_true", help="if starting, open a real terminal for approval")
     parser.add_argument(
         "-d", "--duration", type=parse_duration, required=True, metavar="DURATION",
         help="minimum remaining lifetime, e.g. 30m, 12h, 1d; bare numbers mean seconds",
@@ -390,7 +393,33 @@ def serve(duration=None):
             audit("Closed authenticated terminal session")
 
 
-def start(duration=DURATION):
+def extend(duration):
+    """Return the reply, or None when no session is running."""
+    try:
+        reply = request({"action": "extend", "duration": duration})
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    if reply.get("error") == "Unknown session action":
+        raise RuntimeError(
+            "The running session predates extension support. Once, run sudo-session stop,\n"
+            "then authenticate in a private terminal with "
+            f"sudo-session start --duration {duration}s.\n"
+            "New sessions support sudo-session extend."
+        )
+    if reply.get("error") in ("Credential session expired", "Sudo credential is no longer valid"):
+        return None
+    if reply.get("error"):
+        raise RuntimeError(reply["error"])
+    return reply
+
+
+def start(duration=None):
+    if duration is not None:
+        reply = extend(duration)
+        if reply is not None:
+            print(f"active ({format_duration(reply['remaining'])} remaining)")
+            return reply["code"]
+    duration = duration or DURATION
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError(
             "Start from a private SSH terminal:\n"
@@ -423,7 +452,13 @@ def pending():
     ).returncode == 0
 
 
-def start_in_terminal(duration):
+def start_in_terminal(duration=None):
+    if duration is not None:
+        reply = extend(duration)
+        if reply is not None:
+            print(f"active ({format_duration(reply['remaining'])} remaining)")
+            return reply["code"]
+    duration = duration or DURATION
     try:
         result = request({"action": "status"})
     except (FileNotFoundError, ConnectionRefusedError):
@@ -488,22 +523,13 @@ def main():
         return start(options.duration)
     if action == "extend":
         options = extend_parser().parse_args(args)
-        try:
-            reply = request({"action": "extend", "duration": options.duration})
-        except (FileNotFoundError, ConnectionRefusedError):
-            raise RuntimeError(
-                "No active sudo session to extend; authenticate in a private terminal with "
-                f"sudo-session start --duration {options.duration}s"
-            ) from None
-        if reply.get("error") == "Unknown session action":
-            raise RuntimeError(
-                "The running session predates extension support. Once, run sudo-session stop,\n"
-                "then authenticate in a private terminal with "
-                f"sudo-session start --duration {options.duration}s.\n"
-                "New sessions support sudo-session extend."
-            )
-        if reply.get("error"):
-            raise RuntimeError(reply["error"])
+        reply = extend(options.duration)
+        if reply is None:
+            print(f"No active sudo session; starting one for {format_duration(options.duration)}.",
+                  file=sys.stderr)
+            if options.terminal:
+                return start_in_terminal(options.duration)
+            return start(options.duration)
         print(f"active ({format_duration(reply['remaining'])} remaining)")
         return reply["code"]
     if action in ("status", "stop"):

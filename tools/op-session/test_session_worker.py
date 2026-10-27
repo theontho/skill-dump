@@ -37,6 +37,9 @@ root = Path(os.environ["TEST_ROOT"])
 with (root/"op-calls.jsonl").open("a") as f:
     f.write(json.dumps({"args":args,"tty":tty})+"\\n")
 if args[:2] == ["account","list"]:
+    if os.environ.get("TEST_APP_MARKER") and not Path(os.environ["TEST_APP_MARKER"]).exists():
+        print("cannot connect to 1Password app", file=sys.stderr)
+        sys.exit(1)
     print('[{"url":"example.1password.test"}]')
 elif args[:1] == ["signin"]:
     time.sleep(float(os.environ.get("TEST_SIGNIN_DELAY","0")))
@@ -88,10 +91,10 @@ time.sleep(0.2 if seconds==45 else seconds)
             os.close(self.terminal)
             self.terminal = None
 
-    def begin_start(self):
+    def begin_start(self, *arguments):
         pid, terminal = pty.fork()
         if pid == 0:
-            os.execve(str(self.helper), [str(self.helper), "start"], self.env)
+            os.execve(str(self.helper), [str(self.helper), "start", *arguments], self.env)
         self.started_pid = pid
         self.terminal = terminal
 
@@ -147,7 +150,9 @@ time.sleep(0.2 if seconds==45 else seconds)
         result = self.run_helper("status")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(expiry.read_text(), original_expiry)
-        calls = self.calls()
+        # The helper first probes desktop-app reachability from its own terminal.
+        calls = self.calls()[1:]
+        self.assertEqual(self.calls()[0]["args"][:2], ["account", "list"])
         self.assertEqual(sum(c["args"][:1] == ["signin"] for c in calls), 1)
         self.assertEqual(len({c["tty"] for c in calls}), 1, calls)
         self.assertIsNotNone(calls[0]["tty"])
@@ -201,6 +206,43 @@ time.sleep(0.2 if seconds==45 else seconds)
             str(Path.cwd().resolve()), "$(not a shell command)",
         ])
         self.assertEqual(self.run_helper("run", "--", "vault", "list").returncode, 0)
+
+    def test_extend_and_start_duration_lengthen_but_never_shorten(self):
+        self.begin_start()
+        self.finish_start()
+        expiry = self.temporary / "state/op/expires"
+        original = int(expiry.read_text())
+        result = self.run_helper("extend", "-d", "1d")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        extended = int(expiry.read_text())
+        self.assertGreaterEqual(extended - original, 86400 - 3600 - 5)
+        self.assertEqual(self.run_helper("start", "--duration", "30m").returncode, 0)
+        self.assertEqual(int(expiry.read_text()), extended)
+        self.assertEqual(self.run_helper("start").returncode, 0)
+        self.assertEqual(int(expiry.read_text()), extended)
+        self.assertEqual(self.run_helper("start", "-d", "2d").returncode, 0)
+        self.assertGreater(int(expiry.read_text()), extended)
+        self.wait_for(lambda: sum(c["args"] == ["whoami"] for c in self.calls()) >= 2,
+                      "Keepalive stopped after extension")
+        self.assertEqual(self.run_helper("status").returncode, 0)
+        self.assertEqual(sum(c["args"][:1] == ["signin"] for c in self.calls()), 1)
+        for bad in ("0", "1.5h", "forever"):
+            self.assertEqual(self.run_helper("extend", "-d", bad).returncode, 64)
+
+    def test_extend_without_session_falls_back_to_start(self):
+        result = self.run_helper("extend", "-d", "12h")
+        self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        self.assertIn("starting one", result.stderr)
+        self.assertIn("start --terminal --duration 43200s", result.stderr)
+
+    def test_start_launches_unreachable_desktop_app(self):
+        marker = self.temporary / "app-running"
+        self.env["TEST_APP_MARKER"] = str(marker)
+        self.env["AGENT_SESSION_OP_APP"] = f"touch {marker}"
+        self.begin_start("-d", "90m")
+        self.finish_start()
+        self.assertTrue(marker.exists())
+        self.assertEqual(self.run_helper("vault", "list").returncode, 0)
 
     def test_noninteractive_start_explains_terminal_flow(self):
         result = self.run_helper("start")

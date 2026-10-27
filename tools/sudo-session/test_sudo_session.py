@@ -182,12 +182,31 @@ class SessionTests(unittest.TestCase):
 
     def test_extend_cli_handles_stopped_and_old_sessions_explicitly(self):
         with patch.object(sys, "argv", ["sudo-session", "extend", "--duration", "12h"]):
-            with patch.object(session, "request", side_effect=FileNotFoundError):
-                with self.assertRaisesRegex(RuntimeError, "No active sudo session to extend"):
+            with (patch.object(session, "request", side_effect=FileNotFoundError),
+                  patch.object(session.sys.stdin, "isatty", return_value=False)):
+                with self.assertRaisesRegex(RuntimeError, "start --ssh --duration 43200s"):
                     session.main()
+            with (patch.object(session, "request", side_effect=FileNotFoundError),
+                  patch.object(session, "start", return_value=0) as start):
+                self.assertEqual(session.main(), 0)
+                start.assert_called_once_with(43200)
             with patch.object(session, "request", return_value={"code": 1, "error": "Unknown session action"}):
                 with self.assertRaisesRegex(RuntimeError, "predates extension support"):
                     session.main()
+
+    def test_start_with_duration_extends_active_session_and_without_leaves_it(self):
+        with patch.object(session, "request", return_value={"code": 0, "remaining": 86400}) as request:
+            self.assertEqual(session.start(86400), 0)
+            request.assert_called_once_with({"action": "extend", "duration": 86400})
+            self.assertEqual(session.start_in_terminal(86400), 0)
+        with (patch.object(session.sys.stdin, "isatty", return_value=True),
+              patch.object(session.sys.stdout, "isatty", return_value=True),
+              patch.object(session, "prepare_runtime"),
+              patch.object(session, "request", return_value={"code": 0, "remaining": 60}) as request,
+              patch.object(session.subprocess, "call") as launch):
+            self.assertEqual(session.start(), 0)
+            request.assert_called_once_with({"action": "status"})
+            launch.assert_not_called()
 
     def test_terminal_start_preserves_pending_approval_and_waits_for_broker(self):
         with (patch.object(session, "pending", return_value=True),

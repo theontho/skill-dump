@@ -24,13 +24,15 @@ STATE_DIR="$STATE_ROOT/$KIND"
 SOCKET=${AGENT_SESSION_TMUX_SOCKET:-"copilot-agent-sessions-$UID"}
 SESSION="copilot-$KIND-$UID"
 DURATION_SECONDS=3600
+DURATION_EXPLICIT=false
 LOCK_DIR="$STATE_DIR/send.lock"
 LOCK_HELD=false
 
 usage() {
   cat <<'EOF'
 usage:
-  op-session start [-d|--duration 1h|4h|12h|24h] [--terminal]
+  op-session start [-d|--duration DURATION] [--terminal]
+  op-session extend -d|--duration DURATION [--terminal]
   op-session status
   op-session shell
   op-session stop
@@ -41,11 +43,13 @@ usage:
 Commands run as: op OP_ARGUMENT [ARG ...]
 The legacy exec form runs COMMAND verbatim in the authenticated pane.
 Authentication is retained in one tmux PTY for one hour by default.
-Use start --duration 4h for an explicitly authorized four-hour grant.
-Use start --duration 12h for an explicitly authorized 12-hour grant.
-Use start --duration 24h for an explicitly authorized 24-hour grant.
+DURATION is a positive whole number with s, m, h or d (bare numbers are
+seconds), e.g. 30m, 12h, 24h, 1d. Longer grants need explicit authorization.
+start --duration on an active session extends it to at least DURATION from
+now; extend on an inactive session starts one. Neither shortens a grant.
+start without --duration leaves an active session unchanged.
 The grant can end earlier if 1Password invalidates authentication.
-Starting an existing session does not extend its expiration.
+If the 1Password desktop app is not running, start launches it.
 Status reports pending authentication without cancelling it.
 EOF
   agent_usage
@@ -204,7 +208,7 @@ cleanup_stale_session() {
     tmux -L "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
   fi
   if ! has_tmux_session; then
-    rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target"
+    rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target" "$STATE_DIR/extendable"
   fi
 }
 
@@ -217,6 +221,84 @@ quote_command() {
     quoted+=("$arg")
   done
   printf '%s ' "${quoted[@]}"
+}
+
+parse_duration() {
+  local value=$1 number unit
+
+  [[ "$value" =~ ^([0-9]+)([smhd]?)$ ]] || {
+    echo "$KIND-session duration must be a positive whole number with s, m, h or d, such as 30m or 12h" >&2
+    exit 64
+  }
+  number=$((10#${BASH_REMATCH[1]}))
+  unit=${BASH_REMATCH[2]}
+  case "$unit" in
+    m) number=$((number * 60)) ;;
+    h) number=$((number * 3600)) ;;
+    d) number=$((number * 86400)) ;;
+  esac
+  [[ "$number" -gt 0 && "${#BASH_REMATCH[1]}" -le 12 ]] || {
+    echo "$KIND-session duration must be positive and reasonable" >&2
+    exit 64
+  }
+  DURATION_SECONDS=$number
+  DURATION_EXPLICIT=true
+}
+
+extend_session() {
+  local expiry now target_expiry
+
+  cleanup_stale_session
+  is_active || return 1
+  [[ -f "$STATE_DIR/extendable" ]] || {
+    echo "The running $KIND session predates extension support." >&2
+    echo "Once, run: $KIND-session stop; $KIND-session start --duration ${DURATION_SECONDS}s" >&2
+    exit 69
+  }
+  expiry=$(read_expiry)
+  now=$(date +%s)
+  target_expiry=$((now + DURATION_SECONDS))
+  if [[ "$target_expiry" -gt "$expiry" ]]; then
+    printf '%s\n' "$target_expiry" > "$STATE_DIR/expires.tmp"
+    mv "$STATE_DIR/expires.tmp" "$STATE_DIR/expires"
+    audit "extend" " remaining_seconds=$DURATION_SECONDS"
+  fi
+  status_session
+}
+
+op_app_reachable() {
+  op account list --format json >/dev/null 2>&1
+}
+
+# The CLI's desktop-app integration fails while the app is not running, e.g.
+# after a package upgrade replaced its binary and it exited.
+ensure_op_app() {
+  local deadline launcher=()
+
+  op_app_reachable && return
+  if [[ -n "${AGENT_SESSION_OP_APP:-}" ]]; then
+    read -r -a launcher <<< "$AGENT_SESSION_OP_APP"
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    launcher=(open -g -a 1Password)
+  elif command -v 1password >/dev/null 2>&1; then
+    if command -v systemd-run >/dev/null 2>&1 &&
+      systemctl --user is-system-running >/dev/null 2>&1; then
+      launcher=(systemd-run --user --collect --quiet -- "$(command -v 1password)" --silent)
+    else
+      launcher=(setsid -f 1password --silent)
+    fi
+  fi
+  if [[ "${#launcher[@]}" -gt 0 ]]; then
+    echo "1Password desktop app is not reachable; launching it." >&2
+    "${launcher[@]}" </dev/null >/dev/null 2>&1 || true
+    deadline=$(($(date +%s) + ${AGENT_SESSION_OP_APP_WAIT:-30}))
+    while [[ "$(date +%s)" -lt "$deadline" ]]; do
+      op_app_reachable && return
+      sleep 1
+    done
+  fi
+  echo "warning: 1Password desktop app is still not reachable; start and unlock it," >&2
+  echo "and enable Settings > Developer > Integrate with 1Password CLI." >&2
 }
 
 terminal_command() {
@@ -233,7 +315,7 @@ terminal_command() {
     words+=("XDG_STATE_HOME=$(printf '%q' "$XDG_STATE_HOME")")
   [[ "${#words[@]}" -eq 0 ]] || words=(env "${words[@]}")
   words+=("$(printf '%q' "$SCRIPT_DIR/session-helper")" "$KIND" start)
-  words+=(--duration "$((DURATION_SECONDS / 3600))h")
+  words+=(--duration "${DURATION_SECONDS}s")
   printf '%s; echo "This window can be closed once the session is active."\n' "${words[*]}"
 }
 
@@ -277,7 +359,11 @@ start_in_terminal() {
 
   cleanup_stale_session
   if is_active; then
-    status_session
+    if [[ "$DURATION_EXPLICIT" == true ]]; then
+      extend_session
+    else
+      status_session
+    fi
     return
   fi
   [[ "$wait_seconds" =~ ^[0-9]+$ ]] || {
@@ -286,7 +372,7 @@ start_in_terminal() {
   }
   if has_tmux_session; then
     echo "$KIND authorization is already pending; approve it in the open terminal window." >&2
-  elif ! launch_terminal; then
+  elif ! { ensure_op_app; launch_terminal; }; then
     echo "could not open a terminal window for $KIND-session start" >&2
     echo "Ask the person to run '$KIND-session start' in their own terminal," >&2
     echo "or set AGENT_SESSION_TERMINAL to a launcher such as 'alacritty -e'." >&2
@@ -311,14 +397,19 @@ start_session() {
 
   cleanup_stale_session
   if is_active; then
-    status_session
+    if [[ "$DURATION_EXPLICIT" == true ]]; then
+      extend_session
+    else
+      echo "Existing session unchanged; use --duration to extend it."
+      status_session
+    fi
     return
   fi
 
   [[ -t 0 && -t 1 ]] || {
     echo "$KIND-session start must run once in an interactive terminal" >&2
     echo "From an agent or other non-interactive harness, run" >&2
-    echo "  $KIND-session start --terminal" >&2
+    echo "  $KIND-session start --terminal --duration ${DURATION_SECONDS}s" >&2
     echo "to open a real terminal window for approval; see $KIND-session --help." >&2
     exit 64
   }
@@ -328,7 +419,8 @@ start_session() {
   }
 
   if ! has_tmux_session; then
-    rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/auth-status"
+    ensure_op_app
+    rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/auth-status" "$STATE_DIR/extendable"
     worker_command=$(quote_command \
       "$WORKER" "$KIND" "$SESSION" "$STATE_DIR" "$DURATION_SECONDS" "$SOCKET")
     tmux -L "$SOCKET" new-session -d -s "$SESSION" "$worker_command"
@@ -379,7 +471,8 @@ stop_session() {
   acquire_lock
   trap 'release_lock' EXIT HUP INT TERM
   tmux -L "$SOCKET" kill-session -t "$SESSION"
-  rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target" "$STATE_DIR/auth-status"
+  rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/target" "$STATE_DIR/auth-status" \
+    "$STATE_DIR/extendable"
   audit "stop"
   release_lock
   trap - EXIT HUP INT TERM
@@ -493,7 +586,7 @@ ensure_state_dir
 
 action=${1:-help}
 case "$action" in
-  start)
+  start | extend)
     shift
     terminal_start=false
     while [[ "$#" -gt 0 ]]; do
@@ -507,17 +600,12 @@ case "$action" in
             usage >&2
             exit 64
           }
-          case "$2" in
-            1h) DURATION_SECONDS=3600 ;;
-            4h) DURATION_SECONDS=14400 ;;
-            12h) DURATION_SECONDS=43200 ;;
-            24h) DURATION_SECONDS=86400 ;;
-            *)
-              echo "$KIND-session duration must be 1h, 4h, 12h or 24h" >&2
-              exit 64
-              ;;
-          esac
+          parse_duration "$2"
           shift 2
+          ;;
+        --duration=*)
+          parse_duration "${1#--duration=}"
+          shift
           ;;
         *)
           usage >&2
@@ -526,6 +614,14 @@ case "$action" in
       esac
     done
     require_command "$KIND"
+    if [[ "$action" == extend ]]; then
+      [[ "$DURATION_EXPLICIT" == true ]] || {
+        echo "usage: $KIND-session extend --duration DURATION" >&2
+        exit 64
+      }
+      extend_session && exit 0
+      echo "No active $KIND session; starting one for ${DURATION_SECONDS}s." >&2
+    fi
     if [[ "$terminal_start" == true ]]; then
       start_in_terminal
     else

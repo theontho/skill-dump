@@ -47,9 +47,10 @@ sudo-session extend --duration 12h
 ```
 
 This uses the current valid sudo credential without another password prompt,
-logs the change, and never shortens an already-longer session. It cannot revive
-a stopped or expired session. Starting an already-active session does **not**
-reset or extend its deadline; use `extend` explicitly. To shorten a lifetime,
+logs the change, and never shortens an already-longer session. `start
+--duration` on an active session extends it the same way, and `extend` with no
+active session falls back to `start --duration` (add `--terminal` from an
+agent). `start` without `--duration` leaves an active session unchanged. To shorten a lifetime,
 run `sudo-session stop`, then authenticate again with the desired `--duration`.
 Stopping does not terminate already-running commands. Longer lifetimes let other
 processes running as your user use the session for longer, too. No lifetime is
