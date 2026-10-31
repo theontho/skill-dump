@@ -33,6 +33,18 @@
       }
     },
     {
+      "id": "pr-babysitter",
+      "name": "pr-babysitter",
+      "description": "Use when asked to babysit, shepherd, or watch a pull request until it merges: monitor CI and review comments on a schedule, fix failures, stack fixes for blockers from main, resolve threads, keep it rebased, and land via auto-merge only when everything is clean.",
+      "license": "MIT",
+      "path": "skills/pr-babysitter/SKILL.md",
+      "sha256": "77eb29676f912a2521b2eddffde588564bb32017e07953d55c4ad5ff7ccbdbfa",
+      "metadata": {
+        "author": "theontho",
+        "version": "1.0.0"
+      }
+    },
+    {
       "id": "transcript-summarize",
       "name": "transcript-summarize",
       "description": "Downloads video transcripts via subtitles using yt-dlp, deduplicates and cleans them into plain-text files, then produces an AI summary of each video. WHEN: \"summarize video\", \"video summary\", \"transcript summary\", \"summarize YouTube\", \"get transcript\", \"video transcript\", \"watch summary\".",
