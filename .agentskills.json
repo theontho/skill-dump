@@ -38,7 +38,7 @@
       "description": "Use when asked to babysit, shepherd, or watch a pull request until it merges: monitor CI and review comments on a schedule, fix failures, stack fixes for blockers from main, resolve threads, keep it rebased, and land via auto-merge only when everything is clean.",
       "license": "MIT",
       "path": "skills/pr-babysitter/SKILL.md",
-      "sha256": "77eb29676f912a2521b2eddffde588564bb32017e07953d55c4ad5ff7ccbdbfa",
+      "sha256": "e8bbb1e33d139f1ca73eaba29a03b62bc8a3fcf58cedae538f1c4f4a75688849",
       "metadata": {
         "author": "theontho",
         "version": "1.0.0"
