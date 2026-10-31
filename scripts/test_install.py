@@ -75,6 +75,7 @@ class InstallTests(unittest.TestCase):
                          home / ".codex/AGENTS.md", home / ".gemini/GEMINI.md",
                          home / ".config/opencode/AGENTS.md"):
                 self.assertEqual(file.read_text().count("<!-- BEGIN skill-dump:"), 1)
+                self.assertIn("# Babysitting pull requests", file.read_text())
             self.assertEqual(run("git", "status", "--porcelain", cwd=installed), "")
 
 
