@@ -390,7 +390,7 @@ upsert_block() { # upsert_block FILE BLOCK_FILE (empty BLOCK_FILE removes the bl
 }
 
 install_agent_instructions() {
-  local block target tool host global
+  local block target tool host
   block=$(mktemp)
   if [[ $AGENT_INSTRUCTIONS == yes ]]; then
     host=$(short_host)
@@ -398,9 +398,6 @@ install_agent_instructions() {
       echo "$BEGIN_MARK"
       for tool in "${INSTALLED_TOOLS[@]+"${INSTALLED_TOOLS[@]}"}"; do
         [[ -f $SD_HOME/tools/$tool/agents.md ]] && { echo; render "$SD_HOME/tools/$tool/agents.md"; }
-      done
-      for global in "$SD_HOME"/agents/global/*.md; do
-        [[ -f $global ]] && { echo; render "$global"; }
       done
       [[ -f $SD_HOME/agents/hosts/$host.md ]] && { echo; render "$SD_HOME/agents/hosts/$host.md"; }
       echo
