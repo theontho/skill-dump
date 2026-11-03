@@ -65,16 +65,21 @@ elif args[:1] == ["signin"]:
     if cli_only:
         if os.environ.get("TEST_INTERACTIVE_CLI") and getpass.getpass("Account password: ") != "fake-test-password":
             sys.exit(24)
-        if not os.environ.get("TEST_EMPTY_SESSION"):
-            print("fake-test-session" if "--raw" in args else 'export OP_SESSION="fake-test-session"')
+        if os.environ.get("TEST_INVALID_SESSION"):
+            print('export OP_SESSION_test="$(exit 0)"')
+        elif not os.environ.get("TEST_EMPTY_SESSION"):
+            print("fake-test-session" if "--raw" in args else
+                  'export OP_SESSION_test="fake-test-session"\\n'
+                  "# This command is meant to be used with your shell's eval function.\\n"
+                  "# Use the --raw flag to only output the session token.")
     (root/"authorized-tty").write_text(tty or "")
 elif args[:1] == ["whoami"]:
-    if cli_only and os.environ.get("OP_SESSION") != "fake-test-session":
+    if cli_only and os.environ.get("OP_SESSION_test") != "fake-test-session":
         sys.exit(77)
     if not tty or tty != (root/"authorized-tty").read_text() or (root/"revoked").exists():
         sys.exit(77)
 elif args[:2] == ["vault","list"]:
-    if cli_only and os.environ.get("OP_SESSION") != "fake-test-session":
+    if cli_only and os.environ.get("OP_SESSION_test") != "fake-test-session":
         sys.exit(77)
     if not tty or tty != (root/"authorized-tty").read_text():
         sys.exit(77)
@@ -359,15 +364,24 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.env["OP_SESSION_ACCOUNT"] = "selected.1password.test"
         self.begin_start("--cli")
         self.finish_start()
-        self.assertIn(["signin", "--raw", "--account", "selected.1password.test"],
+        self.assertIn(["signin", "--account", "selected.1password.test"],
                       [c["args"] for c in self.calls()])
         self.assertEqual(self.run_helper("whoami").returncode, 0)
 
-    def test_cli_signin_requires_a_raw_session_token(self):
+    def test_cli_signin_requires_a_session_assignment(self):
         self.env["TEST_EMPTY_SESSION"] = "1"
         self.begin_start("--cli")
         output = self.finish_start(expected_status=77)
         self.assertIn("1Password returned no session token", output)
+        self.assertFalse(any(c["args"] == ["whoami"] for c in self.calls()))
+
+    def test_invalid_export_is_rejected_without_logging_its_value(self):
+        self.env["TEST_INVALID_SESSION"] = "1"
+        self.begin_start("--cli")
+        output = self.finish_start(expected_status=77)
+        self.assertIn("Unexpected 1Password session assignment", output)
+        self.assertNotIn("$(exit 0)", output)
+        self.assertNotIn("$(exit 0)", self.run_helper("logs").stdout)
         self.assertFalse(any(c["args"] == ["whoami"] for c in self.calls()))
 
     def test_terminal_launch_preserves_explicit_cli_mode_in_either_flag_order(self):

@@ -38,8 +38,9 @@ pasting multiple shell commands that could be consumed as prompt answers.
 terminal rather than opening another. `shell` attaches to the authorized pane.
 
 The worker selects a configured account, signs in once, validates it, and
-uses `op signin --raw` to export the token as `OP_SESSION` without evaluating
-shell output. It dispatches keepalives through the same foreground TTY. Commands are serialized
+reads the validated account-specific `OP_SESSION_*` export from `op signin`,
+ignoring its instructional comments without evaluating shell output.
+It dispatches keepalives through the same foreground TTY. Commands are serialized
 until completion, with quoted arguments, working directory and exit status
 preserved. Command output is returned and deleted, not retained as diagnostics.
 Expiry or failed keepalive ends the session and records the reason without

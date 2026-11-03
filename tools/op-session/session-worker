@@ -94,18 +94,30 @@ else
   auth_error "No 1Password accounts are available; add an account in the desktop app."
   exit 77
 fi
-signin_output=$(auth_op signin --raw --account "$OP_ACCOUNT")
+signin_output=$(auth_op signin --account "$OP_ACCOUNT")
 if [[ -n "$signin_output" ]]; then
-  if [[ ! "$signin_output" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
-    auth_error "Unexpected 1Password session token; authentication was not established."
+  # op appends instructional comments after the account-specific export.
+  assignment=${signin_output%%$'\n'*}
+  assignment=${assignment#export }
+  session_name=${assignment%%=*}
+  session_value=${assignment#*=}
+  if [[ "$session_value" == \"*\" || "$session_value" == \'*\' ]]; then
+    session_value=${session_value:1:${#session_value}-2}
+  fi
+  if [[ "$signin_output" != export\ OP_SESSION_* ||
+    ! "$session_name" =~ ^OP_SESSION_[A-Za-z0-9_]+$ ||
+    ! "$session_value" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    auth_error "Unexpected 1Password session assignment; authentication was not established."
     exit 65
   fi
-  export OP_SESSION="$signin_output"
+  export "$session_name=$session_value"
 elif [[ "${AGENT_SESSION_OP_AUTH:-app}" == cli ]]; then
   auth_error "1Password returned no session token for CLI sign-in."
   exit 65
 fi
 signin_output=""
+assignment=""
+session_value=""
 auth_status "validating 1Password authentication"
 auth_op whoami >/dev/null
 
