@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ref="${HF_TOKEN_OP_REF:-op://Personal/Hugging Face Personal Access Token/user access token}"
+if (($# == 0)); then
+  printf 'usage: hf-op COMMAND [ARG ...]\n' >&2
+  exit 2
+fi
+export HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0
+if token="$(op-session exec op read --no-newline "$ref" 2>/dev/null)" && [[ -n "$token" ]]; then
+  export HF_TOKEN="$token"
+elif [[ -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ]]; then
+  HF_TOKEN="$(<"${HF_HOME:-$HOME/.cache/huggingface}/token")"
+  export HF_TOKEN
+  printf 'hf-op: 1Password token unavailable; using the stored Hugging Face login\n' >&2
+else
+  printf 'hf-op: no token: sign in to 1Password (op-session signin) or run hf auth login\n' >&2
+  exit 1
+fi
+exec "$@"

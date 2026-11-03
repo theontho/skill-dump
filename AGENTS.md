@@ -31,3 +31,5 @@ Use `npm run skills:check` to verify manifests, plugin metadata, hashes, and ada
 The credential helpers support macOS and Linux without separate platform forks.
 `npm run tools:test:credentials` runs their isolated fake-credential tests on either
 platform; the full tooling suite additionally needs Linux for agent-coord.
+`cli-launchers` and `hf-op` retain the shared standalone launchers and Hugging Face
+token wrapper; `npm run tools:test:launchers` exercises them without real agents or credentials.

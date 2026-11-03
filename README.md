@@ -24,6 +24,8 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 | `sudo-session` | Share a time-limited, audited sudo credential with fresh agent shells | macOS/Linux, python3, tmux, sudo |
 | `op-session` | Persistent 1Password CLI session for fresh agent shells | macOS/Linux, tmux, op, jq |
 | `copilot-persistent` | `copilot` wrapper that keeps interactive sessions in a tmux service | Linux, systemd user session, tmux, mise |
+| `cli-launchers` | Shared mise launchers for agent CLIs and development tools | mise |
+| `hf-op` | Hugging Face token routing through op-session or an existing hf login | bash |
 
 Tools whose requirements are missing are skipped. Choose tools with `--skip` / `--only`
 (saved in `~/.config/skill-dump/config` and reused when a pull reinstalls):

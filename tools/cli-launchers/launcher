@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+program=${0##*/}
+case "$program" in
+  claude|codex|crush|cursor-agent|gemini|gh|opencode|pi) tool=$program ;;
+  ghui) tool=npm:@kitlangton/ghui ;;
+  grok) tool=npm:@xai-official/grok ;;
+  hunk) tool=aqua:modem-dev/hunk ;;
+  omp) tool=github:can1357/oh-my-pi ;;
+  playwright) tool=npm:playwright ;;
+  muse) tool='http:muse[url=https://api.meta.ai/muse-launcher.sh,bin=muse,version_list_url=https://api.meta.ai/muse-code/channels/muse-stable,version_json_path=.version]' ;;
+  *) printf 'Unknown CLI launcher: %s\n' "$program" >&2; exit 64 ;;
+esac
+
+export MISE_MINIMUM_RELEASE_AGE=0
+mise use -g --quiet "$tool"
+exec mise x "$tool" -- "$program" "$@"
