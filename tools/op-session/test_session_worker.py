@@ -59,6 +59,9 @@ elif args[:2] == ["account","list"]:
     print('[{"url":"example.1password.test"}]')
 elif args[:1] == ["signin"]:
     time.sleep(float(os.environ.get("TEST_SIGNIN_DELAY","0")))
+    if os.environ.get("TEST_SIGNIN_FAILURE"):
+        print("[ERROR] fake sign-in denied", file=sys.stderr)
+        sys.exit(7)
     if cli_only:
         if os.environ.get("TEST_INTERACTIVE_CLI") and getpass.getpass("Account password: ") != "fake-test-password":
             sys.exit(24)
@@ -310,6 +313,11 @@ time.sleep(0.2 if seconds==45 else seconds)
         output = self.finish_start()
         self.assertNotIn("fake-test-password", output)
         self.assertNotIn("fake-test-session", output)
+        log = self.run_helper("logs")
+        self.assertEqual(log.returncode, 0, log.stderr)
+        for secret in ("fake-test-password", "fake-test-session", "fake-test-key"):
+            self.assertNotIn(secret, log.stdout)
+        self.assertEqual((self.temporary / "state/op/auth.log").stat().st_mode & 0o777, 0o600)
         for arguments in (("whoami",), ("exec", "op", "whoami"),
                           ("run", "--", "op", "vault", "list")):
             result = self.run_helper(*arguments)
@@ -333,6 +341,18 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
         self.assertIn("adding 1Password account to the CLI failed (exit 23)", status.stdout)
         self.assertFalse(any(c["args"][:1] == ["signin"] for c in self.calls()))
+
+    def test_signin_stderr_survives_closed_pane_and_is_shown_by_start_and_logs(self):
+        self.env["TEST_SIGNIN_FAILURE"] = "1"
+        self.begin_start("--cli")
+        output = self.finish_start(expected_status=77)
+        self.assertIn("[ERROR] fake sign-in denied", output)
+        self.assertIn("Authentication log:", output)
+        log = self.run_helper("logs")
+        self.assertEqual(log.returncode, 0, log.stderr)
+        self.assertIn("[ERROR] fake sign-in denied", log.stdout)
+        self.assertIn("1Password sign-in failed (exit 7)", log.stdout)
+        self.assertNotIn("fake-test-session", log.stdout)
 
     def test_cli_account_override_is_forwarded_to_worker(self):
         self.env["OP_SESSION_ACCOUNT"] = "selected.1password.test"

@@ -5,6 +5,7 @@ and Linux, so fresh agent shells can reuse it without another sign-in.
 
 ```sh
 op-session status                # 0 active, 2 approval pending, 1 inactive
+op-session logs                  # most recent authentication attempt's diagnostics
 op-session start                 # authenticate once in an interactive terminal
 op-session signin                # CLI-only password sign-in, including locally
 op-session start --cli -d 12h     # explicit 12-hour CLI-only lease
@@ -43,6 +44,12 @@ preserved. Command output is returned and deleted, not retained as diagnostics.
 Expiry or failed keepalive ends the session and records the reason without
 starting another sign-in. State and credential-safe audit records live in
 `~/.local/state/copilot-agent-sessions/`.
+
+Authentication stages and `op`'s stderr are retained in a private, mode-0600
+`op/auth.log` under that state directory, replaced on the next attempt.
+Sign-in stdout (the session token), terminal input, and dispatched command
+output are never logged. If the authentication pane exits, `start` prints the
+last log lines instead of losing the error; `op-session logs` shows the attempt.
 
 On macOS, enable **Keep 1Password in the menu bar** and leave the app running.
 Desktop lock, quit or restart can revoke authorization before the local lease

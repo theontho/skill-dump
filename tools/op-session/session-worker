@@ -20,15 +20,29 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 umask 077
 export HISTFILE=/dev/null
 set +o history
+set +x
+: > "$STATE_DIR/auth.log"
+chmod 0600 "$STATE_DIR/auth.log"
 auth_stage="waiting for terminal"
 auth_status() {
   auth_stage=$1
   printf '%s\n' "$auth_stage" > "$STATE_DIR/auth-status"
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$auth_stage" >> "$STATE_DIR/auth.log"
+}
+auth_op() {
+  local rc=0 logger
+  # Never log stdout: op signin returns the session token there.
+  {
+    logger=$!
+    op "$@" || rc=$?
+  } 2> >(tee -a "$STATE_DIR/auth.log" >&2)
+  wait "$logger"
+  return "$rc"
 }
 auth_failure() {
   local rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    printf '%s failed (exit %s)\n' "$auth_stage" "$rc" > "$STATE_DIR/auth-status"
+    auth_status "$auth_stage failed (exit $rc)"
   fi
 }
 trap auth_failure EXIT
@@ -44,25 +58,25 @@ if [[ "${AGENT_SESSION_OP_AUTH:-app}" == cli ]]; then
   # Use the CLI's own password sign-in; works without the desktop app (SSH).
   export OP_BIOMETRIC_UNLOCK_ENABLED=false
   auth_status "listing 1Password CLI accounts"
-  if [[ "$(op account list --format json | jq length)" -eq 0 ]]; then
+  if [[ "$(auth_op account list --format json | jq length)" -eq 0 ]]; then
     echo "Add your 1Password account to the CLI (sign-in address, email, Secret Key, password):"
     auth_status "adding 1Password account to the CLI"
-    op account add
+    auth_op account add
   fi
 fi
 account_urls=()
 auth_status "listing 1Password accounts"
-account_json=$(op account list --format json)
+account_json=$(auth_op account list --format json)
 while IFS= read -r account_url; do
   account_urls+=("$account_url")
 done < <(printf '%s' "$account_json" | jq -r '.[].url')
 account_json=""
 auth_status "1Password sign-in"
 if [[ -n "${OP_ACCOUNT:-}" ]]; then
-  signin_output=$(op signin --account "$OP_ACCOUNT")
+  signin_output=$(auth_op signin --account "$OP_ACCOUNT")
 elif [[ "${#account_urls[@]}" -eq 1 ]]; then
   export OP_ACCOUNT="${account_urls[0]}"
-  signin_output=$(op signin --account "${account_urls[0]}")
+  signin_output=$(auth_op signin --account "${account_urls[0]}")
 elif [[ "${#account_urls[@]}" -gt 1 ]]; then
   echo "Choose the 1Password account for this session:" >&2
   select account_url in "${account_urls[@]}"; do
@@ -73,7 +87,7 @@ elif [[ "${#account_urls[@]}" -gt 1 ]]; then
     echo "Enter a number from the account list." >&2
   done
   [[ -n "${OP_ACCOUNT:-}" ]] || exit 77
-  signin_output=$(op signin --account "$OP_ACCOUNT")
+  signin_output=$(auth_op signin --account "$OP_ACCOUNT")
 else
   echo "No 1Password accounts are available; add an account in the desktop app." >&2
   exit 77
@@ -98,7 +112,7 @@ fi
 signin_output=""
 session_value=""
 auth_status "validating 1Password authentication"
-op whoami >/dev/null
+auth_op whoami >/dev/null
 
 expiry=$(($(date +%s) + DURATION_SECONDS))
 printf '%s\n' "$TMUX_PANE" > "$STATE_DIR/target.tmp"

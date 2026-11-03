@@ -37,6 +37,7 @@ usage:
   op-session start [-d|--duration DURATION] [--terminal] [--cli|--app]
   op-session extend -d|--duration DURATION [--terminal] [--cli|--app]
   op-session status
+  op-session logs
   op-session shell
   op-session stop
   op-session run -- OP_ARGUMENT [ARG ...]
@@ -445,6 +446,10 @@ start_session() {
     cleanup_stale_session
     echo "authentication did not establish a $KIND session" >&2
     [[ ! -f "$STATE_DIR/auth-status" ]] || cat "$STATE_DIR/auth-status" >&2
+    if [[ -f "$STATE_DIR/auth.log" ]]; then
+      printf 'Authentication log: %s\n' "$STATE_DIR/auth.log" >&2
+      tail -n 25 "$STATE_DIR/auth.log" >&2
+    fi
     exit 77
   fi
 
@@ -657,6 +662,18 @@ case "$action" in
       exit 64
     }
     status_session
+    ;;
+  logs)
+    shift
+    [[ "$#" -eq 0 ]] || {
+      usage >&2
+      exit 64
+    }
+    if [[ ! -f "$STATE_DIR/auth.log" ]]; then
+      echo "No authentication log yet; run: $KIND-session start" >&2
+      exit 1
+    fi
+    cat "$STATE_DIR/auth.log"
     ;;
   shell)
     shift
