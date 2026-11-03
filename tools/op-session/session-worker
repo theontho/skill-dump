@@ -58,7 +58,9 @@ while IFS= read -r account_url; do
 done < <(printf '%s' "$account_json" | jq -r '.[].url')
 account_json=""
 auth_status "1Password sign-in"
-if [[ "${#account_urls[@]}" -eq 1 ]]; then
+if [[ -n "${OP_ACCOUNT:-}" ]]; then
+  signin_output=$(op signin --account "$OP_ACCOUNT")
+elif [[ "${#account_urls[@]}" -eq 1 ]]; then
   export OP_ACCOUNT="${account_urls[0]}"
   signin_output=$(op signin --account "${account_urls[0]}")
 elif [[ "${#account_urls[@]}" -gt 1 ]]; then

@@ -29,7 +29,7 @@ class WorkerTests(unittest.TestCase):
         self.log = self.temporary / "op-calls.jsonl"
         self.fake_op = self.bin / "op"
         self.fake_op.write_text("""#!/usr/bin/env python3
-import json,os,sys,time
+import getpass,json,os,sys,time
 from pathlib import Path
 tty = os.ttyname(0) if os.isatty(0) else None
 args = sys.argv[1:]
@@ -41,6 +41,16 @@ cli_only = os.environ.get("OP_BIOMETRIC_UNLOCK_ENABLED") == "false"
 if args[:2] == ["account","list"] and cli_only and not (root/"cli-account").exists():
     print("[]")
 elif args[:2] == ["account","add"]:
+    if os.environ.get("TEST_ADD_FAILURE"):
+        print("account enrollment failed", file=sys.stderr)
+        sys.exit(23)
+    if os.environ.get("TEST_INTERACTIVE_CLI"):
+        if input("Sign-in address: ") != "example.1password.test":
+            sys.exit(24)
+        if input("Email address: ") != "test@example.invalid":
+            sys.exit(24)
+        if getpass.getpass("Secret Key: ") != "fake-test-key":
+            sys.exit(24)
     (root/"cli-account").touch()
 elif args[:2] == ["account","list"]:
     if not cli_only and os.environ.get("TEST_APP_MARKER") and not Path(os.environ["TEST_APP_MARKER"]).exists():
@@ -49,11 +59,19 @@ elif args[:2] == ["account","list"]:
     print('[{"url":"example.1password.test"}]')
 elif args[:1] == ["signin"]:
     time.sleep(float(os.environ.get("TEST_SIGNIN_DELAY","0")))
+    if cli_only:
+        if os.environ.get("TEST_INTERACTIVE_CLI") and getpass.getpass("Account password: ") != "fake-test-password":
+            sys.exit(24)
+        print('export OP_SESSION_test="fake-test-session"')
     (root/"authorized-tty").write_text(tty or "")
 elif args[:1] == ["whoami"]:
+    if cli_only and os.environ.get("OP_SESSION_test") != "fake-test-session":
+        sys.exit(77)
     if not tty or tty != (root/"authorized-tty").read_text() or (root/"revoked").exists():
         sys.exit(77)
 elif args[:2] == ["vault","list"]:
+    if cli_only and os.environ.get("OP_SESSION_test") != "fake-test-session":
+        sys.exit(77)
     if not tty or tty != (root/"authorized-tty").read_text():
         sys.exit(77)
     print(json.dumps({"tty":tty,"vaults":[]}))
@@ -72,6 +90,9 @@ time.sleep(0.2 if seconds==45 else seconds)
                         TERM="xterm-256color", TEST_ROOT=str(self.temporary),
                         AGENT_SESSION_STATE_HOME=str(self.temporary / "state"),
                         AGENT_SESSION_TMUX_SOCKET=self.socket)
+        for name in ("SSH_CONNECTION", "SSH_TTY", "OP_ACCOUNT", "OP_SESSION_ACCOUNT",
+                     "OP_BIOMETRIC_UNLOCK_ENABLED"):
+            self.env.pop(name, None)
         self.worker = Path(os.environ.get("TEST_SESSION_WORKER", ROOT / "session-worker"))
         self.helper = Path(os.environ.get("TEST_SESSION_HELPER", ROOT / "op-session"))
         self.env["AGENT_SESSION_WORKER"] = str(self.worker)
@@ -97,14 +118,14 @@ time.sleep(0.2 if seconds==45 else seconds)
             os.close(self.terminal)
             self.terminal = None
 
-    def begin_start(self, *arguments):
+    def begin_start(self, *arguments, action="start"):
         pid, terminal = pty.fork()
         if pid == 0:
-            os.execve(str(self.helper), [str(self.helper), "start", *arguments], self.env)
+            os.execve(str(self.helper), [str(self.helper), action, *arguments], self.env)
         self.started_pid = pid
         self.terminal = terminal
 
-    def finish_start(self):
+    def finish_start(self, expected_status=0):
         output = bytearray()
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -123,8 +144,19 @@ time.sleep(0.2 if seconds==45 else seconds)
             self.fail("Interactive worker startup timed out")
         _, status = os.waitpid(self.started_pid, 0)
         self.started_pid = None
-        self.assertEqual(os.waitstatus_to_exitcode(status), 0,
+        self.assertEqual(os.waitstatus_to_exitcode(status), expected_status,
                          output.decode(errors="replace"))
+        return output.decode(errors="replace")
+
+    def answer_prompt(self, prompt, answer):
+        output = bytearray()
+        deadline = time.monotonic() + 8
+        while prompt.encode() not in output:
+            if time.monotonic() >= deadline:
+                self.fail(f"Prompt {prompt!r} did not appear: {output!r}")
+            if select.select([self.terminal], [], [], 0.1)[0]:
+                output.extend(os.read(self.terminal, 65536))
+        os.write(self.terminal, answer.encode() + b"\n")
 
     def calls(self):
         if not self.log.exists():
@@ -212,6 +244,7 @@ time.sleep(0.2 if seconds==45 else seconds)
             str(Path.cwd().resolve()), "$(not a shell command)",
         ])
         self.assertEqual(self.run_helper("run", "--", "vault", "list").returncode, 0)
+        self.assertEqual(self.run_helper("run", "--", "op", "vault", "list").returncode, 0)
 
     def test_extend_and_start_duration_lengthen_but_never_shorten(self):
         self.begin_start()
@@ -261,6 +294,71 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.assertEqual(sum(c["args"][:1] == ["signin"] for c in worker_calls), 1)
         self.assertIn(["vault", "list"], [c["args"] for c in worker_calls])
         self.assertFalse((self.temporary / "never").exists())
+
+    def test_signin_enrolls_interactively_then_reuses_cli_token_without_desktop(self):
+        self.env.pop("SSH_CONNECTION", None)
+        self.env.pop("SSH_TTY", None)
+        self.env["TEST_INTERACTIVE_CLI"] = "1"
+        self.env["TEST_APP_MARKER"] = str(self.temporary / "never")
+        self.begin_start(action="signin")
+        self.answer_prompt("Sign-in address: ", "example.1password.test")
+        self.answer_prompt("Email address: ", "test@example.invalid")
+        self.answer_prompt("Secret Key: ", "fake-test-key")
+        pending = self.run_helper("status")
+        self.assertEqual(pending.returncode, 2, pending.stdout + pending.stderr)
+        self.answer_prompt("Account password: ", "fake-test-password")
+        output = self.finish_start()
+        self.assertNotIn("fake-test-password", output)
+        self.assertNotIn("fake-test-session", output)
+        for arguments in (("whoami",), ("exec", "op", "whoami"),
+                          ("run", "--", "op", "vault", "list")):
+            result = self.run_helper(*arguments)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.wait_for(lambda: sum(c["args"] == ["whoami"] for c in self.calls()) >= 4,
+                      "CLI keepalive did not reuse the exported token")
+        self.assertTrue(all(c["app"] == "false" for c in self.calls()))
+        self.assertEqual(len({c["tty"] for c in self.calls()}), 1)
+        self.assertEqual(self.run_helper("stop").returncode, 0)
+        self.begin_start("--cli", "-d", "12h")
+        self.answer_prompt("Account password: ", "fake-test-password")
+        self.finish_start()
+        self.assertEqual(sum(c["args"][:2] == ["account", "add"] for c in self.calls()), 1)
+        self.assertFalse((self.temporary / "never").exists())
+
+    def test_cli_enrollment_failure_is_reported_without_attempting_signin(self):
+        self.env["TEST_ADD_FAILURE"] = "1"
+        self.begin_start("--cli")
+        self.finish_start(expected_status=77)
+        status = self.run_helper("status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        self.assertIn("adding 1Password account to the CLI failed (exit 23)", status.stdout)
+        self.assertFalse(any(c["args"][:1] == ["signin"] for c in self.calls()))
+
+    def test_cli_account_override_is_forwarded_to_worker(self):
+        self.env["OP_SESSION_ACCOUNT"] = "selected.1password.test"
+        self.begin_start("--cli")
+        self.finish_start()
+        self.assertIn(["signin", "--account", "selected.1password.test"],
+                      [c["args"] for c in self.calls()])
+        self.assertEqual(self.run_helper("whoami").returncode, 0)
+
+    def test_terminal_launch_preserves_explicit_cli_mode_in_either_flag_order(self):
+        launcher = self.bin / "fake-terminal"
+        launcher.write_text(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$TEST_ROOT/terminal-args\"\n"
+        )
+        launcher.chmod(0o755)
+        self.env["AGENT_SESSION_TERMINAL"] = str(launcher)
+        self.env["AGENT_SESSION_TERMINAL_WAIT"] = "0"
+        for arguments in (("--cli", "--terminal"), ("--terminal", "--cli")):
+            with self.subTest(arguments=arguments):
+                result = self.run_helper("start", *arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                recorded = self.temporary / "terminal-args"
+                self.wait_for(recorded.exists, "Terminal launcher did not run")
+                self.assertIn("--cli", recorded.read_text())
+                recorded.unlink()
+        self.assertEqual(self.calls(), [])
 
     def test_noninteractive_start_explains_terminal_flow(self):
         result = self.run_helper("start")

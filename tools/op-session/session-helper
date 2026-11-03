@@ -33,6 +33,7 @@ LOCK_HELD=false
 usage() {
   cat <<'EOF'
 usage:
+  op-session signin [-d|--duration DURATION] [--terminal]
   op-session start [-d|--duration DURATION] [--terminal] [--cli|--app]
   op-session extend -d|--duration DURATION [--terminal] [--cli|--app]
   op-session status
@@ -44,6 +45,7 @@ usage:
 
 Commands run as: op OP_ARGUMENT [ARG ...]
 The legacy exec form runs COMMAND verbatim in the authenticated pane.
+run -- op ARGUMENT ... also accepts the legacy explicit op executable.
 Authentication is retained in one tmux PTY for one hour by default.
 DURATION is a positive whole number with s, m, h or d (bare numbers are
 seconds), e.g. 30m, 12h, 24h, 1d. Longer grants need explicit authorization.
@@ -55,6 +57,8 @@ The grant can end earlier if 1Password invalidates authentication.
 not running, start launches it. --cli signs in with the account password in
 this terminal (default over SSH); the first time it also asks for the email
 and Secret Key to add the account to the CLI.
+signin is an alias for start --cli. OP_ACCOUNT (or the legacy
+OP_SESSION_ACCOUNT) selects an account without an interactive chooser.
 Status reports pending authentication without cancelling it.
 EOF
   agent_usage
@@ -318,9 +322,12 @@ terminal_command() {
     words+=("AGENT_SESSION_TMUX_SOCKET=$(printf '%q' "$AGENT_SESSION_TMUX_SOCKET")")
   [[ -z "${XDG_STATE_HOME:-}" ]] ||
     words+=("XDG_STATE_HOME=$(printf '%q' "$XDG_STATE_HOME")")
+  [[ -z "${OP_SESSION_ACCOUNT:-${OP_ACCOUNT:-}}" ]] ||
+    words+=("OP_ACCOUNT=$(printf '%q' "${OP_SESSION_ACCOUNT:-${OP_ACCOUNT:-}}")")
   [[ "${#words[@]}" -eq 0 ]] || words=(env "${words[@]}")
   words+=("$(printf '%q' "$SCRIPT_DIR/session-helper")" "$KIND" start)
   words+=(--duration "${DURATION_SECONDS}s")
+  words+=("--$AUTH_MODE")
   printf '%s; echo "This window can be closed once the session is active."\n' "${words[*]}"
 }
 
@@ -377,7 +384,7 @@ start_in_terminal() {
   }
   if has_tmux_session; then
     echo "$KIND authorization is already pending; approve it in the open terminal window." >&2
-  elif ! { ensure_op_app; launch_terminal; }; then
+  elif ! launch_terminal; then
     echo "could not open a terminal window for $KIND-session start" >&2
     echo "Ask the person to run '$KIND-session start' in their own terminal," >&2
     echo "or set AGENT_SESSION_TERMINAL to a launcher such as 'alacritty -e'." >&2
@@ -424,13 +431,10 @@ start_session() {
   }
 
   if ! has_tmux_session; then
-    if [[ "$AUTH_MODE" == auto ]]; then
-      AUTH_MODE=app
-      [[ -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] || AUTH_MODE=cli
-    fi
     [[ "$AUTH_MODE" == cli ]] || ensure_op_app
     rm -f "$STATE_DIR/ready" "$STATE_DIR/expires" "$STATE_DIR/auth-status" "$STATE_DIR/extendable"
     worker_command=$(quote_command env "AGENT_SESSION_OP_AUTH=$AUTH_MODE" \
+      "OP_ACCOUNT=${OP_SESSION_ACCOUNT:-${OP_ACCOUNT:-}}" \
       "$WORKER" "$KIND" "$SESSION" "$STATE_DIR" "$DURATION_SECONDS" "$SOCKET")
     tmux -L "$SOCKET" new-session -d -s "$SESSION" "$worker_command"
   fi
@@ -528,7 +532,7 @@ run_request() {
   }
 
   command_name=$1
-  if [[ "$action" == "exec" ]]; then
+  if [[ "$action" == "exec" || ( "$action" == "run" && "$1" == op ) ]]; then
     command=("$@")
   else
     command=(op "$@")
@@ -595,14 +599,14 @@ ensure_state_dir
 
 action=${1:-help}
 case "$action" in
-  start | extend)
+  start | extend | signin)
+    [[ "$action" != signin ]] || AUTH_MODE=cli
     shift
     terminal_start=false
     while [[ "$#" -gt 0 ]]; do
       case "$1" in
         --terminal)
           terminal_start=true
-          AUTH_MODE=app
           shift
           ;;
         --cli | --app)
@@ -627,6 +631,10 @@ case "$action" in
           ;;
       esac
     done
+    if [[ "$AUTH_MODE" == auto ]]; then
+      AUTH_MODE=app
+      [[ "$terminal_start" == true || -z "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] || AUTH_MODE=cli
+    fi
     require_command "$KIND"
     if [[ "$action" == extend ]]; then
       [[ "$DURATION_EXPLICIT" == true ]] || {

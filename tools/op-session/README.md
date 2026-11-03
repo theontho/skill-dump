@@ -6,11 +6,14 @@ and Linux, so fresh agent shells can reuse it without another sign-in.
 ```sh
 op-session status                # 0 active, 2 approval pending, 1 inactive
 op-session start                 # authenticate once in an interactive terminal
+op-session signin                # CLI-only password sign-in, including locally
+op-session start --cli -d 12h     # explicit 12-hour CLI-only lease
 op-session start --terminal      # open a real terminal from an agent harness
 op-session extend -d 12h         # at least 12h remaining; starts if inactive
 op-session vault list            # ordinary op arguments
 op-session run -- vault list     # explicit op-argument form
 op-session exec op vault list    # backward-compatible verbatim command form
+op-session run -- op vault list  # backward-compatible explicit op executable
 op-session stop
 ```
 
@@ -25,7 +28,12 @@ and `start` without `--duration` leaves an active grant unchanged. If the
 Over SSH (or with `--cli`), `start` skips the desktop app and signs in with the
 account password in the terminal (`OP_BIOMETRIC_UNLOCK_ENABLED=false`). The
 first time, it runs `op account add`, which asks for the sign-in address,
-email, Secret Key and password. `--app` forces desktop-app approval. `status` never cancels pending approval; resume its existing
+email, Secret Key and password. `signin` aliases `start --cli`; no desktop app
+is started or needed. It runs a worker script in the terminal, rather than
+pasting multiple shell commands that could be consumed as prompt answers.
+`--terminal --cli` preserves CLI-only mode in the new terminal window.
+`OP_ACCOUNT` (or legacy `OP_SESSION_ACCOUNT`) selects a configured account.
+`--app` forces desktop-app approval. `status` never cancels pending approval; resume its existing
 terminal rather than opening another. `shell` attaches to the authorized pane.
 
 The worker selects a configured account, signs in once, validates it, and
