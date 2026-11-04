@@ -83,8 +83,9 @@ class CoordinatorTest(unittest.TestCase):
         # Wants the same lock: stays behind the head.
         self.assertEqual(self.ask(1, mem=GIB // 2, agent="gpu3", locks=["gpu"])["state"],
                          "waiting")  # fmt: skip
-        # Would leave the head short of cores once the GPU frees: waits.
-        self.assertEqual(self.ask(2, mem=GIB, agent="cpu2")["state"], "waiting")
+        # The GPU holder's share frees with the lock; 3 more cores would
+        # still leave the head short once it does: waits.
+        self.assertEqual(self.ask(4, mem=GIB, agent="cpu2")["state"], "waiting")
 
     def test_head_waiting_for_capacity_with_a_free_lock_is_not_overtaken(self):
         self.ask(6)

@@ -396,17 +396,22 @@ class Coordinator:
         """The named locks head is waiting for (held by someone else)."""
         return {n for n in head.get("locks", ()) if self._lock_holder(n, head.get("id"))}
 
-    def _leaves_room(self, req: dict, head: dict) -> bool:
+    def _leaves_room(self, req: dict, head: dict, waiting_for: set[str]) -> bool:
         """Whether req can run alongside head once head's lock frees: head
-        keeps its place, so backfill never makes it wait for cores or memory."""
+        keeps its place, so backfill never makes it wait for cores or memory.
+        Leases holding the awaited lock end when it frees, so their share
+        counts as free."""
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
-        if used_cores + req["cores"] + head["cores"] > cores:
+        ending = [x for x in self.state["leases"] if waiting_for & set(x.get("locks", ()))]
+        freed_cores = sum(x["cores"] for x in ending)
+        freed_mem = sum(x["mem"] for x in ending)
+        if used_cores - freed_cores + req["cores"] + head["cores"] > cores:
             return False
-        if used_mem + req["mem"] + head["mem"] > mem:
+        if used_mem - freed_mem + req["mem"] + head["mem"] > mem:
             return False
         return self.available is None or (
-            req["mem"] + head["mem"] <= self.available - RESERVE_MEM)
+            req["mem"] + head["mem"] <= self.available + freed_mem - RESERVE_MEM)
 
     def _backfill(self, head: dict) -> bool:
         """Let requests behind a blocked head start if they fit. Small ones
@@ -426,7 +431,7 @@ class Coordinator:
             if req["exclusive"] or self._blocked(req):
                 continue
             if waiting_for:
-                ok = not (waiting_for & set(req.get("locks", ()))) and self._leaves_room(req, head)
+                ok = not (waiting_for & set(req.get("locks", ()))) and self._leaves_room(req, head, waiting_for)
             else:
                 ok = (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
                       and not req.get("disk"))  # fmt: skip
