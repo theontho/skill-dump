@@ -392,17 +392,45 @@ class Coordinator:
         req.pop("reason", None)
         self.state["leases"].append(req)
 
-    def _backfill(self, head: dict) -> bool:
-        """Let small requests behind a blocked head start if they fit: they
-        barely delay it, and a big job waiting for memory shouldn't hold up a
-        one-core chore. Nothing passes an exclusive or lock-waiting head."""
-        if head["exclusive"] or head.get("locks"):
+    def _lock_wait(self, head: dict) -> set[str]:
+        """The named locks head is waiting for (held by someone else)."""
+        return {n for n in head.get("locks", ()) if self._lock_holder(n, head.get("id"))}
+
+    def _leaves_room(self, req: dict, head: dict) -> bool:
+        """Whether req can run alongside head once head's lock frees: head
+        keeps its place, so backfill never makes it wait for cores or memory."""
+        cores, mem = self.capacity()
+        used_cores, used_mem = self._usage()
+        if used_cores + req["cores"] + head["cores"] > cores:
             return False
+        if used_mem + req["mem"] + head["mem"] > mem:
+            return False
+        return self.available is None or (
+            req["mem"] + head["mem"] <= self.available - RESERVE_MEM)
+
+    def _backfill(self, head: dict) -> bool:
+        """Let requests behind a blocked head start if they fit. Small ones
+        always may: they barely delay it, and a big job waiting for memory
+        shouldn't hold up a one-core chore. When the head waits only for a
+        named lock (a GPU job while another holds the GPU), any request that
+        doesn't need that lock may start if it leaves room for the head, so
+        hours of GPU work don't stall every CPU job behind it. Nothing passes
+        an exclusive head."""
+        if head["exclusive"]:
+            return False
+        waiting_for = self._lock_wait(head)
+        if head.get("locks") and not waiting_for:
+            return False  # its lock is free; it waits for capacity: no overtaking
         started = False
         for req in list(self.state["queue"][1:]):
-            small = (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
-                     and not req["exclusive"] and not req.get("disk"))  # fmt: skip
-            if small and not self._blocked(req):
+            if req["exclusive"] or self._blocked(req):
+                continue
+            if waiting_for:
+                ok = not (waiting_for & set(req.get("locks", ()))) and self._leaves_room(req, head)
+            else:
+                ok = (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
+                      and not req.get("disk"))  # fmt: skip
+            if ok:
                 self.state["queue"].remove(req)
                 self._grant(req)
                 started = True

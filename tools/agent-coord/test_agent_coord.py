@@ -41,11 +41,11 @@ class CoordinatorTest(unittest.TestCase):
             cap=lambda: (8.0, 16 * GIB),
         )
 
-    def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False):
+    def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=()):
         return self.c.handle({
             "op": "acquire", "agent": agent, "pid": pid or os.getpid(),
             "cores": cores, "mem": mem, "label": f"{agent} job",
-            "exclusive": exclusive,
+            "exclusive": exclusive, "locks": list(locks),
         })  # fmt: skip
 
     def test_grants_what_fits_and_queues_the_rest(self):
@@ -73,6 +73,23 @@ class CoordinatorTest(unittest.TestCase):
         self.ask(6)
         self.assertEqual(self.ask(4, agent="b")["state"], "waiting")
         self.assertEqual(self.ask(1, mem=GIB // 2, agent="c")["state"], "granted")
+
+    def test_cpu_jobs_pass_a_head_waiting_for_a_lock(self):
+        self.ask(2, mem=4 * GIB, agent="gpu1", locks=["gpu"])  # holds the GPU
+        head = self.ask(2, mem=4 * GIB, agent="gpu2", locks=["gpu"])
+        self.assertEqual(head["state"], "waiting")
+        # Needs no GPU and leaves room for the head: starts now.
+        self.assertEqual(self.ask(3, mem=4 * GIB, agent="cpu")["state"], "granted")
+        # Wants the same lock: stays behind the head.
+        self.assertEqual(self.ask(1, mem=GIB // 2, agent="gpu3", locks=["gpu"])["state"],
+                         "waiting")  # fmt: skip
+        # Would leave the head short of cores once the GPU frees: waits.
+        self.assertEqual(self.ask(2, mem=GIB, agent="cpu2")["state"], "waiting")
+
+    def test_head_waiting_for_capacity_with_a_free_lock_is_not_overtaken(self):
+        self.ask(6)
+        self.assertEqual(self.ask(4, agent="gpu", locks=["gpu"])["state"], "waiting")
+        self.assertEqual(self.ask(2, agent="c")["state"], "waiting")
 
     def test_nothing_passes_an_exclusive_head(self):
         self.ask(6)
