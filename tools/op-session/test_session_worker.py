@@ -38,6 +38,13 @@ with (root/"op-calls.jsonl").open("a") as f:
     f.write(json.dumps({"args":args,"tty":tty,
                         "app":os.environ.get("OP_BIOMETRIC_UNLOCK_ENABLED","true")})+"\\n")
 cli_only = os.environ.get("OP_BIOMETRIC_UNLOCK_ENABLED") == "false"
+if os.environ.get("TEST_SPAWN_DAEMON") and not (root/"daemon.pid").exists():
+    # Like op, the first call starts a detached daemon that inherits stderr.
+    import subprocess
+    daemon = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              start_new_session=True)
+    (root/"daemon.pid").write_text(str(daemon.pid))
 if args[:2] == ["account","list"] and cli_only and not (root/"cli-account").exists():
     print("[]")
 elif args[:2] == ["account","add"]:
@@ -303,6 +310,22 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.assertEqual(sum(c["args"][:1] == ["signin"] for c in worker_calls), 1)
         self.assertIn(["vault", "list"], [c["args"] for c in worker_calls])
         self.assertFalse((self.temporary / "never").exists())
+
+    def test_cli_start_does_not_wait_for_a_daemon_spawned_by_op(self):
+        self.env["SSH_CONNECTION"] = "192.0.2.1 50000 192.0.2.2 22"
+        self.env["TEST_SPAWN_DAEMON"] = "1"
+        self.addCleanup(self.stop_fake_daemon)
+        self.begin_start()
+        self.finish_start()
+        self.assertEqual(self.run_helper("vault", "list").returncode, 0)
+
+    def stop_fake_daemon(self):
+        pid_file = self.temporary / "daemon.pid"
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def test_signin_enrolls_interactively_then_reuses_cli_token_without_desktop(self):
         self.env.pop("SSH_CONNECTION", None)
