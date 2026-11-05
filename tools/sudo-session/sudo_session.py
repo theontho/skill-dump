@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import select
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -32,6 +33,10 @@ RUNTIME = Path(os.environ.get(
 ADDRESS = RUNTIME / "control.sock"
 SUDO = "/usr/bin/sudo"
 TMUX = ["tmux", "-L", os.environ.get("SUDO_SESSION_TMUX_SOCKET", "sudo-session"), "-f", "/dev/null"]
+TERMINAL_UNIT = "sudo-session-terminal.service"
+TERMINAL_ENVIRONMENT = (
+    "AGENT_SESSION_STATE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "SUDO_SESSION_TMUX_SOCKET",
+)
 DURATION = 3600
 
 HELP = """\
@@ -445,11 +450,63 @@ def start(duration=None):
     return subprocess.call([*TMUX, "new-session", "-A", "-s", "auth", command])
 
 
+def terminal_unit_active():
+    return sys.platform != "darwin" and bool(shutil.which("systemctl")) and subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", TERMINAL_UNIT],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
 def pending():
     return subprocess.run(
         [*TMUX, "has-session", "-t", "auth"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    ).returncode == 0 or terminal_unit_active()
+
+
+def launch_terminal(duration):
+    """Open a real terminal running start; return True if it runs as a systemd unit."""
+    arguments = [sys.executable, str(ROOT), "start", "--duration", f"{duration}s"]
+    environment = [f"{name}={os.environ[name]}" for name in TERMINAL_ENVIRONMENT if name in os.environ]
+    shell_command = shlex.join(["env", *environment, *arguments])
+    prefix = shlex.split(os.environ.get("AGENT_SESSION_TERMINAL", ""))
+    if sys.platform == "darwin" and not prefix:
+        subprocess.run([
+            "osascript", "-e", "on run argv", "-e", 'tell application "Terminal"',
+            "-e", "activate", "-e", "do script (item 1 of argv)",
+            "-e", "end tell", "-e", "end run", shell_command,
+        ], check=True)
+        return False
+    if not prefix:
+        for name in ("ghostty", "alacritty", "kitty", "foot", "xterm"):
+            if shutil.which(name):
+                prefix = [name, "-e"]
+                break
+    if not prefix:
+        raise RuntimeError("No terminal found; set AGENT_SESSION_TERMINAL, for example 'alacritty -e'")
+    executable = shutil.which(prefix[0])
+    if not executable:
+        raise RuntimeError(f"Terminal command not found: {prefix[0]}")
+    prefix[0] = executable
+    if sys.platform != "darwin" and shutil.which("systemd-run"):
+        command = [
+            "systemd-run", "--user", "--collect", "--quiet", f"--unit={TERMINAL_UNIT}",
+            "--property=Type=exec", "--property=ExitType=cgroup",
+        ]
+        for name in (*TERMINAL_ENVIRONMENT, "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
+            if name in os.environ:
+                command.append(f"--setenv={name}={os.environ[name]}")
+        # Keep the terminal and its tmux server outside the agent harness lifecycle.
+        if subprocess.run([*command, "--", *prefix, *arguments]).returncode == 0:
+            return True
+        print("warning: systemd-run failed; the terminal may close with this agent shell",
+              file=sys.stderr)
+    subprocess.Popen(
+        [*prefix, "bash", "-c", shell_command],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return False
 
 
 def start_in_terminal(duration=None):
@@ -469,27 +526,9 @@ def start_in_terminal(duration=None):
     wait = os.environ.get("AGENT_SESSION_TERMINAL_WAIT", "300")
     if not wait.isdecimal():
         raise RuntimeError("AGENT_SESSION_TERMINAL_WAIT must be a whole number of seconds")
+    supervised = False
     if not pending():
-        command = [sys.executable, str(ROOT), "start", "--duration", f"{duration}s"]
-        environment = {name: os.environ[name] for name in (
-            "AGENT_SESSION_STATE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "SUDO_SESSION_TMUX_SOCKET",
-        ) if name in os.environ}
-        shell_command = shlex.join(["env", *(f"{key}={value}" for key, value in environment.items()), *command])
-        launcher = os.environ.get("AGENT_SESSION_TERMINAL")
-        if launcher:
-            subprocess.Popen(
-                [*shlex.split(launcher), "bash", "-c", shell_command],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        elif sys.platform == "darwin":
-            subprocess.run([
-                "osascript", "-e", "on run argv", "-e", 'tell application "Terminal"',
-                "-e", "activate", "-e", "do script (item 1 of argv)",
-                "-e", "end tell", "-e", "end run", shell_command,
-            ], check=True)
-        else:
-            raise RuntimeError("Set AGENT_SESSION_TERMINAL to a terminal launcher, such as 'alacritty -e'")
+        supervised = launch_terminal(duration)
         print("Opened a terminal for sudo approval; never enter a password in agent chat.", flush=True)
     deadline = time.monotonic() + int(wait)
     while True:
@@ -500,6 +539,11 @@ def start_in_terminal(duration=None):
         if result["code"] == 0:
             print(f"active ({format_duration(result['remaining'])} remaining)")
             return 0
+        if supervised and not pending():
+            raise RuntimeError(
+                "Authentication terminal exited without establishing a sudo session.\n"
+                f"Inspect terminal errors with: journalctl --user -u {TERMINAL_UNIT}"
+            )
         if time.monotonic() >= deadline:
             print("Sudo approval is pending in the existing terminal; check sudo-session status.")
             return 2

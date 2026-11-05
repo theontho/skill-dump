@@ -14,7 +14,7 @@
       "description": "Use for op-session or sudo-session authentication, persistent credential grants across fresh agent shells, repeated 1Password approval prompts, authorization loss, and credential-helper diagnosis or installation.",
       "license": "MIT",
       "path": "skills/credential-sessions/SKILL.md",
-      "sha256": "a33ea675204f4bc0d1e5ffe27520f3eaa066c3f52b4864b287c22abfa49e04fe",
+      "sha256": "bb303cc3cf17dac763aba90abedb596454cea6103a738a9a283eccd7946d9c4b",
       "metadata": {
         "author": "theontho",
         "version": "1.0.0"

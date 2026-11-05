@@ -35,7 +35,9 @@ Never capture or reuse an administrator or 1Password account password.
 5. Verify actual 1Password reuse with two non-secret `op-session whoami` calls
    from separate fresh shells; status alone does not prove vault access.
 6. Keep the same grant throughout related work, side questions and waits.
-   Stop once at the end, not between queries.
+   Stop a 1Password session you started once that work ends, not between queries;
+   leave pre-existing sessions available. Leave sudo sessions open unless the
+   user asks to stop them, letting their grants expire normally.
 
 ## macOS desktop integration
 

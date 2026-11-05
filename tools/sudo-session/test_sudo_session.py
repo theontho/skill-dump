@@ -235,6 +235,36 @@ class SessionTests(unittest.TestCase):
               patch.object(session, "pending", return_value=True)):
             self.assertEqual(session.main(), 2)
 
+    def test_linux_terminal_launch_detects_terminal_and_survives_in_systemd_unit(self):
+        with (patch.object(session.sys, "platform", "linux"),
+              patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-1"}, clear=True),
+              patch.object(session.shutil, "which",
+                           side_effect=lambda name: None if name == "ghostty" else f"/usr/bin/{name}"),
+              patch.object(session.subprocess, "run",
+                           return_value=subprocess.CompletedProcess([], 0)) as run):
+            self.assertTrue(session.launch_terminal(43200))
+            command = run.call_args.args[0]
+            self.assertEqual(command[:3], ["systemd-run", "--user", "--collect"])
+            self.assertIn("--setenv=WAYLAND_DISPLAY=wayland-1", command)
+            self.assertEqual(command[command.index("--") + 1:], [
+                "/usr/bin/alacritty", "-e", sys.executable, str(session.ROOT),
+                "start", "--duration", "43200s",
+            ])
+        with (patch.object(session.sys, "platform", "linux"),
+              patch.dict(os.environ, {}, clear=True),
+              patch.object(session.shutil, "which", return_value=None),
+              self.assertRaisesRegex(RuntimeError, "No terminal found")):
+            session.launch_terminal(3600)
+
+    def test_linux_terminal_exit_without_session_is_reported(self):
+        with (patch.dict(os.environ, {"AGENT_SESSION_TERMINAL_WAIT": "5"}),
+              patch.object(session, "pending", return_value=False),
+              patch.object(session, "launch_terminal", return_value=True),
+              patch.object(session, "request", side_effect=FileNotFoundError),
+              contextlib.redirect_stdout(io.StringIO()),
+              self.assertRaisesRegex(RuntimeError, "exited without establishing")):
+            session.start_in_terminal(3600)
+
     def test_macos_does_not_invoke_linux_legacy_grant_cleanup(self):
         with (patch.object(session.sys, "platform", "darwin"),
               patch.object(session.subprocess, "run") as run):

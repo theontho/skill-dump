@@ -21,9 +21,13 @@ sudo-session status
 sudo-session start --terminal
 ```
 
-macOS uses Terminal.app. On Linux, set `AGENT_SESSION_TERMINAL` to a launcher
-such as `alacritty -e`. `AGENT_SESSION_TERMINAL_WAIT` controls the approval wait
-(default 300 seconds). Status exits 0 when active, 2 when approval is pending,
+macOS uses Terminal.app. On Linux, the helper picks Ghostty, Alacritty, Kitty,
+Foot or Xterm and runs it as the `sudo-session-terminal` systemd user unit, so
+the terminal and its tmux server outlive the agent's tool call; if that terminal
+exits without authenticating, `start --terminal` fails and points at
+`journalctl --user -u sudo-session-terminal`. Set `AGENT_SESSION_TERMINAL` to
+override the launcher, for example `alacritty -e`. `AGENT_SESSION_TERMINAL_WAIT`
+controls the approval wait (default 300 seconds). Status exits 0 when active, 2 when approval is pending,
 or 1 when stopped. Resume pending approval; do not restart it.
 
 ## Session lifetime
