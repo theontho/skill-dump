@@ -56,8 +56,8 @@ start without --duration leaves an active session unchanged.
 The grant can end earlier if 1Password invalidates authentication.
 --app approves in the 1Password desktop app (default locally); if the app is
 not running, start launches it. --cli signs in with the account password in
-this terminal (default over SSH and on Linux without a graphical display,
-such as a text console); the first time it also asks for the email
+this terminal (default over SSH, on Linux without a graphical display, and
+for durations over 12h, the app's limit); the first time it also asks for the email
 and Secret Key to add the account to the CLI.
 signin is an alias for start --cli. OP_ACCOUNT (or the legacy
 OP_SESSION_ACCOUNT) selects an account without an interactive chooser.
@@ -640,9 +640,11 @@ case "$action" in
     if [[ "$AUTH_MODE" == auto ]]; then
       AUTH_MODE=app
       if [[ "$terminal_start" != true ]]; then
-        # The desktop app cannot approve over SSH or on a Linux text console.
+        # The desktop app cannot approve over SSH or on a Linux text console,
+        # and its authorization has a 12-hour hard limit.
         if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] ||
-          [[ "$(uname -s)" == Linux && -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+          [[ "$(uname -s)" == Linux && -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] ||
+          [[ "$DURATION_SECONDS" -gt 43200 ]]; then
           AUTH_MODE=cli
         fi
       fi

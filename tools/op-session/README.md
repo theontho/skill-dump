@@ -26,8 +26,8 @@ and `start` without `--duration` leaves an active grant unchanged. If the
 1Password desktop app is unreachable (e.g. it exited after a package upgrade),
 `start` launches it (`AGENT_SESSION_OP_APP` overrides the launcher).
 
-Over SSH, on a Linux text console (no `DISPLAY` or `WAYLAND_DISPLAY`), or with
-`--cli`, `start` skips the desktop app and signs in with the
+Over SSH, on a Linux text console (no `DISPLAY` or `WAYLAND_DISPLAY`), for
+durations over 12 hours, or with `--cli`, `start` skips the desktop app and signs in with the
 account password in the terminal (`OP_BIOMETRIC_UNLOCK_ENABLED=false`). The
 first time, it runs `op account add`, which asks for the sign-in address,
 email, Secret Key and password. `signin` aliases `start --cli`; no desktop app
@@ -35,8 +35,8 @@ is started or needed. It runs a worker script in the terminal, rather than
 pasting multiple shell commands that could be consumed as prompt answers.
 `--terminal --cli` preserves CLI-only mode in the new terminal window.
 `OP_ACCOUNT` (or legacy `OP_SESSION_ACCOUNT`) selects a configured account.
-Password sign-in has no desktop-app 12-hour limit, so `start -d 24h` from a
-console or SSH lasts the full lease while keepalives refresh the idle timeout.
+Password sign-in has no desktop-app 12-hour limit, so `start -d 24h` lasts
+the full lease while keepalives refresh the idle timeout.
 `--app` forces desktop-app approval. `status` never cancels pending approval; resume its existing
 terminal rather than opening another. `shell` attaches to the authorized pane.
 

@@ -313,11 +313,19 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.assertIn(["vault", "list"], [c["args"] for c in worker_calls])
         self.assertFalse((self.temporary / "never").exists())
 
+    def test_start_longer_than_app_limit_uses_cli_password_signin(self):
+        self.env["TEST_APP_MARKER"] = str(self.temporary / "never")
+        self.begin_start("-d", "24h")
+        self.assertIn("account password", self.finish_start())
+        worker_calls = [c for c in self.calls() if c["app"] == "false"]
+        self.assertEqual(sum(c["args"][:1] == ["signin"] for c in worker_calls), 1)
+        self.assertFalse((self.temporary / "never").exists())
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux text console")
     def test_linux_text_console_start_uses_cli_password_signin(self):
         self.env.pop("WAYLAND_DISPLAY")
         self.env["TEST_APP_MARKER"] = str(self.temporary / "never")
-        self.begin_start("-d", "24h")
+        self.begin_start("-d", "2h")
         self.finish_start()
         self.assertEqual(self.run_helper("vault", "list").returncode, 0)
         worker_calls = [c for c in self.calls() if c["app"] == "false"]

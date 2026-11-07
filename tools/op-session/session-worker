@@ -57,6 +57,11 @@ while ! tmux -L "$SOCKET" list-clients -t "$SESSION" -F '#{client_pid}' \
 done
 
 echo "Authenticate once to open a 1Password CLI session for ${DURATION_SECONDS}s."
+if [[ "${AGENT_SESSION_OP_AUTH:-app}" == cli ]]; then
+  echo "Signing in with your 1Password account password in this terminal."
+else
+  echo "Approve in the 1Password desktop app (or Ctrl-C and rerun with --cli)."
+fi
 [[ "${AGENT_SESSION_OP_AUTH:-app}" != cli ]] || export OP_BIOMETRIC_UNLOCK_ENABLED=false
 # The first op call may start a background `op daemon` that inherits its stderr;
 # start it here so it never holds auth_op's log pipe open and hangs sign-in.
