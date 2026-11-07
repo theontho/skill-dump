@@ -41,12 +41,27 @@ class CoordinatorTest(unittest.TestCase):
             cap=lambda: (8.0, 16 * GIB),
         )
 
-    def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=()):
+    def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=(),
+            **extra):
         return self.c.handle({
             "op": "acquire", "agent": agent, "pid": pid or os.getpid(),
             "cores": cores, "mem": mem, "label": f"{agent} job",
-            "exclusive": exclusive, "locks": list(locks),
+            "exclusive": exclusive, "locks": list(locks), **extra,
         })  # fmt: skip
+
+    def poll(self, reply):
+        return self.c.handle({"op": "poll", "id": reply["id"]})["state"]
+
+    def release(self, reply, **extra):
+        return self.c.handle({"op": "release", "id": reply["id"], **extra})
+
+    def history(self):
+        return ac.read_history(0, Path(self.tmp.name, "history.jsonl"))
+
+    def age(self, reply, seconds, key="asked"):
+        for x in self.c.state["queue"] + self.c.state["leases"]:
+            if x["id"] == reply["id"]:
+                x[key] -= seconds
 
     def test_grants_what_fits_and_queues_the_rest(self):
         self.assertEqual(self.ask(6)["state"], "granted")
@@ -92,10 +107,183 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(4, agent="gpu", locks=["gpu"])["state"], "waiting")
         self.assertEqual(self.ask(2, agent="c")["state"], "waiting")
 
-    def test_nothing_passes_an_exclusive_head(self):
-        self.ask(6)
+    def test_small_requests_pass_a_waiting_exclusive_head(self):
+        self.ask(4)
+        perf = self.ask(2, agent="perf", exclusive=True)
+        self.assertEqual(perf["state"], "waiting")
+        small = self.ask(ac.SMALL_CORES, mem=ac.SMALL_MEM, agent="small")
+        self.assertEqual(small["state"], "granted")
+        # Bigger than small: stays behind the exclusive request.
+        self.assertEqual(self.ask(ac.SMALL_CORES + 1, agent="c")["state"], "waiting")
+        self.assertEqual(self.ask(1, mem=ac.SMALL_MEM + GIB, agent="d")["state"], "waiting")
+        # Other exclusive requests never overtake.
+        self.assertEqual(self.ask(1, agent="perf2", exclusive=True)["state"], "waiting")
+        # The exclusive one waits for the small one too, then starts.
+        self.release(small)
+        self.release(self.c.state["leases"][0])
+        self.assertEqual(self.poll(perf), "granted")
+
+    def test_small_requests_stop_passing_an_exclusive_head_after_the_window(self):
+        self.ask(4)
+        perf = self.ask(2, agent="perf", exclusive=True)
+        self.age(perf, ac.EXCLUSIVE_PASS_WINDOW + 1)
+        reply = self.ask(1, mem=GIB // 2, agent="c")
+        self.assertEqual(reply["state"], "waiting")
+        self.assertIn("1 request(s) ahead", reply["reason"])
+        self.assertFalse(self.c.handle({"op": "check", "cores": 1, "mem": GIB})["ok"])
+
+    def test_small_requests_sharing_the_exclusive_heads_lock_wait(self):
+        self.ask(4)
+        self.ask(2, agent="perf", exclusive=True, locks=["gpu"])
+        self.assertEqual(self.ask(1, agent="c", locks=["gpu"])["state"], "waiting")
+        self.assertEqual(self.ask(1, agent="d", locks=["nas"])["state"], "granted")
+
+    def test_check_knows_small_requests_may_pass_an_exclusive_head(self):
+        self.ask(4)
         self.ask(2, agent="perf", exclusive=True)
-        self.assertEqual(self.ask(1, mem=GIB // 2, agent="c")["state"], "waiting")
+        self.assertTrue(self.c.handle({"op": "check", "cores": 2, "mem": GIB})["ok"])
+        self.assertFalse(self.c.handle({"op": "check", "cores": 3, "mem": GIB})["ok"])
+
+    def test_only_small_requests_pass_an_exclusive_request_deeper_in_line(self):
+        self.ask(2, mem=4 * GIB, agent="gpu1", locks=["gpu"])
+        self.assertEqual(self.ask(2, agent="gpu2", locks=["gpu"])["state"], "waiting")
+        perf = self.ask(1, agent="perf", exclusive=True)
+        # Would pass the lock-waiting head, but not the exclusive one behind it.
+        self.assertEqual(self.ask(3, agent="cpu")["state"], "waiting")
+        self.assertEqual(self.ask(1, agent="tiny")["state"], "granted")
+        self.age(perf, ac.EXCLUSIVE_PASS_WINDOW + 1)
+        self.assertEqual(self.ask(1, agent="tiny2")["state"], "waiting")
+
+    def test_exclusive_lock_waits_for_the_lock_not_for_cpu_leases(self):
+        cpu = self.ask(3, agent="cpu")
+        gpu = self.ask(1, agent="gpu1", locks=["gpu"])
+        timed = self.ask(2, agent="perf", exclusive_locks=["gpu"])
+        self.assertEqual(timed["state"], "waiting")
+        self.assertIn("gpu is held by gpu1", timed["reason"])
+        self.release(gpu)
+        self.assertEqual(self.poll(timed), "granted")  # beside the CPU lease
+        self.assertEqual(self.poll(cpu), "granted")
+        # The lock stays its own; CPU-only work still runs beside it.
+        self.assertEqual(self.ask(1, agent="gpu2", locks=["gpu"])["state"], "waiting")
+        self.assertIn("error", self.c.handle(
+            {"op": "lock", "agent": "x", "name": "gpu", "reason": "r"}))
+        self.assertEqual(self.ask(1, agent="cpu2")["state"], "granted")
+        status = self.c.handle({"op": "status"})
+        self.assertEqual([x["exclusive_locks"] for x in status["leases"]
+                          if x.get("exclusive_locks")], [["gpu"]])  # fmt: skip
+
+    def test_exclusive_lock_cores_are_guaranteed_after_warmup(self):
+        timed = self.ask(4, agent="perf", exclusive_locks=["gpu"])
+        plain = self.ask(2, agent="plain", locks=["nas"])
+        for lease in (timed, plain):
+            self.age(lease, ac.WARMUP + 1, key="granted")
+        self.busy = self.c.busy = 1.0  # both measured at a core in total
+        # Measured: 1 busy + perf's 4 guaranteed; plain counts as measured.
+        self.assertEqual(self.ask(3, agent="c")["state"], "granted")
+        self.assertEqual(self.ask(1, agent="d")["state"], "waiting")  # c warms up
+
+    def test_exclusive_lock_and_exclusive_together_are_refused(self):
+        self.assertIn("error", self.ask(1, exclusive=True, exclusive_locks=["gpu"]))
+
+    def test_headroom_keeps_cores_unclaimed_while_it_runs(self):
+        timed = self.ask(2, agent="perf", exclusive_locks=["gpu"], headroom=4)
+        self.assertEqual(timed["state"], "granted")
+        refused = self.ask(3, agent="c")  # 2 + 3 + 4 > 8
+        self.assertEqual(refused["state"], "waiting")
+        self.assertIn("kept free for perf's lease", refused["reason"])
+        self.release(refused)
+        self.assertEqual(self.ask(2, agent="d")["state"], "granted")  # 2 + 2 + 4 = 8
+        self.release(timed)
+        self.assertEqual(self.ask(3, agent="e")["state"], "granted")
+
+    def test_headroom_waits_to_start_until_it_is_free(self):
+        first = self.ask(5)
+        timed = self.ask(2, agent="perf", exclusive_locks=["gpu"], headroom=2)
+        self.assertEqual(timed["state"], "waiting")
+        self.assertIn("kept free for this request", timed["reason"])
+        self.release(first)
+        self.assertEqual(self.poll(timed), "granted")
+
+    def test_headroom_beyond_the_computer_is_refused(self):
+        self.assertIn("error", self.ask(6, headroom=4))
+
+    def test_state_from_an_older_version_still_loads(self):
+        self.state.write_text(json.dumps({"leases": [{
+            "id": "L7", "agent": "old", "pid": os.getpid(), "cores": 2.0,
+            "mem": GIB, "label": "old job", "exclusive": False, "asked": 0,
+            "granted": 0, "cwd": "/"}], "queue": [], "next": 8}))  # fmt: skip
+        self.c = self.make()
+        self.assertEqual(self.ask(6)["state"], "granted")
+        self.assertEqual(self.c.handle({"op": "release", "id": "L7", "code": 0}),
+                         {"released": True})  # fmt: skip
+        self.assertEqual(self.history()[-1]["event"], "ended")
+
+    def test_history_records_each_lease_event(self):
+        first = self.ask(6)
+        second = self.ask(4, agent="b")
+        self.release(first, code=0)
+        self.assertEqual(self.poll(second), "granted")
+        self.release(second, code=3)
+        events = [(e["event"], e["id"]) for e in self.history()]
+        self.assertEqual(events, [
+            ("requested", first["id"]), ("started", first["id"]),
+            ("requested", second["id"]), ("waiting", second["id"]),
+            ("ended", first["id"]), ("started", second["id"]),
+            ("ended", second["id"])])  # fmt: skip
+        log = self.history()
+        self.assertEqual(log[3]["kind"], "cores")
+        self.assertIn("cores free", log[3]["reason"])
+        self.assertEqual(log[4]["code"], 0)
+        self.assertEqual(log[-1]["code"], 3)
+        for key in ("wait", "run"):
+            self.assertIn(key, log[-1])
+        self.assertEqual(log[0]["agent"], "a")
+        self.assertEqual(log[0]["label"], "a job")
+        self.assertTrue(all("cwd" not in e and "pid" not in e for e in log))
+
+    def test_history_logs_waiting_only_when_the_kind_changes(self):
+        self.ask(1, agent="gpu1", locks=["gpu"])
+        hog = self.ask(5, agent="hog")
+        head = self.ask(4, agent="gpu2", locks=["gpu"])
+        for _ in range(5):
+            self.c.tick()
+        self.release(self.c.state["leases"][0])  # gpu free; still short of cores
+        for _ in range(5):
+            self.c.tick()
+        kinds = [e["kind"] for e in self.history()
+                 if e["event"] == "waiting" and e["id"] == head["id"]]  # fmt: skip
+        self.assertEqual(kinds, ["lock:gpu", "cores"])
+        self.release(hog)
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_history_records_cancelled_requests(self):
+        self.ask(8)
+        waiting = self.ask(2, agent="b")
+        self.release(waiting, why="max-wait")
+        self.ask(2, agent="c", pid=dead_pid())
+        cancelled = [e for e in self.history() if e["event"] == "cancelled"]
+        self.assertEqual([e["agent"] for e in cancelled], ["b", "c"])
+        self.assertEqual(cancelled[0]["why"], "max-wait")
+        self.assertEqual(cancelled[1]["why"], "process exited")
+        self.assertIn("wait", cancelled[0])
+
+    def test_history_rotates_by_size(self):
+        old_max, old_keep = ac.HISTORY_MAX_BYTES, ac.HISTORY_KEEP
+        ac.HISTORY_MAX_BYTES, ac.HISTORY_KEEP = 2000, 2
+        try:
+            for _ in range(40):
+                self.release(self.ask(1))
+        finally:
+            ac.HISTORY_MAX_BYTES, ac.HISTORY_KEEP = old_max, old_keep
+        path = Path(self.tmp.name, "history.jsonl")
+        files = ac.history_files(path)
+        self.assertEqual([f.name for f in files],
+                         ["history.jsonl.2", "history.jsonl.1", "history.jsonl"])  # fmt: skip
+        self.assertFalse(path.with_name("history.jsonl.3").exists())
+        self.assertTrue(all(f.stat().st_size < 2000 + 500 for f in files))
+        times = [e["time"] for e in ac.read_history(0, path)]
+        self.assertEqual(times, sorted(times))
+        self.assertEqual(ac.read_history(0, path)[-1]["event"], "ended")
 
     def test_memory_is_a_limit_too(self):
         self.ask(1, mem=10 * GIB)
@@ -295,6 +483,7 @@ class ServiceTest(unittest.TestCase):
     def cli(self, *args):
         code = (f"import agent_coord as ac, pathlib, sys; "
                 f"ac.SOCKET = pathlib.Path({str(self.sock)!r}); "
+                f"ac.HISTORY_FILE = pathlib.Path({str(Path(self.tmp.name, 'history.jsonl'))!r}); "
                 f"sys.exit(ac.main(sys.argv[1:]))")  # fmt: skip
         return subprocess.run([sys.executable, "-c", code, *args],
                               cwd=Path(__file__).parent,
@@ -313,6 +502,22 @@ class ServiceTest(unittest.TestCase):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "x",
                           "--", "sh", "-c", "exit 3")  # fmt: skip
         self.assertEqual(result.returncode, 3)
+        history = self.cli("history", "--json")
+        events = [json.loads(line) for line in history.stdout.splitlines()]
+        self.assertEqual([e["event"] for e in events], ["requested", "started", "ended"])
+        self.assertEqual(events[-1]["code"], 3)
+        self.assertIn("ended", self.cli("history", "--since", "1h").stdout)
+
+    def test_run_with_exclusive_lock_and_headroom(self):
+        result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "timed",
+                          "--exclusive-lock", "gpu", "--headroom", "2",
+                          "--", "true")  # fmt: skip
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cli("check", "--cores", "1", "--mem", "64M",
+                                  "--exclusive-lock", "gpu").returncode, 0)  # fmt: skip
+        both = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "x",
+                        "--exclusive", "--exclusive-lock", "gpu", "--", "true")  # fmt: skip
+        self.assertNotEqual(both.returncode, 0)
 
     def test_messages_round_trip(self):
         self.assertEqual(self.cli("--as", "a", "send", "--to", "b", "hello").returncode, 0)

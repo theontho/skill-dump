@@ -10,7 +10,9 @@ gives them one live place to:
 
 It is a user systemd service (`agent-coord.service`) speaking JSON lines on
 `$XDG_RUNTIME_DIR/agent-coord/sock`, with its state in
-`~/.local/state/agent-coord/state.json`. The state survives restarts. The CLI
+`~/.local/state/agent-coord/state.json`. The state survives restarts: held
+leases and waiting requests are kept, and waiting `run` clients retry their
+polls for two minutes while the service restarts. The CLI
 is the same file, installed as `~/.local/bin/agent-coord` by `skill-dump install`.
 
 ## Use
@@ -23,7 +25,11 @@ agent-coord check --cores 4 --mem 8G     # exit 0 if it would start now
 agent-coord run --cores 4 --mem 8G --label "ultima chr20 realign" -- \
     wgsextract realign --threads 4 ...
 
-# Timed/perf run: waits for other leases to end, then holds new ones back.
+# GPU timing run: exclusive on the GPU only, with its 6 cores guaranteed and
+# 2 more kept unclaimed; CPU-only leases still run in the rest.
+agent-coord run --cores 6 --mem 40G --exclusive-lock gpu --headroom 2 --label "gpu timing" -- ...
+
+# Whole-machine timed run: waits for every other lease to end, then holds new ones back.
 agent-coord run --cores 6 --mem 12G --exclusive --label "windows timing" -- ...
 
 # Lease for a job already started (until its PID exits).
@@ -41,6 +47,7 @@ agent-coord send --to worktree-ultima "done with the VM at 15:00"
 agent-coord send --to all "NAS scrub starting; IO will be slow"
 agent-coord inbox [--wait 10m]           # unread messages, then marked read
 agent-coord agents                       # who has been seen
+agent-coord history --since 6h           # lease events with wait/run times (--json)
 ```
 
 Agents are named after their git worktree's folder (`worktree-ultima`), or
@@ -77,12 +84,47 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   from it is fine. Active work goes on the SSDs (`/home`, `/mnt/Windows`).
   `--allow-archive` overrides, e.g. to archive a finished result.
 - First come, first served: nothing overtakes the request at the head of the
-  line, so big jobs are not starved, except small requests (1 core or less, 1 GB
-  or less, no disk reservation), which may start past a blocked head when they fit.
-  Nothing passes an exclusive or lock-waiting head. A request that has waited a minute tells
-  the holders (once) through their inbox.
-- `--exclusive` waits until no other lease is held, then keeps new ones waiting.
+  line, so big jobs are not starved, with these exceptions for requests that fit now:
+  - **Tiny requests** (1 core or less, 1 GB or less, no disk reservation) may
+    start past a head waiting for capacity, unless that head names a lock.
+  - **Past a lock-waiting head** (a GPU job while another holds the GPU), any
+    request that doesn't need that lock may start if it leaves the head room
+    (cores, memory, headroom) for when the lock frees.
+  - **Past a waiting `--exclusive` request** (anywhere ahead in line), small
+    requests (2 cores or less, 6 GB or less, no disk, none of its locks) may
+    start, but only during its first 30 minutes of waiting. An exclusive request
+    waits for every lease to end anyway, so a small one only adds its own run
+    time; after the window nothing new starts past it, so its wait is bounded
+    by 30 minutes plus the longest lease already running. Nothing bigger passes
+    it, and exclusive requests never overtake anything.
+
+  A request that has waited a minute tells the holders (once) through their inbox.
+- `--exclusive` (whole machine) waits until no other lease is held, then keeps
+  new ones waiting until it ends. Use it only when the whole machine must be quiet.
+- `--exclusive-lock NAME` (e.g. `gpu`) is exclusive on that resource only: it
+  holds NAME like `--lock` (waiting while anyone else holds it, and keeping
+  others from taking it), its cores count at their full size rather than
+  measured use, so they stay guaranteed, and CPU-only leases keep running in the
+  rest of the machine. This is what GPU timing runs should use.
+- `--headroom N` keeps N cores unclaimed beside the lease: it starts only when
+  its cores plus N fit with every lease counted at its full size (each is capped
+  at that by CPUQuota), and while it runs nothing is admitted into those N
+  cores. That bounds CPU contention, and so timing noise, without stopping all
+  other work.
 - A lease ends when its process exits; dead holders and waiters are dropped.
+
+## History
+
+Every lease event is appended as one JSON line to
+`~/.local/state/agent-coord/history.jsonl`, rotated at 8 MB (four older files,
+`history.jsonl.1` .. `.4`, are kept). Events: `requested`, `waiting` (the head
+of the line's reason, logged when its kind changes: `exclusive`, `lock:NAME`,
+`cores`, `mem`, `available`, `disk`, `headroom`), `started` (with `wait`
+seconds), `ended` (with `wait`, `run` seconds and the command's exit `code`
+when `run` reports it) and `cancelled` (released or died while waiting). Each
+carries the lease id, agent, label, cores, mem, locks and exclusive mode
+(`machine`, `lock` or null); never commands, paths or environment.
+`agent-coord history [--since 6h] [--json]` prints it (default: last 24 h).
 
 `run` enforces the lease: the command runs in a systemd user scope with
 `CPUQuota` (N cores) and `MemoryMax` (exceeding it kills the command, exit 137),

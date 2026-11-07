@@ -28,6 +28,10 @@ STATE_FILE = (
     / "agent-coord"
     / "state.json"
 )
+# One JSON line per lease event, next to the state; rotated by size.
+HISTORY_FILE = STATE_FILE.with_name("history.jsonl")
+HISTORY_MAX_BYTES = 8 * 1024**2
+HISTORY_KEEP = 4  # rotated files kept: history.jsonl.1 .. .4
 # Left for the desktop, the agents themselves and unleased short commands.
 RESERVE_MEM = 4 * 1024**3
 TICK = 2.0
@@ -38,6 +42,13 @@ NUDGE_AFTER = 60
 WARMUP = 60
 # Requests this small may start ahead of a blocked head of the line.
 BACKFILL_CORES, BACKFILL_MEM = 1.0, 1024**3
+# Requests this small may start while an --exclusive request waits ahead of
+# them (it waits for every lease to end anyway; a small one only adds its own
+# run time), but only until that request has waited EXCLUSIVE_PASS_WINDOW:
+# after that nothing new starts past it, so it waits at most the window plus
+# the longest lease already running.
+SMALL_CORES, SMALL_MEM = 2.0, 6 * 1024**3
+EXCLUSIVE_PASS_WINDOW = 30 * 60
 # Kept free on every disk beyond all reservations.
 DISK_MARGIN = 20 * 1024**3
 MAX_MESSAGES = 1000
@@ -46,9 +57,10 @@ HELP = """\
 agent-coord - share this computer's CPU and RAM between agents, and message them
 
 QUOTA
-  agent-coord check --cores N --mem SIZE [--exclusive]
+  agent-coord check --cores N --mem SIZE [--exclusive | --exclusive-lock NAME]
       Exit 0 if a lease that size would start now, else 1 with the reason.
-  agent-coord run --cores N --mem SIZE --label TEXT [--exclusive] [--max-wait D] -- CMD ...
+  agent-coord run --cores N --mem SIZE --label TEXT [--exclusive | --exclusive-lock NAME]
+                  [--headroom N] [--max-wait D] -- CMD ...
       Wait in line until N cores and SIZE of RAM are free, then run CMD capped
       at them (systemd scope: CPUQuota, MemoryMax; exceeding MemoryMax kills
       CMD) at nice 19 and idle IO priority. CMD sees COMPUTE_LEASE_CORES=N:
@@ -58,8 +70,19 @@ QUOTA
       until PID exits. Prints the lease ID. Holding a VM's qemu PID replaces
       its measured use with the lease.
   agent-coord release ID
-  --exclusive   For timed or performance runs: wait until no other lease is
-                held, then keep new ones waiting until this one ends.
+  --exclusive   Whole-machine exclusive: wait until no other lease is held,
+                then keep new ones waiting until this one ends. Small requests
+                (<= 2 cores, 6G, no disk) may still start while it waits, for
+                its first 30 min of waiting only.
+  --exclusive-lock NAME
+                Exclusive on resource NAME only (e.g. gpu, for a GPU timing
+                run): holds NAME like --lock, waits until nobody else holds it,
+                and its cores count in full (not measured use) so they stay
+                guaranteed. CPU-only leases still run beside it in the rest of
+                the machine. Repeatable. Prefer it to --exclusive.
+  --headroom N  Start only when N cores beyond this lease are unclaimed
+                (leases counted at their full size), and keep them unclaimed
+                while it runs: bounds CPU contention for timing runs.
   --max-wait D  Give up (exit 75) if not started within D (30m, 2h).
   --disk PATH:SIZE  Reserve SIZE of free space on PATH's disk for the job's
                 peak (temp + outputs); repeatable. Waits until it's free
@@ -82,6 +105,9 @@ MESSAGES
   agent-coord agents                       Agents seen, newest first.
 
   agent-coord status [--json]              Leases, line, VMs, free capacity.
+  agent-coord history [--since D] [--json] Lease events (requested, waiting,
+                                           started, ended, cancelled) with
+                                           wait/run times; default last 24h.
 
 Lease anything using more than 2 cores or 2 GB for more than a few minutes.
 Running QEMU guests and other unleased load are measured and counted. --as NAME sets who you are
@@ -109,6 +135,13 @@ def parse_duration(text: str) -> float:
 
 def human(size: float) -> str:
     return f"{size / 1024**3:.1f}G"
+
+
+def exclusive_mode(x: dict) -> str | None:
+    """'machine' for --exclusive, 'lock' for --exclusive-lock, else None."""
+    if x.get("exclusive"):
+        return "machine"
+    return "lock" if x.get("exclusive_locks") else None
 
 
 def alive(pid: int) -> bool:
@@ -232,9 +265,11 @@ def default_agent() -> str:
 class Coordinator:
     """All state, guarded by one lock; saved to STATE_FILE on every change."""
 
-    def __init__(self, state_file: Path, measure=measure, cap=capacity):
+    def __init__(self, state_file: Path, measure=measure, cap=capacity,
+                 history_file: Path | None = None):
         self.disk_free = disk_free
         self.state_file = state_file
+        self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
         self.measure = measure
         self.capacity = cap
         self.lock = threading.Lock()
@@ -260,10 +295,50 @@ class Coordinator:
         tmp.write_text(json.dumps(self.state))
         tmp.replace(self.state_file)
 
+    def _log(self, event: str, x: dict, **extra) -> None:
+        """Append one lease event to the history (labels only, no commands or
+        environment), rotating it by size. Never fails a request."""
+        entry = {"time": round(time.time(), 1), "event": event, "id": x["id"],
+                 "agent": x["agent"], "label": x["label"], "cores": x["cores"],
+                 "mem": x["mem"], "locks": x.get("locks", []),
+                 "exclusive": exclusive_mode(x)}  # fmt: skip
+        if x.get("exclusive_locks"):
+            entry["exclusive_locks"] = x["exclusive_locks"]
+        for key in ("headroom", "disk"):
+            if x.get(key):
+                entry[key] = x[key]
+        entry.update(extra)
+        path = self.history_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size >= HISTORY_MAX_BYTES:
+                for n in range(HISTORY_KEEP, 0, -1):
+                    older = path if n == 1 else path.with_name(f"{path.name}.{n - 1}")
+                    if older.exists():
+                        older.replace(path.with_name(f"{path.name}.{n}"))
+            with path.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            print(f"agent-coord: history: {e}", file=sys.stderr, flush=True)
+
+    def _log_end(self, x: dict, held: bool, **extra) -> None:
+        now = time.time()
+        if held:
+            granted = x.get("granted", now)
+            self._log("ended", x, wait=round(granted - x["asked"], 1),
+                      run=round(now - granted, 1), **extra)  # fmt: skip
+        else:
+            self._log("cancelled", x, wait=round(now - x["asked"], 1), **extra)
+
     def _prune(self) -> bool:
         changed = False
         for key in ("leases", "queue"):
-            live = [x for x in self.state[key] if alive(x["pid"])]
+            live = []
+            for x in self.state[key]:
+                if alive(x["pid"]):
+                    live.append(x)
+                else:
+                    self._log_end(x, key == "leases", why="process exited")
             changed |= len(live) != len(self.state[key])
             self.state[key] = live
         now = time.time()
@@ -326,39 +401,72 @@ class Coordinator:
         lease is capped at its size, at nice 19); new leases count at their
         size until they ramp up. Memory counts every lease at its size, since
         running out of it means swapping or killing."""
-        cores = self.busy + sum(x["cores"] for x in self._warming())
+        warming = {x["id"] for x in self._warming()}
+        # Leases exclusive on a lock (timing runs) count in full all along, so
+        # their cores stay guaranteed. Conservative: their measured use is in
+        # self.busy too.
+        cores = self.busy + sum(x["cores"] for x in self.state["leases"]
+                                if x["id"] in warming or x.get("exclusive_locks"))  # fmt: skip
         vms = self._vms()
         mem = sum(x["mem"] for x in self.state["leases"]) + sum(g["mem"] for g in vms)
         return cores, mem
 
-    def _blocked(self, req: dict) -> str | None:
-        """Why req can't start now, ignoring the line, or None."""
+    def _claimed(self) -> float:
+        """Cores claimed: every lease at its full size, plus VMs and unleased
+        load as measured. --headroom is kept against this, not measured use,
+        since a lease may speed up at any moment (up to its CPUQuota)."""
+        leased = sum(x["cores"] for x in self.state["leases"])
+        return leased + sum(g["cores"] for g in self._vms()) + self._unleased()
+
+    def _too_big(self, req: dict) -> str | None:
+        cores, mem = self.capacity()
+        if req["cores"] + req.get("headroom", 0) > cores or req["mem"] > mem:
+            return f"more than this computer has ({cores:g} cores, {human(mem)})"
+        return None
+
+    def _why(self, req: dict) -> tuple[str, str] | None:
+        """(kind, reason) req can't start now, ignoring the line, or None.
+        kind is a stable category (exclusive, lock:NAME, disk, cores, mem,
+        available, headroom, too-big) for the history."""
         leases = self.state["leases"]
         holder = next((x for x in leases if x["exclusive"]), None)
         if holder:
-            return f"{holder['agent']} holds an exclusive lease ({holder['label']})"
+            return "exclusive", f"{holder['agent']} holds an exclusive lease ({holder['label']})"
         if req["exclusive"] and leases:
-            return f"{len(leases)} other lease(s) must end first"
+            return "exclusive", f"{len(leases)} other lease(s) must end first"
         for name in req.get("locks", ()):
             if holder := self._lock_holder(name, req.get("id")):
-                return f"{name} is held by {holder}"
+                return f"lock:{name}", f"{name} is held by {holder}"
         for mount, size in req.get("disk", {}).items():
             free = self.disk_free(mount) - self._reserved(mount) - DISK_MARGIN
             if size > free:
-                return (f"{human(max(free, 0))} of disk free on {mount} after "
-                        f"reservations and a {human(DISK_MARGIN)} margin")  # fmt: skip
+                return "disk", (f"{human(max(free, 0))} of disk free on {mount} after "
+                                f"reservations and a {human(DISK_MARGIN)} margin")  # fmt: skip
+        if too_big := self._too_big(req):
+            return "too-big", too_big
         cores, mem = self.capacity()
-        if req["cores"] > cores or req["mem"] > mem:
-            return f"more than this computer has ({cores:g} cores, {human(mem)})"
         used_cores, used_mem = self._usage()
         if used_cores + req["cores"] > cores:
-            return f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
+            return "cores", f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
         if used_mem + req["mem"] > mem:
-            return f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
+            return "mem", f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
         if self.available is not None and req["mem"] > self.available - RESERVE_MEM:
-            return (f"only {human(max(self.available - RESERVE_MEM, 0))} of memory "
-                    "actually available")  # fmt: skip
+            return "available", (f"only {human(max(self.available - RESERVE_MEM, 0))} "
+                                 "of memory actually available")  # fmt: skip
+        keeper = max([req, *leases], key=lambda x: x.get("headroom", 0))
+        if need := keeper.get("headroom", 0):
+            claimed = self._claimed()
+            if claimed + req["cores"] + need > cores:
+                whose = "this request" if keeper is req else (
+                    f"{keeper['agent']}'s lease {keeper['id']} ({keeper['label']})")
+                return "headroom", (f"{max(cores - claimed, 0):.1f} cores unclaimed; "
+                                    f"{need:g} are kept free for {whose}")  # fmt: skip
         return None
+
+    def _blocked(self, req: dict) -> str | None:
+        """Why req can't start now, ignoring the line, or None."""
+        why = self._why(req)
+        return why[1] if why else None
 
     def _admit(self) -> bool:
         """Start waiting requests in order; the first that doesn't fit stops
@@ -366,9 +474,15 @@ class Coordinator:
         changed = False
         while self.state["queue"]:
             head = self.state["queue"][0]
-            reason = self._blocked(head)
-            if reason:
+            why = self._why(head)
+            if why:
+                kind, reason = why
                 head["reason"] = reason
+                if head.get("reason_kind") != kind:
+                    head["reason_kind"] = kind
+                    self._log("waiting", head, kind=kind, reason=reason,
+                              waited=round(time.time() - head["asked"], 1))  # fmt: skip
+                    changed = True
                 if not head.get("nudged") and time.time() - head["asked"] > NUDGE_AFTER:
                     head["nudged"] = True
                     for holder in self.state["leases"]:
@@ -390,7 +504,9 @@ class Coordinator:
     def _grant(self, req: dict) -> None:
         req["granted"] = time.time()
         req.pop("reason", None)
+        req.pop("reason_kind", None)
         self.state["leases"].append(req)
+        self._log("started", req, wait=round(req["granted"] - req["asked"], 1))
 
     def _lock_wait(self, head: dict) -> set[str]:
         """The named locks head is waiting for (held by someone else)."""
@@ -410,36 +526,64 @@ class Coordinator:
             return False
         if used_mem - freed_mem + req["mem"] + head["mem"] > mem:
             return False
+        if head.get("headroom") and (self._claimed() - freed_cores + req["cores"]
+                                     + head["cores"] + head["headroom"] > cores):  # fmt: skip
+            return False
         return self.available is None or (
             req["mem"] + head["mem"] <= self.available + freed_mem - RESERVE_MEM)
 
-    def _backfill(self, head: dict) -> bool:
-        """Let requests behind a blocked head start if they fit. Small ones
-        always may: they barely delay it, and a big job waiting for memory
-        shouldn't hold up a one-core chore. When the head waits only for a
-        named lock (a GPU job while another holds the GPU), any request that
-        doesn't need that lock may start if it leaves room for the head, so
-        hours of GPU work don't stall every CPU job behind it. Nothing passes
-        an exclusive head."""
-        if head["exclusive"]:
-            return False
-        waiting_for = self._lock_wait(head)
-        if head.get("locks") and not waiting_for:
-            return False  # its lock is free; it waits for capacity: no overtaking
+    def _backfill(self, _head: dict) -> bool:
+        """Start the requests behind a blocked head that fit and may pass."""
         started = False
         for req in list(self.state["queue"][1:]):
-            if req["exclusive"] or self._blocked(req):
-                continue
-            if waiting_for:
-                ok = not (waiting_for & set(req.get("locks", ()))) and self._leaves_room(req, head, waiting_for)
-            else:
-                ok = (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
-                      and not req.get("disk"))  # fmt: skip
-            if ok:
+            if not self._blocked(req) and self._may_pass(req):
                 self.state["queue"].remove(req)
                 self._grant(req)
                 started = True
         return started
+
+    def _may_pass(self, req: dict) -> bool:
+        """Whether req (which fits now) may start ahead of the requests before
+        it in line (the whole line, for a check).
+
+        - Plain --exclusive requests never overtake.
+        - An --exclusive request waits for every lease to end, so a small one
+          (SMALL_CORES, SMALL_MEM, no disk, none of its locks) only delays it
+          by its own run time: small ones pass it until it has waited
+          EXCLUSIVE_PASS_WINDOW. After that nothing passes it, so its wait is
+          bounded by the window plus the longest lease already running.
+        - When the head waits only for a named lock (a GPU job while another
+          holds the GPU), any request that doesn't need that lock may start if
+          it leaves room for the head (cores, memory, headroom), so hours of
+          GPU work don't stall every CPU job behind it.
+        - Otherwise (the head waits for capacity), only tiny requests
+          (BACKFILL_CORES, BACKFILL_MEM, no disk) pass, and only a head with no
+          locks: a big job waiting for memory shouldn't hold up a one-core
+          chore, while anything bigger would take the capacity it waits for."""
+        queue = self.state["queue"]
+        ahead = queue[: queue.index(req)] if req in queue else queue
+        if not ahead:
+            return True
+        if req["exclusive"]:
+            return False
+        now = time.time()
+        small = req["cores"] <= SMALL_CORES and req["mem"] <= SMALL_MEM and not req.get("disk")
+        for x in ahead:
+            if x["exclusive"] and not (
+                small and now - x["asked"] < EXCLUSIVE_PASS_WINDOW
+                and not set(req.get("locks", ())) & set(x.get("locks", ()))
+            ):  # fmt: skip
+                return False
+        head = ahead[0]
+        if head["exclusive"]:
+            return True
+        waiting_for = self._lock_wait(head)
+        if waiting_for:
+            return not (waiting_for & set(req.get("locks", ()))) and self._leaves_room(
+                req, head, waiting_for)  # fmt: skip
+        if head.get("locks"):
+            return False  # its lock is free; it waits for capacity: no overtaking
+        return req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk")
 
     def tick(self) -> None:
         sample = self.measure()
@@ -476,26 +620,41 @@ class Coordinator:
                 return {"error": f"missing {key}"}
         if req["cores"] <= 0 or req["mem"] < 0:
             return {"error": "cores must be positive and mem not negative"}
+        scoped = [str(n) for n in req.get("exclusive_locks") or []]
+        headroom = float(req.get("headroom") or 0)
+        if scoped and req.get("exclusive"):
+            return {"error": "--exclusive already excludes everything; drop --exclusive-lock"}
+        if headroom < 0:
+            return {"error": "headroom must not be negative"}
+        locks = list(dict.fromkeys([*(str(n) for n in req.get("locks") or []), *scoped]))
         lease = {
             "id": f"L{self.state['next']}", "agent": agent, "pid": int(req["pid"]),
             "cores": float(req["cores"]), "mem": int(req["mem"]),
             "label": str(req["label"]), "exclusive": bool(req.get("exclusive")),
             "asked": time.time(), "cwd": req.get("cwd", ""),
-            "locks": [str(n) for n in req.get("locks", [])],
+            "locks": locks,
             "disk": {mount_of(p): int(n) for p, n in (req.get("disk") or {}).items()},
         }  # fmt: skip
+        # Only set when used, so the state stays readable by older versions.
+        if scoped:
+            lease["exclusive_locks"] = scoped
+        if headroom:
+            lease["headroom"] = headroom
         self.state["next"] += 1
-        too_big = self._blocked({**lease, "exclusive": False})
-        if too_big and too_big.startswith("more than") and not req.get("running"):
+        too_big = self._too_big(lease)
+        if too_big and not req.get("running"):
             return {"error": f"asks for {too_big}"}
         if req.get("running"):
             # A job already running: record it as it is (it isn't asking to
             # start), so it counts against everything that is waiting.
+            self._log("requested", lease, held=True)
             lease["granted"] = time.time()
             lease["running"] = True
             self.state["leases"].append(lease)
+            self._log("started", lease, wait=0.0, held=True)
         else:
             self.state["queue"].append(lease)
+            self._log("requested", lease, reason=self._blocked(lease))
         self._admit()
         return {"id": lease["id"], **self._ticket(lease["id"])}
 
@@ -515,18 +674,24 @@ class Coordinator:
 
     def op_release(self, req: dict, _agent: str) -> dict:
         lease_id = str(req.get("id"))
-        before = len(self.state["leases"]) + len(self.state["queue"])
+        extra = {k: req[k] for k in ("code", "why") if req.get(k) is not None}
+        found = False
         for key in ("leases", "queue"):
+            for x in [x for x in self.state[key] if x["id"] == lease_id]:
+                self._log_end(x, key == "leases", **extra)
+                found = True
             self.state[key] = [x for x in self.state[key] if x["id"] != lease_id]
-        found = before != len(self.state["leases"]) + len(self.state["queue"])
         return {"released": found} if found else {"error": f"no lease {lease_id}"}
 
     def op_check(self, req: dict, _agent: str) -> dict:
+        scoped = list(req.get("exclusive_locks") or [])
         probe = {"cores": float(req.get("cores", 1)), "mem": int(req.get("mem", 0)),
                  "exclusive": bool(req.get("exclusive")),
-                 "locks": req.get("locks", []), "disk": req.get("disk", {})}  # fmt: skip
+                 "locks": list(dict.fromkeys([*req.get("locks", []), *scoped])),
+                 "exclusive_locks": scoped, "headroom": float(req.get("headroom") or 0),
+                 "disk": req.get("disk", {})}  # fmt: skip
         reason = self._blocked(probe)
-        if not reason and self.state["queue"]:
+        if not reason and self.state["queue"] and not self._may_pass(probe):
             reason = f"{len(self.state['queue'])} request(s) already waiting"
         return {"ok": reason is None, "reason": reason}
 
@@ -676,7 +841,10 @@ def _call(request: dict, socket_path: Path) -> dict:
             f"agent-coord: the service isn't reachable ({e}). "
             "Start it: systemctl --user start agent-coord"
         ) from e
-    reply = json.loads(data)
+    try:
+        reply = json.loads(data)
+    except ValueError as e:  # cut off mid-reply, e.g. by a service restart
+        raise SystemExit(f"agent-coord: no answer from the service ({e})") from e
     if "error" in reply:
         raise _ServiceError(f"agent-coord: {reply['error']}")
     return reply
@@ -696,7 +864,7 @@ def _wait_for(lease_id: str, reply: dict, max_wait: float | None) -> None:
                   file=sys.stderr, flush=True)  # fmt: skip
             said, said_at = reply["reason"], time.monotonic()
         if deadline is not None and time.monotonic() > deadline:
-            call({"op": "release", "id": lease_id})
+            call({"op": "release", "id": lease_id, "why": "max-wait"}, retry=120)
             print("agent-coord: gave up waiting", file=sys.stderr)
             raise SystemExit(75)
         time.sleep(POLL)
@@ -793,6 +961,7 @@ def _lease_request(args: argparse.Namespace, pid: int) -> dict:
     return {"op": "acquire", "agent": args.agent, "cwd": os.getcwd(), "pid": pid,
             "cores": args.cores, "mem": args.mem, "label": args.label,
             "exclusive": args.exclusive, "locks": args.lock or [],
+            "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
             "disk": dict(args.disk or [])}  # fmt: skip
 
 
@@ -811,6 +980,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     reply = call(_lease_request(args, os.getpid()))
     lease_id = reply["id"]
     child = None
+    end: dict = {}
 
     def forward(signum: int, _frame: object) -> None:
         if child is not None and child.poll() is None:
@@ -834,12 +1004,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         if code == -signal.SIGKILL:
             print(f"agent-coord: {lease_id} was killed; if it used more than "
                   f"--mem {human(args.mem)}, lease more", file=sys.stderr)  # fmt: skip
-        return 128 - code if code < 0 else code
+        end["code"] = 128 - code if code < 0 else code
+        return end["code"]
     except KeyboardInterrupt:
+        end.update(code=130, why="interrupted")
         return 130
     finally:
         try:
-            call({"op": "release", "id": lease_id}, retry=120)
+            call({"op": "release", "id": lease_id, **end}, retry=120)
         except SystemExit:
             pass
 
@@ -855,6 +1027,7 @@ def cmd_hold(args: argparse.Namespace) -> int:
 def cmd_check(args: argparse.Namespace) -> int:
     reply = call({"op": "check", "cores": args.cores, "mem": args.mem,
                   "exclusive": args.exclusive, "locks": args.lock or [],
+                  "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
                   "disk": {mount_of(p): n for p, n in args.disk or []}})  # fmt: skip
     print("ok" if reply["ok"] else f"no: {reply['reason']}")
     return 0 if reply["ok"] else 1
@@ -877,6 +1050,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     for state, x in rows:
         since = (time.time() - x.get("granted", x["asked"])) / 60
         flag = " EXCLUSIVE" if x["exclusive"] else ""
+        if x.get("exclusive_locks"):
+            flag += f" EXCLUSIVE-ON {','.join(x['exclusive_locks'])}"
+        if x.get("headroom"):
+            flag += f" headroom {x['headroom']:g} cores"
         if x.get("locks"):
             flag += f" locks {','.join(x['locks'])}"
         if x.get("disk"):
@@ -902,6 +1079,58 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"            {g['name'] or 'qemu'} (pid {g['pid']}, measured)")
     if not rows and not s["vms"]:
         print("  nothing held")
+    return 0
+
+
+def history_files(path: Path | None = None) -> list[Path]:
+    """The history and its rotated files, oldest first."""
+    path = path or HISTORY_FILE
+    rotated = [path.with_name(f"{path.name}.{n}") for n in range(HISTORY_KEEP, 0, -1)]
+    return [f for f in [*rotated, path] if f.exists()]
+
+
+def read_history(since: float, path: Path | None = None) -> list[dict]:
+    events = []
+    for f in history_files(path):
+        for line in f.read_text(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("time", 0) >= since:
+                events.append(event)
+    return events
+
+
+def _minutes(seconds: float | None) -> str:
+    return "" if seconds is None else f"{seconds / 60:.1f}m"
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    events = read_history(time.time() - args.since)
+    if args.json:
+        for event in events:
+            print(json.dumps(event))
+        return 0
+    for e in events:
+        stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(e["time"]))
+        flag = {"machine": " EXCLUSIVE", "lock": " EXCLUSIVE-ON "
+                + ",".join(e.get("exclusive_locks", []))}.get(e.get("exclusive"), "")  # fmt: skip
+        if e.get("locks"):
+            flag += f" locks {','.join(e['locks'])}"
+        times = []
+        for key in ("wait", "waited", "run"):
+            if key in e:
+                times.append(f"{'wait' if key == 'waited' else key} {_minutes(e[key])}")
+        if "code" in e:
+            times.append(f"exit {e['code']}")
+        detail = e.get("reason") or e.get("why") or ""
+        print(f"{stamp} {e['event']:<9} {e['id']:<6} {e['cores']:>4g}c {human(e['mem']):>6} "
+              f"{e['agent']}: {e['label']}{flag}"
+              + (f" [{', '.join(times)}]" if times else "")
+              + (f" -- {detail}" if detail else ""))  # fmt: skip
+    if not events:
+        print("no lease events in that time")
     return 0
 
 
@@ -963,6 +1192,8 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--cores", type=float, required=True)
         sub.add_argument("--mem", type=parse_size, required=True)
         sub.add_argument("--exclusive", action="store_true")
+        sub.add_argument("--exclusive-lock", action="append")
+        sub.add_argument("--headroom", type=float, default=0.0)
         sub.add_argument("--disk", type=parse_disk, action="append")
         sub.add_argument("--lock", action="append")
         if name == "check":
@@ -975,6 +1206,9 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--allow-archive", action="store_true")
             sub.add_argument("command", nargs=argparse.REMAINDER)
     subs.add_parser("status").add_argument("--json", action="store_true")
+    history = subs.add_parser("history")
+    history.add_argument("--since", type=parse_duration, default=24 * 3600.0)
+    history.add_argument("--json", action="store_true")
     send = subs.add_parser("send")
     send.add_argument("--to", required=True)
     send.add_argument("text", nargs="+")
@@ -994,11 +1228,14 @@ def main(argv: list[str] | None = None) -> int:
     subs.add_parser("serve")
     args = parser.parse_args(argv)
     args.agent = args.agent or default_agent()
+    if getattr(args, "exclusive", False) and getattr(args, "exclusive_lock", None):
+        parser.error("--exclusive already excludes everything; drop --exclusive-lock")
     if args.action == "serve":
         serve()
         return 0
     return {
         "run": cmd_run, "hold": cmd_hold, "check": cmd_check, "status": cmd_status,
+        "history": cmd_history,
         "send": cmd_send, "inbox": cmd_inbox, "agents": cmd_agents,
         "release": cmd_release, "lock": cmd_lock, "unlock": cmd_unlock,
     }[args.action](args)  # fmt: skip
