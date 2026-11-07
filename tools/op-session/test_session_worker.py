@@ -9,6 +9,7 @@ import select
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -107,8 +108,9 @@ time.sleep(0.2 if seconds==45 else seconds)
                         AGENT_SESSION_STATE_HOME=str(self.temporary / "state"),
                         AGENT_SESSION_TMUX_SOCKET=self.socket)
         for name in ("SSH_CONNECTION", "SSH_TTY", "OP_ACCOUNT", "OP_SESSION_ACCOUNT",
-                     "OP_BIOMETRIC_UNLOCK_ENABLED"):
+                     "OP_BIOMETRIC_UNLOCK_ENABLED", "DISPLAY"):
             self.env.pop(name, None)
+        self.env["WAYLAND_DISPLAY"] = "wayland-test"
         self.worker = Path(os.environ.get("TEST_SESSION_WORKER", ROOT / "session-worker"))
         self.helper = Path(os.environ.get("TEST_SESSION_HELPER", ROOT / "op-session"))
         self.env["AGENT_SESSION_WORKER"] = str(self.worker)
@@ -309,6 +311,17 @@ time.sleep(0.2 if seconds==45 else seconds)
         self.assertEqual(sum(c["args"][:2] == ["account", "add"] for c in worker_calls), 1)
         self.assertEqual(sum(c["args"][:1] == ["signin"] for c in worker_calls), 1)
         self.assertIn(["vault", "list"], [c["args"] for c in worker_calls])
+        self.assertFalse((self.temporary / "never").exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux text console")
+    def test_linux_text_console_start_uses_cli_password_signin(self):
+        self.env.pop("WAYLAND_DISPLAY")
+        self.env["TEST_APP_MARKER"] = str(self.temporary / "never")
+        self.begin_start("-d", "24h")
+        self.finish_start()
+        self.assertEqual(self.run_helper("vault", "list").returncode, 0)
+        worker_calls = [c for c in self.calls() if c["app"] == "false"]
+        self.assertEqual(sum(c["args"][:1] == ["signin"] for c in worker_calls), 1)
         self.assertFalse((self.temporary / "never").exists())
 
     def test_cli_start_does_not_wait_for_a_daemon_spawned_by_op(self):
