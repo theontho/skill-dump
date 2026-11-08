@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bootstrap: clone (or update) skill-dump and install it.
 #   curl -fsSL https://raw.githubusercontent.com/theontho/skill-dump/main/install.sh | bash
-#   curl -fsSL .../install.sh | bash -s -- --skip copilot-persistent
+#   curl -fsSL .../install.sh | bash -s -- --skip hf-op
 set -euo pipefail
 
 repo=${SKILL_DUMP_REPO:-https://github.com/theontho/skill-dump.git}

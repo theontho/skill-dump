@@ -17,6 +17,6 @@
     "tools:test:launchers": "cd tools/cli-launchers && python3 -m unittest -q test_launcher && cd ../hf-op && python3 -m unittest -q test_hf_op",
     "tools:test:credentials": "cd tools/sudo-session && python3 -m unittest -q test_sudo_session && cd ../op-session && python3 -m unittest -q test_session_worker",
     "tools:test:install": "python3 -m unittest -q scripts/test_install.py",
-    "tools:lint": "shellcheck bin/skill-dump install.sh githooks/* tools/copilot-persistent/copilot tools/copilot-persistent/copilot-real tools/op-session/op-session tools/op-session/session-helper tools/op-session/session-worker tools/cli-launchers/launcher tools/hf-op/hf-op"
+    "tools:lint": "shellcheck bin/skill-dump install.sh githooks/* tools/op-session/op-session tools/op-session/session-helper tools/op-session/session-worker tools/cli-launchers/launcher tools/hf-op/hf-op"
   }
 }

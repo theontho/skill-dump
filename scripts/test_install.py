@@ -48,7 +48,7 @@ class InstallTests(unittest.TestCase):
             run("git", "add", ".")
             run("git", "commit", "-qm", "Initial installer fixture")
             run("git", "clone", "--bare", "-q", str(source), env["SKILL_DUMP_REPO"])
-            run("/bin/bash", str(source / "install.sh"), "--skip", "agent-coord,copilot-persistent")
+            run("/bin/bash", str(source / "install.sh"), "--skip", "agent-coord")
             installed = Path(env["SKILL_DUMP_HOME"])
             command = home / ".local/bin/skill-dump"
             self.assertTrue(command.is_symlink())
