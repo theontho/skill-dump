@@ -98,6 +98,14 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
     by 30 minutes plus the longest lease already running. Nothing bigger passes
     it, and exclusive requests never overtake anything.
 
+  - **Past a stuck request**, any request that fits may start, in order. A
+    request is stuck once it has waited 2 minutes short of actually available
+    memory and would not fit even if every lease ended (each counted at what it
+    really holds, at most its size): the memory is held outside the line, so
+    holding others back gains it nothing. Its owner is told once, and it takes
+    its turn again as soon as it would fit. Plain `--exclusive` requests are
+    never stuck.
+
   A request that has waited a minute tells the holders (once) through their inbox.
 - `--exclusive` (whole machine) waits until no other lease is held, then keeps
   new ones waiting until it ends. Use it only when the whole machine must be quiet.

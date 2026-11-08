@@ -49,6 +49,10 @@ BACKFILL_CORES, BACKFILL_MEM = 1.0, 1024**3
 # the longest lease already running.
 SMALL_CORES, SMALL_MEM = 2.0, 6 * 1024**3
 EXCLUSIVE_PASS_WINDOW = 30 * 60
+# A request short of memory is stuck once it has waited this long and would not
+# fit even if every lease ended: what it needs is held outside the line, so
+# holding others back gains it nothing. The wait rides out brief dips.
+STUCK_AFTER = 120
 # Kept free on every disk beyond all reservations.
 DISK_MARGIN = 20 * 1024**3
 MAX_MESSAGES = 1000
@@ -185,6 +189,23 @@ def _footprint(pid: int) -> int:
     return total
 
 
+def tree_footprint(pid: int) -> int:
+    """Resident plus swapped-out memory of pid and its descendants."""
+    total, seen, stack = 0, set(), [pid]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        total += _footprint(current)
+        try:
+            for task in Path(f"/proc/{current}/task").iterdir():
+                stack.extend(int(x) for x in (task / "children").read_text().split())
+        except OSError:
+            pass  # exited, or no children file: counts as what was read so far
+    return total
+
+
 def _host_busy() -> tuple[float, float]:
     """(busy, total) CPU seconds since boot, summed over all cores."""
     fields = [int(x) for x in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
@@ -266,8 +287,9 @@ class Coordinator:
     """All state, guarded by one lock; saved to STATE_FILE on every change."""
 
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
-                 history_file: Path | None = None):
+                 history_file: Path | None = None, footprint=tree_footprint):
         self.disk_free = disk_free
+        self.footprint = footprint
         self.state_file = state_file
         self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
         self.measure = measure
@@ -463,6 +485,20 @@ class Coordinator:
                                     f"{need:g} are kept free for {whose}")  # fmt: skip
         return None
 
+    def _stuck(self, req: dict) -> bool:
+        """Whether req has waited STUCK_AFTER for memory that no lease's end
+        would free. Each lease is counted as giving back what it really holds,
+        at most its size. Plain --exclusive requests wait for every lease
+        anyway and keep their own rules."""
+        if req["exclusive"] or self.available is None:
+            return False
+        if time.time() - req["asked"] < STUCK_AFTER:
+            return False
+        if req["mem"] <= self.available - RESERVE_MEM:
+            return False  # fits now: anything holding it up is not memory
+        freed = sum(min(x["mem"], self.footprint(x["pid"])) for x in self.state["leases"])
+        return req["mem"] > self.available + freed - RESERVE_MEM
+
     def _blocked(self, req: dict) -> str | None:
         """Why req can't start now, ignoring the line, or None."""
         why = self._why(req)
@@ -494,6 +530,15 @@ class Coordinator:
                             f"({head['label']}); you hold lease {holder['id']} "
                             f"({holder['label']}).",
                         )  # fmt: skip
+                    changed = True
+                if not head.get("stuck_told") and self._stuck(head):
+                    head["stuck_told"] = True
+                    self._post(
+                        "agent-coord", head["agent"],
+                        f"{head['id']} ({head['label']}) needs {human(head['mem'])}, more than "
+                        "would be available even if every lease ended; other jobs may now "
+                        "pass it. Ask for less, or free the memory held outside leases.",
+                    )  # fmt: skip
                     changed = True
                 return self._backfill(head) or changed
             self.state["queue"].pop(0)
@@ -559,7 +604,10 @@ class Coordinator:
         - Otherwise (the head waits for capacity), only tiny requests
           (BACKFILL_CORES, BACKFILL_MEM, no disk) pass, and only a head with no
           locks: a big job waiting for memory shouldn't hold up a one-core
-          chore, while anything bigger would take the capacity it waits for."""
+          chore, while anything bigger would take the capacity it waits for.
+        - A stuck request (see _stuck) doesn't count as being ahead: no lease
+          ending would let it start, so the line behind it moves on, in order.
+          It takes its turn again as soon as it would fit."""
         queue = self.state["queue"]
         ahead = queue[: queue.index(req)] if req in queue else queue
         if not ahead:
@@ -574,6 +622,9 @@ class Coordinator:
                 and not set(req.get("locks", ())) & set(x.get("locks", ()))
             ):  # fmt: skip
                 return False
+        ahead = [x for x in ahead if not self._stuck(x)]
+        if not ahead:
+            return True
         head = ahead[0]
         if head["exclusive"]:
             return True

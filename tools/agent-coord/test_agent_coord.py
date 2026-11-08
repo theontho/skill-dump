@@ -107,6 +107,87 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(4, agent="gpu", locks=["gpu"])["state"], "waiting")
         self.assertEqual(self.ask(2, agent="c")["state"], "waiting")
 
+    def stuck_head(self, available, mem=11 * GIB, locks=("gpu",), waited=ac.STUCK_AFTER + 1):
+        """A head that has waited, short of actually available memory."""
+        self.available = available
+        self.c.tick()
+        head = self.ask(4, mem=mem, agent="big", locks=locks)
+        self.assertEqual(head["state"], "waiting")
+        self.c.state["queue"][0]["asked"] -= waited
+        return head
+
+    def test_stuck_head_that_no_lease_end_would_help_is_passed(self):
+        # Today's stall: a big GPU lease, short of memory with nothing else running,
+        # held a smaller GPU job behind it while the GPU sat idle.
+        self.stuck_head(10 * GIB)
+        self.assertEqual(self.ask(2, mem=2 * GIB, agent="c", locks=["gpu"])["state"], "granted")
+
+    def test_stuck_head_is_told_once(self):
+        head = self.stuck_head(10 * GIB)
+        self.c.tick()
+        self.c.tick()
+        inbox = self.c.handle({"op": "inbox", "agent": "big"})["messages"]
+        told = [m for m in inbox if head["id"] in m["text"]]
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("even if every lease ended", told[0]["text"])
+
+    def test_head_short_of_memory_keeps_its_place_at_first(self):
+        self.stuck_head(10 * GIB, waited=0)
+        self.assertEqual(self.ask(2, mem=2 * GIB, agent="c")["state"], "waiting")
+
+    def test_head_that_a_lease_end_would_free_is_not_stuck(self):
+        self.ask(2, mem=4 * GIB, agent="holder")  # really holds its 4 GiB
+        self.c.footprint = lambda pid: 4 * GIB
+        self.stuck_head(13 * GIB)  # 9 usable now, 13 once the lease ends: 11 fits then
+        self.assertEqual(self.ask(1, mem=2 * GIB, agent="c")["state"], "waiting")
+
+    def test_lease_counts_only_what_it_really_holds(self):
+        self.ask(2, mem=4 * GIB, agent="holder")  # asked for 4 GiB, holds almost nothing
+        self.c.footprint = lambda pid: GIB // 8
+        self.stuck_head(13 * GIB)
+        self.assertEqual(self.ask(1, mem=2 * GIB, agent="c")["state"], "granted")
+
+    def test_lease_never_counts_for_more_than_its_size(self):
+        self.ask(2, mem=GIB, agent="holder")
+        self.c.footprint = lambda pid: 8 * GIB
+        self.stuck_head(13 * GIB)  # 9 usable + at most 1 from the lease: 11 stays out of reach
+        self.assertEqual(self.ask(1, mem=2 * GIB, agent="c")["state"], "granted")
+
+    def test_stuck_head_takes_its_turn_again_once_it_would_fit(self):
+        self.stuck_head(10 * GIB)
+        self.available = 15 * GIB + GIB // 2
+        self.c.tick()
+        leases = [x["label"] for x in self.c.state["leases"]]
+        self.assertEqual(leases, ["big job"])
+
+    def test_line_behind_a_stuck_head_stays_in_order(self):
+        self.ask(5, mem=GIB, agent="holder")
+        self.stuck_head(10 * GIB, locks=())
+        self.busy = 5.0
+        self.c.tick()
+        # "second" fits nowhere yet; a later request may not jump it just because the head is stuck.
+        self.assertEqual(self.ask(5, mem=GIB, agent="second")["state"], "waiting")
+        self.assertEqual(self.ask(2, mem=2 * GIB, agent="third")["state"], "waiting")
+
+    def test_stuck_head_does_not_let_requests_past_a_waiting_exclusive(self):
+        self.ask(1, agent="holder")
+        self.assertEqual(self.ask(1, agent="whole", exclusive=True)["state"], "waiting")
+        self.c.state["queue"][0]["asked"] -= ac.EXCLUSIVE_PASS_WINDOW + 1
+        self.available = 10 * GIB
+        self.c.tick()
+        big = self.ask(4, mem=11 * GIB, agent="big")
+        self.assertEqual(big["state"], "waiting")
+        self.c.state["queue"][1]["asked"] -= ac.STUCK_AFTER + 1
+        self.assertEqual(self.ask(1, mem=GIB // 2, agent="c")["state"], "waiting")
+
+    def test_exclusive_request_short_of_memory_is_never_stuck(self):
+        self.available = 10 * GIB
+        self.c.tick()
+        self.ask(1, agent="holder")
+        self.assertEqual(self.ask(1, mem=11 * GIB, agent="whole", exclusive=True)["state"], "waiting")
+        self.c.state["queue"][0]["asked"] -= ac.STUCK_AFTER + 1
+        self.assertFalse(self.c._stuck(self.c.state["queue"][0]))
+
     def test_small_requests_pass_a_waiting_exclusive_head(self):
         self.ask(4)
         perf = self.ask(2, agent="perf", exclusive=True)
@@ -437,6 +518,26 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.c.handle({"op": "poll", "id": held["id"]})["state"],
                          "granted")  # fmt: skip
         self.assertEqual(len(self.c.handle({"op": "inbox", "agent": "b"})["messages"]), 1)
+
+
+class FootprintTest(unittest.TestCase):
+    def test_tree_footprint_counts_descendants(self):
+        child = subprocess.Popen([sys.executable, "-c", "x = bytearray(64 * 1024**2); input()"],
+                                 stdin=subprocess.PIPE)  # fmt: skip
+        try:
+            own = ac._footprint(os.getpid())
+            for _ in range(100):
+                if ac._footprint(child.pid) > 60 * 1024**2:
+                    break
+                time.sleep(0.05)
+            self.assertGreaterEqual(ac.tree_footprint(os.getpid()), own + 60 * 1024**2)
+        finally:
+            child.stdin.close()
+            child.kill()
+            child.wait()
+
+    def test_tree_footprint_of_a_dead_pid_is_zero(self):
+        self.assertEqual(ac.tree_footprint(dead_pid()), 0)
 
 
 class ArchiveTest(unittest.TestCase):
