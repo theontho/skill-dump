@@ -29,7 +29,7 @@ Record what you find. Change nothing yet.
 
 - Platform: `uname -s`, `uname -n`, whether a systemd user session works (`systemctl --user show-environment`), and
   which of `python3 tmux mise sudo git` exist. Compare with each tool's `REQUIRES`/`OS` in `tools/*/tool.conf`.
-- Existing copies: `type -a skill-dump agent-coord sudo-session op-session copilot`. List `~/.local/bin`,
+- Existing copies: `type -a skill-dump agent-coord sudo-session op-session`. List `~/.local/bin`,
   `~/.local/libexec`, `~/.config/systemd/user/` and `~/Library/LaunchAgents/`. Follow wrappers to their real
   sources (for example `exec python3 /some/dir/tool.py`), which may live in a project folder.
 - Agent instructions: `~/.copilot/copilot-instructions.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
@@ -37,7 +37,7 @@ Record what you find. Change nothing yet.
   duplicate `tools/*/agents.md`, and any machine-specific rules (storage, VMs, hardware).
 - Skills already in `~/.agents/skills` and `~/.claude/skills` with the same names as repo skills.
 - Live state that must survive: `agent-coord status` (leases, locks, waiters), `sudo-session status`,
-  `op-session status`, and tmux sessions on `tmux -L copilot-persistent ls`.
+  and `op-session status`.
 - Other general agent tooling that would help on every computer (launchers, credential helpers, coordination
   scripts). Leave out project-specific services and things another app manages (for example herdr hooks).
 
@@ -94,19 +94,17 @@ Work in the dev checkout:
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/theontho/skill-dump/main/install.sh | bash
-   # add: -s -- --skip copilot-persistent   (or --only ..., --no-skills, --no-agent-instructions)
+   # add: -s -- --skip hf-op   (or --only ..., --no-skills, --no-agent-instructions)
    ```
 
-   Ask before installing tools that replace a command the user already uses differently, such as the `copilot`
-   wrapper.
+   Ask before installing tools that replace a command the user already uses differently.
 
 ## 5. Verify
 
 - `skill-dump status`: correct commit, tools installed, and `hooks: reinstall on git pull/checkout`.
-- `systemctl --user is-active agent-coord copilot-tmux` (only for installed tools). Unit
+- `systemctl --user is-active agent-coord` (only if installed). Unit
   `ExecStart` lines point into `~/.local/share/skill-dump`.
-- Each command works: `agent-coord status` still shows its earlier leases, `sudo-session status`, `op-session status`
-  and `copilot --version`.
+- Each command works: `agent-coord status` still shows its earlier leases, `sudo-session status` and `op-session status`.
 - Each instruction file contains exactly one skill-dump block and no duplicated old sections. Skills are linked.
 - `skill-dump update` reports `up to date`.
 

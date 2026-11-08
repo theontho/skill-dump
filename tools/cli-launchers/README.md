@@ -9,7 +9,6 @@ then executes it with arguments unchanged. The launchers retain the original
 `MISE_MINIMUM_RELEASE_AGE=0` behavior. Installation only creates links; it does
 not download or launch those programs.
 
-Copilot is deliberately separate, managed by `copilot-persistent` when enabled.
-Use `--skip copilot-persistent` to leave an existing Copilot launcher untouched.
+Copilot has no launcher here: install it with mise and run it directly.
 
 Run `python3 -m unittest -q test_launcher` here for isolated fake-mise tests.
