@@ -42,9 +42,10 @@ agent-coord run --cores 4 --mem 8G --disk /home:150G --label "30x realign" -- ..
 agent-coord lock windows-vm --reason "full SNP correctness until Tue AM" --pid 3442633
 agent-coord run --lock gpu --cores 2 --mem 8G --label "parabricks" -- ...
 
+agent-coord unlock windows-vm
+
 # Announce a failure (to an agent, or all) instead of leaving it in a log.
 agent-coord run --cores 4 --mem 12G --notify-on-fail all --label "overnight call" -- ...
-agent-coord unlock windows-vm
 
 agent-coord send --to worktree-ultima "done with the VM at 15:00"
 agent-coord send --to all "NAS scrub starting; IO will be slow"
