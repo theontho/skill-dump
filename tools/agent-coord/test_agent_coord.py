@@ -609,6 +609,21 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(events[-1]["code"], 3)
         self.assertIn("ended", self.cli("history", "--since", "1h").stdout)
 
+    def test_run_notifies_on_failure(self):
+        result = self.cli("--as", "worker", "run", "--cores", "1", "--mem", "64M",
+                          "--label", "long job", "--notify-on-fail", "boss",
+                          "--", "sh", "-c", "exit 3")  # fmt: skip
+        self.assertEqual(result.returncode, 3)
+        inbox = self.cli("--as", "boss", "inbox").stdout
+        self.assertIn("FAILED: long job", inbox)
+        self.assertIn("exit 3", inbox)
+
+    def test_run_success_sends_no_notice(self):
+        result = self.cli("--as", "worker", "run", "--cores", "1", "--mem", "64M",
+                          "--label", "ok job", "--notify-on-fail", "boss", "--", "true")  # fmt: skip
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("FAILED", self.cli("--as", "boss", "inbox").stdout)
+
     def test_run_with_exclusive_lock_and_headroom(self):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "timed",
                           "--exclusive-lock", "gpu", "--headroom", "2",

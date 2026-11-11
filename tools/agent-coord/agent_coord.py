@@ -1056,6 +1056,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"agent-coord: {lease_id} was killed; if it used more than "
                   f"--mem {human(args.mem)}, lease more", file=sys.stderr)  # fmt: skip
         end["code"] = 128 - code if code < 0 else code
+        if end["code"] and args.notify_on_fail:
+            _notify_failure(args, lease_id, end["code"], code == -signal.SIGKILL)
         return end["code"]
     except KeyboardInterrupt:
         end.update(code=130, why="interrupted")
@@ -1065,6 +1067,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             call({"op": "release", "id": lease_id, **end}, retry=120)
         except SystemExit:
             pass
+
+
+def _notify_failure(args: argparse.Namespace, lease_id: str, code: int,
+                    killed: bool) -> None:
+    """Tell --notify-on-fail's recipients that the command failed, so an
+    unattended job's failure doesn't sit unnoticed in a log."""
+    why = f"killed (memory over --mem {human(args.mem)}?)" if killed else f"exit {code}"
+    text = f"FAILED: {args.label} ({lease_id}, {why}) in {os.getcwd()}"
+    try:
+        call({"op": "send", "agent": args.agent, "cwd": os.getcwd(),
+              "to": args.notify_on_fail, "text": text}, retry=60)  # fmt: skip
+    except SystemExit:
+        print(f"agent-coord: could not send the failure notice: {text}", file=sys.stderr)
 
 
 def cmd_hold(args: argparse.Namespace) -> int:
@@ -1255,6 +1270,7 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--pid", type=int, required=True)
         else:
             sub.add_argument("--allow-archive", action="store_true")
+            sub.add_argument("--notify-on-fail", metavar="AGENT|all")
             sub.add_argument("command", nargs=argparse.REMAINDER)
     subs.add_parser("status").add_argument("--json", action="store_true")
     history = subs.add_parser("history")
