@@ -343,17 +343,49 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.poll(head), "granted")
 
     def test_review_ends_before_start_respects_actual_admission(self):
+        self._assert_same_pass_available_limit(with_head=True)
+
+    def test_review_in_order_grants_respect_actual_admission(self):
+        self._assert_same_pass_available_limit(with_head=False)
+
+    def _assert_same_pass_available_limit(self, with_head):
         self.available = 42 * GIB
-        self.configure(cores=12, mem=58, footprint=lambda pid: 20 * GIB)
-        self.ask(1, mem=20 * GIB, expect=600)
+        holder_pid, candidate_pid = os.getpid(), os.getppid()
+        self.configure(cores=12, mem=58,
+                       footprint=lambda pid: 20 * GIB if pid == holder_pid else 0)
+        self.ask(1, mem=20 * GIB, pid=holder_pid, expect=600)
         self.available = 22 * GIB
         self.c.tick()
-        self.ask(1, mem=30 * GIB, agent="big")
-        replies = [self.ask(1, mem=8 * GIB, agent=f"m{i}", expect=30)
-                   for i in range(4)]
-        # Preserve _why's existing memory safety and claimed-memory limit.
-        self.assertEqual(sum(r["state"] == "granted" for r in replies), 4)
-        self.assertLessEqual(sum(x["mem"] for x in self.c.state["leases"]), 58 * GIB)
+        if with_head:
+            self.assertEqual(self.ask(1, mem=30 * GIB, agent="big")["state"], "waiting")
+        # Queue all candidates before one pass, with no new availability sample.
+        with patch.object(self.c, "_admit", return_value=False):
+            replies = [self.ask(1, mem=8 * GIB, pid=candidate_pid,
+                                agent=f"m{i}", expect=300) for i in range(4)]
+        with patch.object(self.c, "footprint", wraps=self.c.footprint) as footprint:
+            self.c._admit()
+            self.assertLessEqual(footprint.call_count, 2)
+        self.assertEqual([self.c._ticket(r["id"])["state"] for r in replies],
+                         ["granted", "granted", "waiting", "waiting"])
+        granted = [x for x in self.c.state["leases"] if x["pid"] == candidate_pid]
+        self.assertLessEqual(sum(x["mem"] for x in granted), 18 * GIB)
+        if with_head:
+            self.assertTrue(all("expected end before" in x["backfill_reason"] for x in granted))
+        else:
+            self.assertEqual(self.c._why(self.c.state["queue"][0])[0], "available")
+
+    def test_review_available_reserves_only_unmeasured_warming_memory(self):
+        with patch.object(ac.time, "time", return_value=100000) as clock:
+            self.available = 22 * GIB
+            self.configure(cores=12, mem=58, footprint=lambda pid: 3 * GIB)
+            self.ask(1, mem=8 * GIB)
+            # Of 18G usable, only the unmeasured 5G is reserved: 13G still fits.
+            self.assertEqual(self.ask(1, mem=13 * GIB)["state"], "granted")
+            self.assertEqual(self.ask(1, mem=9 * GIB)["state"], "waiting")
+            # Underused claims stop reducing availability when warmup ends.
+            clock.return_value += ac.WARMUP
+            self.c._admit()
+            self.assertEqual(len(self.c.state["queue"]), 0)
 
     def test_review_measured_cpu_projection(self):
         self.configure(cores=12, mem=58)
@@ -506,6 +538,9 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.poll(backfill), "granted")
         self.available = 5 * GIB
         self.c.footprint = lambda pid: 0
+        # These underused jobs are already past startup when the head is stuck.
+        for lease in self.c.state["leases"]:
+            self.age(lease, ac.WARMUP, "granted")
         self.c.tick()
         stuck = self.ask(1, mem=10 * GIB, agent="stuck", locks=["nas"])
         self.age(stuck, ac.STUCK_AFTER + 1)

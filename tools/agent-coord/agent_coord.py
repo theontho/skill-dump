@@ -496,9 +496,15 @@ class Coordinator:
             return "cores", f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
         if used_mem + req["mem"] > mem:
             return "mem", f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
-        if self.available is not None and req["mem"] > self.available - RESERVE_MEM:
-            return "available", (f"only {human(max(self.available - RESERVE_MEM, 0))} "
-                                 "of memory actually available")  # fmt: skip
+        if self.available is not None:
+            # The sample does not yet include warming leases' full claims,
+            # including jobs granted earlier in this admission pass.
+            growth = sum(max(0, x["mem"] - self._footprint(x["pid"]))
+                         for x in self._warming())
+            available = self.available - RESERVE_MEM - growth
+            if req["mem"] > available:
+                return "available", (f"only {human(max(available, 0))} "
+                                     "of memory actually available")  # fmt: skip
         keeper = max([req, *leases], key=lambda x: x.get("headroom", 0))
         if need := keeper.get("headroom", 0):
             claimed = self._claimed()
