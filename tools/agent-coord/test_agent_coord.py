@@ -63,6 +63,118 @@ class CoordinatorTest(unittest.TestCase):
             if x["id"] == reply["id"]:
                 x[key] -= seconds
 
+    def test_round2_window_starts_when_request_becomes_head(self):
+        with patch.object(ac.time, "time", return_value=100000) as clock:
+            self.ask(4, mem=8 * GIB, expect=7200)
+            first = self.ask(8, mem=12 * GIB, agent="first")
+            head = self.ask(6, mem=10 * GIB, agent="head")
+            clock.return_value += ac.BACKFILL_PASS_WINDOW + 60
+            self.release(first)
+            self.assertEqual(self.ask(2, mem=4 * GIB, expect=36000)["state"], "granted")
+            self.assertEqual(self.c.state["queue"][0]["id"], head["id"])
+            self.assertEqual(self.c.state["queue"][0]["head_since"], clock.return_value)
+
+    def test_round2_tiny_passes_after_capacity_window(self):
+        with patch.object(ac.time, "time", return_value=100000) as clock:
+            self.ask(4, mem=8 * GIB, expect=7200)
+            self.ask(6, mem=10 * GIB, agent="head")
+            clock.return_value += ac.BACKFILL_PASS_WINDOW + 1
+            self.assertEqual(self.ask(1, expect=36000)["state"], "granted")
+            self.assertEqual(self.ask(2, expect=1)["state"], "waiting")
+
+    def test_round2_tiny_passes_during_overrun(self):
+        holder = self.ask(4, mem=8 * GIB, expect=600)
+        self.ask(8, mem=14 * GIB, agent="head")
+        medium = self.ask(3, mem=4 * GIB, agent="medium", expect=60)
+        self.age(medium, 61, "granted")
+        self.release(holder)
+        self.assertEqual(self.ask(2, expect=1)["state"], "waiting")
+        self.assertEqual(self.ask(1, expect=36000)["state"], "granted")
+
+    def test_round2_underused_ending_claim_cannot_credit_remaining_holder(self):
+        self.configure(cores=12, mem=58)
+        a = self.ask(8, agent="A", expect=3600)
+        b = self.ask(4, agent="B", expect=36000)
+        self.age(a, 200, "granted")
+        self.age(b, 70, "granted")
+        self.busy = self.c.busy = 6  # A uses 2; B uses 4.
+        head = self.ask(8, agent="head")
+        self.assertEqual(self.ask(4, mem=2 * GIB, expect=36000)["state"], "waiting")
+        self.busy = self.c.busy = 4
+        self.release(a)
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_round2_explicit_holder_expect_without_history(self):
+        with patch.object(ac.time, "time", return_value=100000):
+            self.ask(4, mem=8 * GIB, expect=7200)
+            self.ask(8, mem=12 * GIB, agent="head")
+            self.assertEqual(self.ask(3, mem=4 * GIB, expect=1800)["state"], "granted")
+            self.assertEqual(self.c.state["queue"][0]["projected_start"], 107200)
+
+    def test_round2_holder_fallback_uses_history_median(self):
+        x = {"id": "old", "agent": "other", "label": "other job", "cores": 1, "mem": GIB}
+        for run in (200, 300, 400):
+            self.c._log("ended", x, run=run, code=0)
+        with patch.object(ac.time, "time", return_value=100000):
+            self.assertEqual(self.c._holder_end({**x, "agent": "new", "label": "new job",
+                                               "granted": 100000}), 100300)
+
+    def test_round2_past_estimate_holders_can_end_out_of_order(self):
+        with patch.object(ac.time, "time", return_value=100000):
+            a = self.ask(1, mem=2 * GIB, agent="A", expect=36000)
+            b = self.ask(1, mem=8 * GIB, agent="B", expect=600)
+            self.age(a, 40000, "granted")
+            self.age(b, 1200, "granted")
+            head = self.ask(1, mem=12 * GIB, agent="head")
+            self.assertEqual(self.ask(1, mem=4 * GIB, expect=36000)["state"], "waiting")
+            self.release(b)
+            self.assertEqual(self.poll(head), "granted")
+
+    def test_round2_explicit_holders_end_out_of_order(self):
+        with patch.object(ac.time, "time", return_value=100000):
+            a = self.ask(1, mem=2 * GIB, agent="A", expect=36000)
+            b = self.ask(1, mem=8 * GIB, agent="B", expect=600)
+            for holder in (a, b):
+                self.age(holder, 300, "granted")
+            head = self.ask(1, mem=12 * GIB, agent="head")
+            self.assertEqual(self.ask(1, mem=4 * GIB, expect=36000)["state"], "waiting")
+            self.release(b)
+            self.assertEqual(self.poll(head), "granted")
+
+    def test_round2_ticket_reason_uses_current_capacity_without_history_flood(self):
+        self.ask(6)
+        head = self.ask(4, agent="head")
+        self.ask(1, mem=GIB // 2, agent="tiny")
+        count = len(self.history())
+        for _ in range(3):
+            reply = self.c.handle({"op": "poll", "id": head["id"]})
+            self.assertIn("1.0 of 8 cores free", reply["reason"])
+        self.assertEqual(len(self.history()), count)
+
+    def test_round2_status_reason_uses_current_capacity(self):
+        self.ask(6)
+        self.ask(4, agent="head")
+        self.ask(1, mem=GIB // 2, agent="tiny")
+        status = self.c.handle({"op": "status"})
+        self.assertIn("1.0 of 8 cores free", status["queue"][0]["reason"])
+
+    def test_round2_missing_backfill_reason_does_not_break_tick(self):
+        self.ask(6)
+        self.ask(7, agent="head")
+        self.ask(2, agent="queued", expect=36000)
+        with patch.object(self.c, "_may_pass", return_value=False):
+            self.c.tick()
+        self.assertIn("backfill held", self.c._ticket(self.c.state["queue"][-1]["id"])["reason"])
+
+    def test_round2_granted_head_clears_projection_keys(self):
+        holder = self.ask(6, expect=600)
+        head = self.ask(4, agent="head")
+        self.assertIn("projected_start", self.c.state["queue"][0])
+        self.release(holder)
+        lease = next(x for x in self.c.state["leases"] if x["id"] == head["id"])
+        for key in ("projected_start", "projected_ending", "head_since"):
+            self.assertNotIn(key, lease)
+
     def test_grants_what_fits_and_queues_the_rest(self):
         self.assertEqual(self.ask(6)["state"], "granted")
         waiting = self.ask(4, agent="b")
@@ -120,9 +232,9 @@ class CoordinatorTest(unittest.TestCase):
         medium = self.ask(3, mem=4 * GIB, agent="medium", expect=60)
         self.age(medium, 61, "granted")
         self.release(holder)
-        tiny = self.ask(1, mem=GIB, agent="tiny", expect=1)
-        self.assertEqual(tiny["state"], "waiting")
-        self.assertIn("overrun", tiny["reason"])
+        later = self.ask(2, mem=GIB, agent="later", expect=1)
+        self.assertEqual(later["state"], "waiting")
+        self.assertIn("overrun", later["reason"])
         self.c._admit()
         messages = [m for m in self.c.state["messages"] if "backfill overrun" in m["text"]]
         self.assertEqual(len(messages), 1)
@@ -336,9 +448,9 @@ class CoordinatorTest(unittest.TestCase):
     def test_review_capacity_backfill_cutoff(self):
         self.ask(4, mem=8 * GIB, expect=600)
         head = self.ask(6, mem=10 * GIB, agent="head")
-        self.age(head, ac.EXCLUSIVE_PASS_WINDOW + 1)
+        self.age(head, ac.BACKFILL_PASS_WINDOW + 1, "head_since")
         self.assertEqual(self.ask(2, mem=4 * GIB, expect=7200)["state"], "waiting")
-        self.assertEqual(self.ask(1, expect=1)["state"], "waiting")
+        self.assertEqual(self.ask(1, expect=1)["state"], "granted")
 
     def test_review_projection_is_pinned_before_aging_cutoff(self):
         with patch.object(ac.time, "time", return_value=100000) as clock:
@@ -420,7 +532,8 @@ class CoordinatorTest(unittest.TestCase):
         self.available = 22 * GIB
         self.c.tick()
         self.ask(1, mem=30 * GIB, agent="big")
-        replies = [self.ask(1, mem=8 * GIB, agent=f"m{i}", expect=300)
+        # Longer than the explicit holder estimate: exercise leaves-capacity.
+        replies = [self.ask(1, mem=8 * GIB, agent=f"m{i}", expect=7200)
                    for i in range(4)]
         self.assertEqual([r["state"] for r in replies], ["granted", "waiting", "waiting", "waiting"])
 

@@ -43,8 +43,6 @@ NUDGE_AFTER = 60
 WARMUP = 60
 # Estimate until this agent/label has completed a run.
 DEFAULT_EXPECT = 30 * 60
-# A typical holder ends much sooner than its conservative requested duration.
-DEFAULT_HOLDER_EXPECT = 156
 PROJECTION_GRACE = 60
 BACKFILL_PASS_WINDOW = 10 * 60
 # Preserve the original ordering behind a skipped stuck request.
@@ -551,6 +549,9 @@ class Coordinator:
         changed = False
         while self.state["queue"]:
             head = self.state["queue"][0]
+            if "head_since" not in head:
+                head["head_since"] = time.time()
+                changed = True
             why = self._why(head)
             if why:
                 kind, reason = why
@@ -597,6 +598,8 @@ class Coordinator:
             req.pop("backfill_head", None)
         req.pop("reason", None)
         req.pop("reason_kind", None)
+        for key in ("head_since", "projected_start", "projected_ending"):
+            req.pop(key, None)
         self.state["leases"].append(req)
         self._log("started", req, wait=round(req["granted"] - req["asked"], 1))
 
@@ -650,13 +653,22 @@ class Coordinator:
     def _end(self, lease: dict) -> float:
         return lease["granted"] + lease.get("expect", DEFAULT_EXPECT)
 
-    def _holder_end(self, lease: dict) -> float:
-        runs = sorted(self._runs(lease["agent"], lease["label"]))
-        median = ((runs[(len(runs) - 1) // 2] + runs[len(runs) // 2]) / 2
-                  if runs else DEFAULT_HOLDER_EXPECT)
-        duration = min(lease.get("expect", DEFAULT_EXPECT), median)
-        end = lease["granted"] + duration
-        return end if end > time.time() else max(end, time.time() + PROJECTION_GRACE)
+    def _holder_expect(self, lease: dict) -> float:
+        if lease.get("expect_source") == "explicit":
+            return lease.get("expect", DEFAULT_EXPECT)
+        runs = self._runs(lease["agent"], lease["label"])
+        if not runs:
+            # Label-independent fallback, counting each successful run once.
+            runs = [run for (agent, _), samples in self._samples.items()
+                    if agent is None for run in samples]
+        runs = sorted(runs)
+        return ((runs[(len(runs) - 1) // 2] + runs[len(runs) // 2]) / 2
+                if runs else DEFAULT_EXPECT)
+
+    def _holder_end(self, lease: dict, now: float | None = None) -> float:
+        now = time.time() if now is None else now
+        end = lease["granted"] + self._holder_expect(lease)
+        return end if end > now else now + PROJECTION_GRACE
 
     def _projected_fit(self, head: dict, ending: list[dict], req: dict | None = None) -> bool:
         """Use admission's measured CPU, full memory claims, and reserve any
@@ -668,7 +680,13 @@ class Coordinator:
             return False
         warming = self._warming()
         outside = self._unleased() + sum(g["cores"] for g in self._vms())
-        used = max(outside, self.busy - sum(x["cores"] for x in ending))
+        if req is None:
+            # Measured use finds the head's likely start, but subtracting a
+            # full ending claim can undercount holders that remain.
+            used = max(outside, self.busy - sum(x["cores"] for x in ending))
+        else:
+            used = outside + min(sum(x["cores"] for x in remaining),
+                                 max(0, self.busy - outside))
         used += sum(x["cores"] for x in remaining if x in warming or x.get("exclusive_locks"))
         if used + head["cores"] + (req["cores"] if req else 0) > cores:
             return False
@@ -695,7 +713,7 @@ class Coordinator:
 
     def _projection(self, head: dict) -> tuple[float | None, list[dict]]:
         now = time.time()
-        ends = [(self._holder_end(x), x) for x in self.state["leases"]]
+        ends = [(self._holder_end(x, now), x) for x in self.state["leases"]]
         for start in [now, *sorted({end for end, _ in ends})]:
             ending = [x for end, x in ends if end <= start]
             if self._projected_fit(head, ending):
@@ -719,6 +737,14 @@ class Coordinator:
         now = time.time()
         start, ending = self._projection(head)
         if start is not None:
+            # Expired estimates cannot tell us which holder ends first.
+            # Protect every single departure that would let the head start,
+            # even when the pinned projection grouped several holders.
+            for holder in self.state["leases"]:
+                if (holder["granted"] + self._holder_expect(holder) <= now
+                        and self._projected_fit(head, [holder])
+                        and not self._projected_fit(head, [holder], req)):
+                    return False, f"backfill held: would delay {head['id']} after an overdue holder ends"
             if now + req.get("expect", DEFAULT_EXPECT) <= start:
                 return True, f"backfilled: expected end before {head['id']} projected start"
             if self._projected_fit(head, ending, req):
@@ -747,7 +773,7 @@ class Coordinator:
                 self._grant(req)
                 started = True
             else:
-                reason = why[1] if why else req["backfill_reason"]
+                reason = why[1] if why else req.get("backfill_reason", "backfill held: waiting in line")
                 kind = why[0] if why else reason
                 if req.get("reason_kind") != kind:
                     req["reason"] = reason
@@ -772,8 +798,8 @@ class Coordinator:
           GPU work don't stall every CPU job behind it.
         - Capacity waits keep the tiny pass rule alongside EASY backfill:
           finish before the pinned head start or leave its capacity free.
-          Nothing new passes after BACKFILL_PASS_WINDOW. Disk and lock
-          safeguards remain.
+          Larger jobs stop passing BACKFILL_PASS_WINDOW after head arrival.
+          Disk and lock safeguards remain.
         - A stuck request (see _stuck) doesn't count as being ahead: no lease
           ending would let it start, so the line behind it moves on, in order.
           It takes its turn again as soon as it would fit."""
@@ -814,12 +840,12 @@ class Coordinator:
         if skipped_stuck:
             return (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
                     and not req.get("disk")) or hold("ordering behind a stuck head")
-        if now - head["asked"] >= BACKFILL_PASS_WINDOW:
+        if req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk"):
+            return True
+        if now - head.get("head_since", now) >= BACKFILL_PASS_WINDOW:
             return hold("capacity pass window expired")
         if self._overruns(head):
             return hold(f"overrun delays {head['id']}")
-        if req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk"):
-            return True
         allowed, reason = self._easy(req, head)
         req["backfill_reason"] = reason
         if allowed:
@@ -909,7 +935,7 @@ class Coordinator:
             return {"state": "granted"}
         for position, x in enumerate(self.state["queue"]):
             if x["id"] == lease_id:
-                reason = x.get("reason") or self._blocked(x) or "waiting"
+                reason = self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"
                 if position:
                     reason = f"{position} request(s) ahead in line; {reason}"
                 return {"state": "waiting", "reason": reason}
@@ -1003,7 +1029,9 @@ class Coordinator:
         return {
             "capacity": {"cores": cores, "mem": mem, "reserve": RESERVE_MEM},
             "free": {"cores": cores - used_cores, "mem": mem - used_mem},
-            "leases": self.state["leases"], "queue": self.state["queue"],
+            "leases": self.state["leases"],
+            "queue": [{**x, "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
+                      for x in self.state["queue"]],
             "vms": self._vms(), "load": os.getloadavg(),
             "locks": self.state["locks"],
             "disks": {m: {"free": self.disk_free(m), "reserved": self._reserved(m)}
