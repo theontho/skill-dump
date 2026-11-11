@@ -1,3 +1,6 @@
 #!/bin/sh
 # Reinstall skill-dump after a pull or merge in this checkout.
+# Only the installed checkout reinstalls. A linked worktree (git worktree add runs post-checkout in it) must not
+# repoint the live commands and restart the shared agent-coord service on unreviewed code (2026-11-11).
+[ "$(git rev-parse --git-dir)" = "$(git rev-parse --git-common-dir)" ] || exit 0
 exec "$(git rev-parse --show-toplevel)/bin/skill-dump" install --from-git-hook
