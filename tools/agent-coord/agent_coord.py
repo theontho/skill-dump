@@ -9,6 +9,7 @@ of piling up, and it carries messages between agents.
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -40,7 +41,9 @@ POLL = 3.0
 NUDGE_AFTER = 60
 # A new lease counts at its full size this long, until its use is measured.
 WARMUP = 60
-# Requests this small may start ahead of a blocked head of the line.
+# Estimate until this agent/label has completed a run.
+DEFAULT_EXPECT = 30 * 60
+# Preserve the original ordering behind a skipped stuck request.
 BACKFILL_CORES, BACKFILL_MEM = 1.0, 1024**3
 # Requests this small may start while an --exclusive request waits ahead of
 # them (it waits for every lease to end anyway; a small one only adds its own
@@ -64,7 +67,7 @@ QUOTA
   agent-coord check --cores N --mem SIZE [--exclusive | --exclusive-lock NAME]
       Exit 0 if a lease that size would start now, else 1 with the reason.
   agent-coord run --cores N --mem SIZE --label TEXT [--exclusive | --exclusive-lock NAME]
-                  [--headroom N] [--max-wait D] -- CMD ...
+                  [--headroom N] [--expect D] [--max-wait D] -- CMD ...
       Wait in line until N cores and SIZE of RAM are free, then run CMD capped
       at them (systemd scope: CPUQuota, MemoryMax; exceeding MemoryMax kills
       CMD) at nice 19 and idle IO priority. CMD sees COMPUTE_LEASE_CORES=N:
@@ -87,6 +90,9 @@ QUOTA
   --headroom N  Start only when N cores beyond this lease are unclaimed
                 (leases counted at their full size), and keep them unclaimed
                 while it runs: bounds CPU contention for timing runs.
+  --expect D    Expected run time (e.g. 10m), not a time limit. Defaults to the
+                longest of the last 20 successful runs for this agent/label,
+                or 30m without history. Safe backfill may pass a blocked head.
   --max-wait D  Give up (exit 75) if not started within D (30m, 2h).
   --disk PATH:SIZE  Reserve SIZE of free space on PATH's disk for the job's
                 peak (temp + outputs); repeatable. Waits until it's free
@@ -135,6 +141,13 @@ def parse_duration(text: str) -> float:
     if not match:
         raise argparse.ArgumentTypeError(f"not a duration: {text} (e.g. 30m, 2h)")
     return float(match[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[match[2]]
+
+
+def parse_expect(text: str) -> float:
+    value = parse_duration(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("expect must be a positive finite duration")
+    return value
 
 
 def human(size: float) -> str:
@@ -326,7 +339,7 @@ class Coordinator:
                  "exclusive": exclusive_mode(x)}  # fmt: skip
         if x.get("exclusive_locks"):
             entry["exclusive_locks"] = x["exclusive_locks"]
-        for key in ("headroom", "disk"):
+        for key in ("headroom", "disk", "expect", "expect_source", "backfill_reason", "backfill_head"):
             if x.get(key):
                 entry[key] = x[key]
         entry.update(extra)
@@ -505,8 +518,8 @@ class Coordinator:
         return why[1] if why else None
 
     def _admit(self) -> bool:
-        """Start waiting requests in order; the first that doesn't fit stops
-        the line (no overtaking, so big requests aren't starved)."""
+        """Start requests in order, backfilling around a blocked head without
+        postponing its projected start (exclusive windows keep their rules)."""
         changed = False
         while self.state["queue"]:
             head = self.state["queue"][0]
@@ -548,6 +561,9 @@ class Coordinator:
 
     def _grant(self, req: dict) -> None:
         req["granted"] = time.time()
+        if not req.get("backfill_reason", "").startswith("backfilled:"):
+            req.pop("backfill_reason", None)
+            req.pop("backfill_head", None)
         req.pop("reason", None)
         req.pop("reason_kind", None)
         self.state["leases"].append(req)
@@ -577,14 +593,83 @@ class Coordinator:
         return self.available is None or (
             req["mem"] + head["mem"] <= self.available + freed_mem - RESERVE_MEM)
 
+    def _estimate(self, agent: str, label: str) -> tuple[float, str]:
+        runs = [e["run"] for e in read_history(0, self.history_file)
+                if e.get("event") == "ended" and e.get("agent") == agent
+                and e.get("label") == label and e.get("run", 0) > 0
+                and math.isfinite(e["run"]) and e.get("code", 0) == 0]
+        return (max(runs[-20:]), "history") if runs else (DEFAULT_EXPECT, "default")
+
+    def _end(self, lease: dict) -> float:
+        return lease["granted"] + lease.get("expect", DEFAULT_EXPECT)
+
+    def _projected_fit(self, head: dict, ending: list[dict], req: dict | None = None) -> bool:
+        """Remaining leases count in full; outside load stays. Only measured
+        memory is returned, never more than the ending lease reserved."""
+        jobs = [x for x in self.state["leases"] if x not in ending]
+        jobs += [head, *([req] if req else [])]
+        cores, mem = self.capacity()
+        if sum(x["mem"] for x in jobs) + sum(g["mem"] for g in self._vms()) > mem:
+            return False
+        claimed = sum(x["cores"] for x in jobs) + self._unleased() + sum(
+            g["cores"] for g in self._vms())
+        if claimed + max(x.get("headroom", 0) for x in jobs) > cores:
+            return False
+        if self.available is not None:
+            freed = sum(min(x["mem"], self.footprint(x["pid"])) for x in ending)
+            if head["mem"] + (req["mem"] if req else 0) > self.available + freed - RESERVE_MEM:
+                return False
+        return True
+
+    def _overruns(self, head: dict) -> list[dict]:
+        overdue = [x for x in self.state["leases"]
+                   if x.get("backfill_head") == head.get("id") and self._end(x) <= time.time()]
+        return overdue if overdue and self._projected_fit(head, overdue) else []
+
+    def _easy(self, req: dict, head: dict) -> tuple[bool, str]:
+        if self._overruns(head):
+            return False, f"backfill held: overrun delays {head['id']}"
+        if req.get("disk"):
+            return False, "backfill held: disk reservations do not overtake capacity waits"
+        now = time.time()
+        leases = self.state["leases"]
+        times = sorted({self._end(x) for x in leases if self._end(x) > now})
+        for start in [now, *times]:
+            ending = [x for x in leases if now < self._end(x) <= start]
+            if self._projected_fit(head, ending):
+                if now + req.get("expect", DEFAULT_EXPECT) <= start:
+                    return True, f"backfilled: expected end before {head['id']} projected start"
+                if self._projected_fit(head, ending, req):
+                    return True, f"backfilled: leaves capacity for {head['id']} projected start"
+                return False, f"backfill held: would delay {head['id']} projected start"
+        return False, f"backfill held: no projected start for {head['id']}"
+
     def _backfill(self, _head: dict) -> bool:
         """Start the requests behind a blocked head that fit and may pass."""
         started = False
+        for holder in self._overruns(_head):
+            if holder.get("overrun_told") != _head["id"]:
+                holder["overrun_told"] = _head["id"]
+                reason = (f"backfill overrun: lease {holder['id']} delays {_head['id']} "
+                          f"({_head['label']}); no new backfill until capacity frees")
+                holder["overrun_reason"] = reason
+                self._post("agent-coord", holder["agent"], reason)
+                self._log("overrun", holder, reason=reason)
+                started = True
         for req in list(self.state["queue"][1:]):
-            if not self._blocked(req) and self._may_pass(req):
+            req.pop("backfill_reason", None)
+            req.pop("backfill_head", None)
+            blocked = self._blocked(req)
+            if not blocked and self._may_pass(req):
                 self.state["queue"].remove(req)
                 self._grant(req)
                 started = True
+            else:
+                reason = blocked or req.get("backfill_reason") or "backfill held: queue safeguards"
+                if req.get("reason") != reason:
+                    req["reason"] = reason
+                    self._log("waiting", req, kind="backfill", reason=reason)
+                    started = True
         return started
 
     def _may_pass(self, req: dict) -> bool:
@@ -601,10 +686,8 @@ class Coordinator:
           holds the GPU), any request that doesn't need that lock may start if
           it leaves room for the head (cores, memory, headroom), so hours of
           GPU work don't stall every CPU job behind it.
-        - Otherwise (the head waits for capacity), only tiny requests
-          (BACKFILL_CORES, BACKFILL_MEM, no disk) pass, and only a head with no
-          locks: a big job waiting for memory shouldn't hold up a one-core
-          chore, while anything bigger would take the capacity it waits for.
+        - Capacity waits use EASY backfill: finish before the projected head
+          start or leave its capacity free. Disk and lock safeguards remain.
         - A stuck request (see _stuck) doesn't count as being ahead: no lease
           ending would let it start, so the line behind it moves on, in order.
           It takes its turn again as soon as it would fit."""
@@ -622,6 +705,7 @@ class Coordinator:
                 and not set(req.get("locks", ())) & set(x.get("locks", ()))
             ):  # fmt: skip
                 return False
+        skipped_stuck = any(self._stuck(x) for x in ahead)
         ahead = [x for x in ahead if not self._stuck(x)]
         if not ahead:
             return True
@@ -634,7 +718,13 @@ class Coordinator:
                 req, head, waiting_for)  # fmt: skip
         if head.get("locks"):
             return False  # its lock is free; it waits for capacity: no overtaking
-        return req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk")
+        if skipped_stuck:
+            return req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk")
+        allowed, reason = self._easy(req, head)
+        req["backfill_reason"] = reason
+        if allowed:
+            req["backfill_head"] = head.get("id")
+        return allowed
 
     def tick(self) -> None:
         sample = self.measure()
@@ -677,13 +767,18 @@ class Coordinator:
             return {"error": "--exclusive already excludes everything; drop --exclusive-lock"}
         if headroom < 0:
             return {"error": "headroom must not be negative"}
+        expect = req.get("expect")
+        if expect is not None and (not isinstance(expect, (int, float)) or not math.isfinite(expect) or expect <= 0):
+            return {"error": "expect must be a positive finite duration"}
+        estimate, source = ((expect, "explicit") if expect is not None
+                            else self._estimate(agent, str(req["label"])))
         locks = list(dict.fromkeys([*(str(n) for n in req.get("locks") or []), *scoped]))
         lease = {
             "id": f"L{self.state['next']}", "agent": agent, "pid": int(req["pid"]),
             "cores": float(req["cores"]), "mem": int(req["mem"]),
             "label": str(req["label"]), "exclusive": bool(req.get("exclusive")),
             "asked": time.time(), "cwd": req.get("cwd", ""),
-            "locks": locks,
+            "locks": locks, "expect": estimate, "expect_source": source,
             "disk": {mount_of(p): int(n) for p, n in (req.get("disk") or {}).items()},
         }  # fmt: skip
         # Only set when used, so the state stays readable by older versions.
@@ -740,10 +835,10 @@ class Coordinator:
                  "exclusive": bool(req.get("exclusive")),
                  "locks": list(dict.fromkeys([*req.get("locks", []), *scoped])),
                  "exclusive_locks": scoped, "headroom": float(req.get("headroom") or 0),
-                 "disk": req.get("disk", {})}  # fmt: skip
+                 "disk": req.get("disk", {}), "expect": req.get("expect") or DEFAULT_EXPECT}  # fmt: skip
         reason = self._blocked(probe)
         if not reason and self.state["queue"] and not self._may_pass(probe):
-            reason = f"{len(self.state['queue'])} request(s) already waiting"
+            reason = probe.get("backfill_reason") or f"{len(self.state['queue'])} request(s) already waiting"
         return {"ok": reason is None, "reason": reason}
 
     def op_lock(self, req: dict, agent: str) -> dict:
@@ -1013,7 +1108,7 @@ def _lease_request(args: argparse.Namespace, pid: int) -> dict:
             "cores": args.cores, "mem": args.mem, "label": args.label,
             "exclusive": args.exclusive, "locks": args.lock or [],
             "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
-            "disk": dict(args.disk or [])}  # fmt: skip
+            "expect": args.expect, "disk": dict(args.disk or [])}  # fmt: skip
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1079,7 +1174,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     reply = call({"op": "check", "cores": args.cores, "mem": args.mem,
                   "exclusive": args.exclusive, "locks": args.lock or [],
                   "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
-                  "disk": {mount_of(p): n for p, n in args.disk or []}})  # fmt: skip
+                  "expect": args.expect, "disk": {mount_of(p): n for p, n in args.disk or []}})  # fmt: skip
     print("ok" if reply["ok"] else f"no: {reply['reason']}")
     return 0 if reply["ok"] else 1
 
@@ -1109,7 +1204,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             flag += f" locks {','.join(x['locks'])}"
         if x.get("disk"):
             flag += " disk " + ",".join(f"{m}:{human(n)}" for m, n in x["disk"].items())
-        why = f" -- {x['reason']}" if state == "waiting" and x.get("reason") else ""
+        detail = x.get("reason") if state == "waiting" else x.get("overrun_reason") or x.get("backfill_reason")
+        why = f" -- {detail}" if detail else ""
         print(f"  {x['id']:<6} {state:<7} {x['cores']:>4g} cores {human(x['mem']):>6} "
               f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){why}")
     if "busy_cores" in s:
@@ -1175,7 +1271,7 @@ def cmd_history(args: argparse.Namespace) -> int:
                 times.append(f"{'wait' if key == 'waited' else key} {_minutes(e[key])}")
         if "code" in e:
             times.append(f"exit {e['code']}")
-        detail = e.get("reason") or e.get("why") or ""
+        detail = e.get("reason") or e.get("why") or e.get("backfill_reason") or ""
         print(f"{stamp} {e['event']:<9} {e['id']:<6} {e['cores']:>4g}c {human(e['mem']):>6} "
               f"{e['agent']}: {e['label']}{flag}"
               + (f" [{', '.join(times)}]" if times else "")
@@ -1247,6 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--headroom", type=float, default=0.0)
         sub.add_argument("--disk", type=parse_disk, action="append")
         sub.add_argument("--lock", action="append")
+        sub.add_argument("--expect", type=parse_expect, help="expected run time, e.g. 10m (default: learned per agent/label, else 30m)")
         if name == "check":
             continue
         sub.add_argument("--label", required=True)

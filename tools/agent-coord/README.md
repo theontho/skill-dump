@@ -85,8 +85,24 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   `--allow-archive` overrides, e.g. to archive a finished result.
 - First come, first served: nothing overtakes the request at the head of the
   line, so big jobs are not starved, with these exceptions for requests that fit now:
-  - **Tiny requests** (1 core or less, 1 GB or less, no disk reservation) may
-    start past a head waiting for capacity, unless that head names a lock.
+  - **EASY backfill past a capacity wait**: a later job that fits now may start
+    if its expected end precedes the head's projected start, or if it leaves
+    enough cores, memory and headroom for the head at that time. Remaining
+    leases count at their full size in the projection; outside load stays,
+    and ending leases return only their measured memory (at most their
+    reservation). Already overdue end times are not assumed to free
+    capacity. Jobs reserving disk do not pass capacity waits, nor do jobs pass
+    a capacity-waiting head with named locks.
+    Use `--expect 10m` on `run` or `hold` to supply an estimate, not a time
+    limit. Without it, the service uses the longest of the last 20 successful
+    completed runs for the same agent and label in retained history, or 30m
+    with no samples. `check --expect 10m` probes with that estimate (default
+    30m, since check has no label). Estimates start when granted; for `hold`,
+    supply the expected remaining time.
+    If an overdue backfill job is delaying its head, no new capacity backfill
+    starts; the overrunning agent is told once through its inbox. Jobs are
+    never killed for exceeding estimates. `status` and `history` show backfill
+    decisions, hold reasons and overrun notices.
   - **Past a lock-waiting head** (a GPU job while another holds the GPU), any
     request that doesn't need that lock may start if it leaves the head room
     (cores, memory, headroom) for when the lock frees.
@@ -104,7 +120,9 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
     really holds, at most its size): the memory is held outside the line, so
     holding others back gains it nothing. Its owner is told once, and it takes
     its turn again as soon as it would fit. Plain `--exclusive` requests are
-    never stuck.
+    never stuck. Once a stuck request is skipped, the existing ordering rules
+    behind it remain: only tiny jobs (at most 1 core/1 GB, no disk) may pass
+    the next capacity-blocked request without a named lock.
 
   A request that has waited a minute tells the holders (once) through their inbox.
 - `--exclusive` (whole machine) waits until no other lease is held, then keeps
@@ -127,10 +145,12 @@ Every lease event is appended as one JSON line to
 `~/.local/state/agent-coord/history.jsonl`, rotated at 8 MB (four older files,
 `history.jsonl.1` .. `.4`, are kept). Events: `requested`, `waiting` (the head
 of the line's reason, logged when its kind changes: `exclusive`, `lock:NAME`,
-`cores`, `mem`, `available`, `disk`, `headroom`), `started` (with `wait`
-seconds), `ended` (with `wait`, `run` seconds and the command's exit `code`
-when `run` reports it) and `cancelled` (released or died while waiting). Each
-carries the lease id, agent, label, cores, mem, locks and exclusive mode
+`cores`, `mem`, `available`, `disk`, `headroom`; later requests also log changed
+backfill hold reasons), `started` (with `wait` seconds and any backfill reason),
+`overrun` (with the delaying lease's notice), `ended` (with `wait`, `run` seconds
+and the command's exit `code` when `run` reports it) and `cancelled` (released or died while waiting). Each
+carries the lease id, agent, label, cores, mem, locks, expected seconds and
+estimate source, and exclusive mode
 (`machine`, `lock` or null); never commands, paths or environment.
 `agent-coord history [--since 6h] [--json]` prints it (default: last 24 h).
 

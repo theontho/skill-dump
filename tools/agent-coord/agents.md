@@ -5,6 +5,7 @@ Several agents share this computer. Coordinate heavy work through the `agent-coo
 - **Before anything heavy** (more than 2 cores or 2 GB for more than a few minutes: alignment, variant calling, full test suites, big builds), run it through `agent-coord run --cores N --mem SIZE --label "what" -- COMMAND`.
   - It waits its turn, then caps the command at N cores and SIZE of RAM.
   - Give the command's tools N threads.
+  - Add `--expect 10m` when you know the run time; otherwise it learns from completed runs for your agent/label (30m initially). Jobs may pass a capacity-blocked head only if they finish before its projected start or leave its capacity free. Overruns that delay the head pause new backfill and notify their agent; estimates do not kill jobs.
 - `agent-coord check --cores N --mem SIZE` says whether a job that size may start now. `agent-coord status` shows who holds what.
 - **Timed or performance runs:** for a GPU timing run use `--exclusive-lock gpu` (exclusive on the GPU, its cores guaranteed, CPU-only work keeps running beside it), plus `--headroom N` to keep N more cores unclaimed and bound timing noise. Use whole-machine `--exclusive` only when nothing else may run; small jobs (≤2 cores, ≤6G) still start during its first 30 min of waiting. A job started without a lease can be registered with `agent-coord hold … --pid PID`.
 - `agent-coord history [--since 6h] [--json]` shows lease events with wait and run times and why requests waited.

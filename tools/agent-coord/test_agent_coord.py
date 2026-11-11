@@ -78,7 +78,7 @@ class CoordinatorTest(unittest.TestCase):
 
     def test_the_line_is_first_come_first_served(self):
         self.ask(5)
-        big = self.ask(4, agent="b")
+        big = self.ask(7, agent="b")
         medium = self.ask(2, agent="c")  # fits now, but must not overtake b
         self.assertEqual(medium["state"], "waiting")
         self.assertIn("1 request(s) ahead", medium["reason"])
@@ -88,6 +88,101 @@ class CoordinatorTest(unittest.TestCase):
         self.ask(6)
         self.assertEqual(self.ask(4, agent="b")["state"], "waiting")
         self.assertEqual(self.ask(1, mem=GIB // 2, agent="c")["state"], "granted")
+
+    def test_medium_backfill_finishes_before_big_head(self):
+        self.ask(4, mem=8 * GIB, expect=600)
+        head = self.ask(8, mem=12 * GIB, agent="big")
+        medium = self.ask(3, mem=4 * GIB, agent="medium", expect=60)
+        self.assertEqual(medium["state"], "granted")
+        lease = self.c.state["leases"][-1]
+        self.assertEqual(lease["backfill_head"], head["id"])
+        self.assertIn("expected end", lease["backfill_reason"])
+        self.assertIn("backfilled", self.history()[-1]["backfill_reason"])
+
+    def test_medium_backfill_leaves_head_capacity(self):
+        self.ask(4, mem=8 * GIB, expect=600)
+        self.ask(6, mem=10 * GIB, agent="big")
+        medium = self.ask(2, mem=4 * GIB, agent="medium", expect=1200)
+        self.assertEqual(medium["state"], "granted")
+        self.assertIn("leaves capacity", self.c.state["leases"][-1]["backfill_reason"])
+
+    def test_backfill_that_would_delay_head_is_held_and_logged(self):
+        self.ask(4, mem=8 * GIB, expect=60)
+        self.ask(8, mem=12 * GIB, agent="big")
+        medium = self.ask(3, mem=4 * GIB, agent="medium", expect=600)
+        self.assertEqual(medium["state"], "waiting")
+        self.assertIn("would delay", medium["reason"])
+        self.assertIn("would delay", self.history()[-1]["reason"])
+
+    def test_overrun_freezes_backfill_and_tells_agent_once(self):
+        holder = self.ask(4, mem=8 * GIB, expect=600)
+        head = self.ask(8, mem=14 * GIB, agent="big")
+        medium = self.ask(3, mem=4 * GIB, agent="medium", expect=60)
+        self.age(medium, 61, "granted")
+        self.release(holder)
+        tiny = self.ask(1, mem=GIB, agent="tiny", expect=1)
+        self.assertEqual(tiny["state"], "waiting")
+        self.assertIn("overrun", tiny["reason"])
+        self.c._admit()
+        messages = [m for m in self.c.state["messages"] if "backfill overrun" in m["text"]]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["to"], "medium")
+        self.assertEqual(len([e for e in self.history() if e["event"] == "overrun"]), 1)
+        self.release(medium)
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_multiple_backfills_preserve_head_reservation(self):
+        self.ask(4, mem=8 * GIB, expect=60)
+        self.ask(6, mem=12 * GIB, agent="big")
+        first = self.ask(2, mem=3 * GIB, agent="first", expect=600)
+        self.assertEqual(first["state"], "granted")
+        # Each fits beside the holder, but together they would delay the head.
+        self.assertEqual(self.ask(2, mem=3 * GIB, agent="second", expect=600)["state"], "waiting")
+
+    def test_overdue_backfill_that_leaves_room_does_not_freeze_line(self):
+        holder = self.ask(4, mem=8 * GIB, expect=600)
+        self.ask(6, mem=12 * GIB, agent="big")
+        medium = self.ask(1, mem=GIB, agent="medium", expect=60)
+        self.age(medium, 61, "granted")
+        self.assertEqual(self.ask(1, mem=GIB, agent="tiny", expect=1)["state"], "granted")
+        self.assertFalse(any(e["event"] == "overrun" for e in self.history()))
+        self.release(holder)
+
+    def test_estimate_uses_recent_successful_samples_only(self):
+        lease = {"id": "L0", "agent": "a", "label": "a job", "cores": 1, "mem": GIB}
+        for run in [9999, *range(1, 21)]:
+            self.c._log("ended", lease, run=run, code=0)
+        self.c._log("ended", lease, run=99999, code=1)
+        self.assertEqual(self.c._estimate("a", "a job"), (20, "history"))
+
+    def test_backfill_preserves_headroom_and_disk_rules(self):
+        self.ask(4, mem=8 * GIB, expect=60)
+        self.ask(6, mem=10 * GIB, agent="big", headroom=2)
+        self.assertEqual(self.ask(2, agent="medium", expect=600)["state"], "waiting")
+        self.assertEqual(self.ask(1, agent="disk", expect=1, disk={"/": GIB})["state"], "waiting")
+
+    def test_expect_defaults_learn_from_same_agent_and_label(self):
+        self.assertEqual(self.c._estimate("a", "a job"), (ac.DEFAULT_EXPECT, "default"))
+        first = self.ask(1, expect=90)
+        self.age(first, 75, "granted")
+        self.release(first, code=0)
+        second = self.ask(1)
+        lease = self.c.state["leases"][-1]
+        self.assertEqual(lease["expect_source"], "history")
+        self.assertGreaterEqual(lease["expect"], 75)
+        self.assertLess(lease["expect"], 76)
+        self.assertEqual(self.c._estimate("other", "a job")[1], "default")
+        self.assertEqual(self.c._estimate("a", "other job")[1], "default")
+        self.release(second)
+        self.assertIn("error", self.ask(1, expect=0))
+        self.assertIn("error", self.ask(1, expect=float("inf")))
+
+    def test_expect_duration_parser(self):
+        self.assertEqual(ac.parse_expect("10m"), 600)
+        self.assertEqual(ac.parse_expect("1.5h"), 5400)
+        for value in ("0", "-1m", "nan", "forever"):
+            with self.assertRaises(ac.argparse.ArgumentTypeError):
+                ac.parse_expect(value)
 
     def test_cpu_jobs_pass_a_head_waiting_for_a_lock(self):
         self.ask(2, mem=4 * GIB, agent="gpu1", locks=["gpu"])  # holds the GPU
@@ -608,6 +703,17 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual([e["event"] for e in events], ["requested", "started", "ended"])
         self.assertEqual(events[-1]["code"], 3)
         self.assertIn("ended", self.cli("history", "--since", "1h").stdout)
+
+    def test_expect_cli_round_trip(self):
+        result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "short",
+                          "--expect", "10m", "--", "true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in self.cli("history", "--json").stdout.splitlines()]
+        self.assertTrue(all(e["expect"] == 600 for e in events))
+        self.assertTrue(all(e["expect_source"] == "explicit" for e in events))
+        result = self.cli("check", "--cores", "1", "--mem", "64M", "--expect", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("positive", result.stderr)
 
     def test_run_with_exclusive_lock_and_headroom(self):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "timed",
