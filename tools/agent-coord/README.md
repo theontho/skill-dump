@@ -88,16 +88,26 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   - **EASY backfill past a capacity wait**: a later job that fits now may start
     if its expected end precedes the head's projected start, or if it leaves
     enough cores, memory and headroom for the head at that time. Remaining
-    leases count at their full size in the projection; outside load stays,
-    and ending leases return only their measured memory (at most their
-    reservation). Already overdue end times are not assumed to free
-    capacity. Jobs reserving disk do not pass capacity waits, nor do jobs pass
-    a capacity-waiting head with named locks.
+    memory claims count in full; CPU follows measured admission, with warmup
+    and scoped exclusive guarantees. Outside load stays. Ending leases return
+    only measured memory (at most their reservation), and non-ending leases'
+    unmeasured memory growth is reserved against available memory.
+    The head's first projected start is pinned and may only move earlier.
+    Holder ends use the median successful duration (156 seconds initially),
+    capped by their requested duration; overdue holders get a 60-second grace.
+    Tiny jobs (at most 1 core/1 GiB, no disk) retain their pass rule even
+    without a projection. After a capacity head waits 10 minutes, no new
+    capacity backfill passes it. Jobs reserving disk do not pass capacity waits,
+    nor do jobs pass a capacity-waiting head with named locks. Queued lock
+    users keep their order, except for the existing stuck-head exception.
     Use `--expect 10m` on `run` or `hold` to supply an estimate, not a time
-    limit. Without it, the service uses the longest of the last 20 successful
-    completed runs for the same agent and label in retained history, or 30m
-    with no samples. `check --expect 10m` probes with that estimate (default
-    30m, since check has no label). Estimates start when granted; for `hold`,
+    limit. Without it, the service uses the 90th percentile of the last 20
+    explicitly successful, non-held runs for the same agent and label, falls
+    back to the same label across agents, or uses 30m without samples.
+    Estimates are cached and updated as runs finish. Holder projections use
+    the median; candidate lengths use the conservative estimate.
+    `check --label TEXT` uses the same learned estimate as `run`;
+    `check --expect 10m` overrides it. Estimates start when granted; for `hold`,
     supply the expected remaining time.
     If an overdue backfill job is delaying its head, no new capacity backfill
     starts; the overrunning agent is told once through its inbox. Jobs are

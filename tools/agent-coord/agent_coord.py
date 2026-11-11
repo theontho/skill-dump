@@ -43,6 +43,10 @@ NUDGE_AFTER = 60
 WARMUP = 60
 # Estimate until this agent/label has completed a run.
 DEFAULT_EXPECT = 30 * 60
+# A typical holder ends much sooner than its conservative requested duration.
+DEFAULT_HOLDER_EXPECT = 156
+PROJECTION_GRACE = 60
+BACKFILL_PASS_WINDOW = 10 * 60
 # Preserve the original ordering behind a skipped stuck request.
 BACKFILL_CORES, BACKFILL_MEM = 1.0, 1024**3
 # Requests this small may start while an --exclusive request waits ahead of
@@ -91,7 +95,7 @@ QUOTA
                 (leases counted at their full size), and keep them unclaimed
                 while it runs: bounds CPU contention for timing runs.
   --expect D    Expected run time (e.g. 10m), not a time limit. Defaults to the
-                longest of the last 20 successful runs for this agent/label,
+                90th percentile of the last 20 successful runs for this agent/label,
                 or 30m without history. Safe backfill may pass a blocked head.
   --max-wait D  Give up (exit 75) if not started within D (30m, 2h).
   --disk PATH:SIZE  Reserve SIZE of free space on PATH's disk for the job's
@@ -301,6 +305,9 @@ class Coordinator:
 
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
                  history_file: Path | None = None, footprint=tree_footprint):
+        self._saved = None
+        self._samples = None
+        self._footprints = None
         self.disk_free = disk_free
         self.footprint = footprint
         self.state_file = state_file
@@ -325,10 +332,14 @@ class Coordinator:
     # -- persistence and housekeeping
 
     def _save(self) -> None:
+        serialized = json.dumps(self.state)
+        if serialized == self._saved:
+            return
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state))
+        tmp.write_text(serialized)
         tmp.replace(self.state_file)
+        self._saved = serialized
 
     def _log(self, event: str, x: dict, **extra) -> None:
         """Append one lease event to the history (labels only, no commands or
@@ -343,6 +354,8 @@ class Coordinator:
             if x.get(key):
                 entry[key] = x[key]
         entry.update(extra)
+        if self._samples is not None:
+            self._remember(entry)
         path = self.history_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -361,7 +374,7 @@ class Coordinator:
         if held:
             granted = x.get("granted", now)
             self._log("ended", x, wait=round(granted - x["asked"], 1),
-                      run=round(now - granted, 1), **extra)  # fmt: skip
+                      run=round(now - granted, 1), held=bool(x.get("running")), **extra)  # fmt: skip
         else:
             self._log("cancelled", x, wait=round(now - x["asked"], 1), **extra)
 
@@ -406,7 +419,7 @@ class Coordinator:
     def _post(self, sender: str, to: str, text: str) -> None:
         self.state["messages"].append(
             {"id": self.state["next"], "time": time.time(), "from": sender,
-             "to": to, "text": text}  # fmt: skip
+             "to": to, "text": text}
         )
         self.state["next"] += 1
         del self.state["messages"][:-MAX_MESSAGES]
@@ -509,7 +522,7 @@ class Coordinator:
             return False
         if req["mem"] <= self.available - RESERVE_MEM:
             return False  # fits now: anything holding it up is not memory
-        freed = sum(min(x["mem"], self.footprint(x["pid"])) for x in self.state["leases"])
+        freed = sum(min(x["mem"], self._footprint(x["pid"])) for x in self.state["leases"])
         return req["mem"] > self.available + freed - RESERVE_MEM
 
     def _blocked(self, req: dict) -> str | None:
@@ -518,6 +531,21 @@ class Coordinator:
         return why[1] if why else None
 
     def _admit(self) -> bool:
+        # Cache only within this pass; new measurements are visible next time.
+        self._footprints = {}
+        try:
+            return self._admit_pass()
+        finally:
+            self._footprints = None
+
+    def _footprint(self, pid: int) -> int:
+        if self._footprints is None:
+            return self.footprint(pid)
+        if pid not in self._footprints:
+            self._footprints[pid] = self.footprint(pid)
+        return self._footprints[pid]
+
+    def _admit_pass(self) -> bool:
         """Start requests in order, backfilling around a blocked head without
         postponing its projected start (exclusive windows keep their rules)."""
         changed = False
@@ -526,8 +554,8 @@ class Coordinator:
             why = self._why(head)
             if why:
                 kind, reason = why
-                head["reason"] = reason
                 if head.get("reason_kind") != kind:
+                    head["reason"] = reason
                     head["reason_kind"] = kind
                     self._log("waiting", head, kind=kind, reason=reason,
                               waited=round(time.time() - head["asked"], 1))  # fmt: skip
@@ -553,6 +581,9 @@ class Coordinator:
                         "pass it. Ask for less, or free the memory held outside leases.",
                     )  # fmt: skip
                     changed = True
+                before = head.get("projected_start")
+                self._projection(head)
+                changed |= before != head.get("projected_start")
                 return self._backfill(head) or changed
             self.state["queue"].pop(0)
             self._grant(head)
@@ -593,33 +624,87 @@ class Coordinator:
         return self.available is None or (
             req["mem"] + head["mem"] <= self.available + freed_mem - RESERVE_MEM)
 
+    def _remember(self, entry: dict) -> None:
+        run = entry.get("run")
+        if (entry.get("event") != "ended" or type(entry.get("code")) is not int
+                or entry["code"] != 0 or entry.get("held") or entry.get("why")
+                or type(run) not in (int, float) or not math.isfinite(run) or run <= 0):
+            return
+        for key in ((entry.get("agent"), entry.get("label")), (None, entry.get("label"))):
+            samples = self._samples.setdefault(key, [])
+            samples.append(run)
+            del samples[:-20]
+
+    def _runs(self, agent: str, label: str) -> list[float]:
+        if self._samples is None:
+            self._samples = {}
+            for entry in read_history(0, self.history_file):
+                self._remember(entry)
+        return self._samples.get((agent, label)) or self._samples.get((None, label), [])
+
     def _estimate(self, agent: str, label: str) -> tuple[float, str]:
-        runs = [e["run"] for e in read_history(0, self.history_file)
-                if e.get("event") == "ended" and e.get("agent") == agent
-                and e.get("label") == label and e.get("run", 0) > 0
-                and math.isfinite(e["run"]) and e.get("code", 0) == 0]
-        return (max(runs[-20:]), "history") if runs else (DEFAULT_EXPECT, "default")
+        runs = sorted(self._runs(agent, label))
+        return ((runs[math.ceil(.9 * len(runs)) - 1], "history") if runs
+                else (DEFAULT_EXPECT, "default"))
 
     def _end(self, lease: dict) -> float:
         return lease["granted"] + lease.get("expect", DEFAULT_EXPECT)
 
+    def _holder_end(self, lease: dict) -> float:
+        runs = sorted(self._runs(lease["agent"], lease["label"]))
+        median = ((runs[(len(runs) - 1) // 2] + runs[len(runs) // 2]) / 2
+                  if runs else DEFAULT_HOLDER_EXPECT)
+        duration = min(lease.get("expect", DEFAULT_EXPECT), median)
+        end = lease["granted"] + duration
+        return end if end > time.time() else max(end, time.time() + PROJECTION_GRACE)
+
     def _projected_fit(self, head: dict, ending: list[dict], req: dict | None = None) -> bool:
-        """Remaining leases count in full; outside load stays. Only measured
-        memory is returned, never more than the ending lease reserved."""
-        jobs = [x for x in self.state["leases"] if x not in ending]
-        jobs += [head, *([req] if req else [])]
+        """Use admission's measured CPU, full memory claims, and reserve any
+        remaining memory growth against the measured available sample."""
+        remaining = [x for x in self.state["leases"] if x not in ending]
+        jobs = [*remaining, head, *([req] if req else [])]
         cores, mem = self.capacity()
         if sum(x["mem"] for x in jobs) + sum(g["mem"] for g in self._vms()) > mem:
             return False
-        claimed = sum(x["cores"] for x in jobs) + self._unleased() + sum(
-            g["cores"] for g in self._vms())
-        if claimed + max(x.get("headroom", 0) for x in jobs) > cores:
+        warming = self._warming()
+        outside = self._unleased() + sum(g["cores"] for g in self._vms())
+        used = max(outside, self.busy - sum(x["cores"] for x in ending))
+        used += sum(x["cores"] for x in remaining if x in warming or x.get("exclusive_locks"))
+        if used + head["cores"] + (req["cores"] if req else 0) > cores:
+            return False
+        headroom = max(x.get("headroom", 0) for x in jobs)
+        if headroom and (sum(x["cores"] for x in jobs) + self._unleased()
+                         + sum(g["cores"] for g in self._vms()) + headroom > cores):
             return False
         if self.available is not None:
-            freed = sum(min(x["mem"], self.footprint(x["pid"])) for x in ending)
-            if head["mem"] + (req["mem"] if req else 0) > self.available + freed - RESERVE_MEM:
+            # Multiple leases may name the same process. Its measured memory
+            # can be returned/reserved only once, including within this pass.
+            measured = {}
+            footprints = {}
+            for x in self.state["leases"]:
+                pid = x["pid"]
+                budget = measured.setdefault(pid, self._footprint(pid))
+                footprints[x["id"]] = min(x["mem"], budget)
+                measured[pid] -= footprints[x["id"]]
+            freed = sum(footprints[x["id"]] for x in ending)
+            growth = sum(max(0, x["mem"] - footprints[x["id"]]) for x in remaining)
+            need = head["mem"] + (req["mem"] if req else 0)
+            if need > self.available + freed - growth - RESERVE_MEM:
                 return False
         return True
+
+    def _projection(self, head: dict) -> tuple[float | None, list[dict]]:
+        now = time.time()
+        ends = [(self._holder_end(x), x) for x in self.state["leases"]]
+        for start in [now, *sorted({end for end, _ in ends})]:
+            ending = [x for end, x in ends if end <= start]
+            if self._projected_fit(head, ending):
+                if start < head.get("projected_start", math.inf):
+                    head["projected_start"] = start
+                    head["projected_ending"] = [x["id"] for x in ending]
+                break
+        ids = head.get("projected_ending", [])
+        return head.get("projected_start"), [x for x in self.state["leases"] if x["id"] in ids]
 
     def _overruns(self, head: dict) -> list[dict]:
         overdue = [x for x in self.state["leases"]
@@ -632,16 +717,13 @@ class Coordinator:
         if req.get("disk"):
             return False, "backfill held: disk reservations do not overtake capacity waits"
         now = time.time()
-        leases = self.state["leases"]
-        times = sorted({self._end(x) for x in leases if self._end(x) > now})
-        for start in [now, *times]:
-            ending = [x for x in leases if now < self._end(x) <= start]
-            if self._projected_fit(head, ending):
-                if now + req.get("expect", DEFAULT_EXPECT) <= start:
-                    return True, f"backfilled: expected end before {head['id']} projected start"
-                if self._projected_fit(head, ending, req):
-                    return True, f"backfilled: leaves capacity for {head['id']} projected start"
-                return False, f"backfill held: would delay {head['id']} projected start"
+        start, ending = self._projection(head)
+        if start is not None:
+            if now + req.get("expect", DEFAULT_EXPECT) <= start:
+                return True, f"backfilled: expected end before {head['id']} projected start"
+            if self._projected_fit(head, ending, req):
+                return True, f"backfilled: leaves capacity for {head['id']} projected start"
+            return False, f"backfill held: would delay {head['id']} projected start"
         return False, f"backfill held: no projected start for {head['id']}"
 
     def _backfill(self, _head: dict) -> bool:
@@ -659,16 +741,18 @@ class Coordinator:
         for req in list(self.state["queue"][1:]):
             req.pop("backfill_reason", None)
             req.pop("backfill_head", None)
-            blocked = self._blocked(req)
-            if not blocked and self._may_pass(req):
+            why = self._why(req)
+            if not why and self._may_pass(req):
                 self.state["queue"].remove(req)
                 self._grant(req)
                 started = True
             else:
-                reason = blocked or req.get("backfill_reason") or "backfill held: queue safeguards"
-                if req.get("reason") != reason:
+                reason = why[1] if why else req["backfill_reason"]
+                kind = why[0] if why else reason
+                if req.get("reason_kind") != kind:
                     req["reason"] = reason
-                    self._log("waiting", req, kind="backfill", reason=reason)
+                    req["reason_kind"] = kind
+                    self._log("waiting", req, kind=kind, reason=reason)
                     started = True
         return started
 
@@ -686,8 +770,10 @@ class Coordinator:
           holds the GPU), any request that doesn't need that lock may start if
           it leaves room for the head (cores, memory, headroom), so hours of
           GPU work don't stall every CPU job behind it.
-        - Capacity waits use EASY backfill: finish before the projected head
-          start or leave its capacity free. Disk and lock safeguards remain.
+        - Capacity waits keep the tiny pass rule alongside EASY backfill:
+          finish before the pinned head start or leave its capacity free.
+          Nothing new passes after BACKFILL_PASS_WINDOW. Disk and lock
+          safeguards remain.
         - A stuck request (see _stuck) doesn't count as being ahead: no lease
           ending would let it start, so the line behind it moves on, in order.
           It takes its turn again as soon as it would fit."""
@@ -695,8 +781,16 @@ class Coordinator:
         ahead = queue[: queue.index(req)] if req in queue else queue
         if not ahead:
             return True
-        if req["exclusive"]:
+
+        def hold(reason):
+            req["backfill_reason"] = f"backfill held: {reason}"
             return False
+
+        if req["exclusive"]:
+            return hold("exclusive requests never overtake")
+        for x in ahead:
+            if not self._stuck(x) and set(req.get("locks", ())) & set(x.get("locks", ())):
+                return hold(f"lock order behind {x.get('id', 'queued request')}")
         now = time.time()
         small = req["cores"] <= SMALL_CORES and req["mem"] <= SMALL_MEM and not req.get("disk")
         for x in ahead:
@@ -704,7 +798,7 @@ class Coordinator:
                 small and now - x["asked"] < EXCLUSIVE_PASS_WINDOW
                 and not set(req.get("locks", ())) & set(x.get("locks", ()))
             ):  # fmt: skip
-                return False
+                return hold("exclusive pass window or size limit")
         skipped_stuck = any(self._stuck(x) for x in ahead)
         ahead = [x for x in ahead if not self._stuck(x)]
         if not ahead:
@@ -714,12 +808,18 @@ class Coordinator:
             return True
         waiting_for = self._lock_wait(head)
         if waiting_for:
-            return not (waiting_for & set(req.get("locks", ()))) and self._leaves_room(
-                req, head, waiting_for)  # fmt: skip
+            return self._leaves_room(req, head, waiting_for) or hold("lock-wait head capacity reservation")
         if head.get("locks"):
-            return False  # its lock is free; it waits for capacity: no overtaking
+            return hold("lock-owning head waits for capacity")
         if skipped_stuck:
-            return req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk")
+            return (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
+                    and not req.get("disk")) or hold("ordering behind a stuck head")
+        if now - head["asked"] >= BACKFILL_PASS_WINDOW:
+            return hold("capacity pass window expired")
+        if self._overruns(head):
+            return hold(f"overrun delays {head['id']}")
+        if req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk"):
+            return True
         allowed, reason = self._easy(req, head)
         req["backfill_reason"] = reason
         if allowed:
@@ -768,7 +868,7 @@ class Coordinator:
         if headroom < 0:
             return {"error": "headroom must not be negative"}
         expect = req.get("expect")
-        if expect is not None and (not isinstance(expect, (int, float)) or not math.isfinite(expect) or expect <= 0):
+        if expect is not None and (type(expect) not in (int, float) or not math.isfinite(expect) or expect <= 0):
             return {"error": "expect must be a positive finite duration"}
         estimate, source = ((expect, "explicit") if expect is not None
                             else self._estimate(agent, str(req["label"])))
@@ -830,12 +930,17 @@ class Coordinator:
         return {"released": found} if found else {"error": f"no lease {lease_id}"}
 
     def op_check(self, req: dict, _agent: str) -> dict:
+        expect = req.get("expect")
+        if expect is not None and (type(expect) not in (int, float) or not math.isfinite(expect) or expect <= 0):
+            return {"error": "expect must be a positive finite duration"}
+        if expect is None:
+            expect, _ = self._estimate(_agent, str(req.get("label", "")))
         scoped = list(req.get("exclusive_locks") or [])
         probe = {"cores": float(req.get("cores", 1)), "mem": int(req.get("mem", 0)),
                  "exclusive": bool(req.get("exclusive")),
                  "locks": list(dict.fromkeys([*req.get("locks", []), *scoped])),
                  "exclusive_locks": scoped, "headroom": float(req.get("headroom") or 0),
-                 "disk": req.get("disk", {}), "expect": req.get("expect") or DEFAULT_EXPECT}  # fmt: skip
+                 "disk": req.get("disk", {}), "expect": expect}  # fmt: skip
         reason = self._blocked(probe)
         if not reason and self.state["queue"] and not self._may_pass(probe):
             reason = probe.get("backfill_reason") or f"{len(self.state['queue'])} request(s) already waiting"
@@ -903,11 +1008,11 @@ class Coordinator:
             "locks": self.state["locks"],
             "disks": {m: {"free": self.disk_free(m), "reserved": self._reserved(m)}
                       for m in sorted({m for x in self.state["leases"]
-                                       for m in x.get("disk", {})})},  # fmt: skip
+                                       for m in x.get("disk", {})})},
             "unleased_cores": round(self._unleased(), 1),
             "busy_cores": round(self.busy, 1),
             "available": self.available,
-        }  # fmt: skip
+        }
 
 
 def serve(
@@ -942,7 +1047,7 @@ def serve(
             while True:
                 try:
                     coordinator.tick()
-                except Exception as e:  # keep serving; log for journalctl
+                except Exception as e:  # noqa: BLE001 - keep serving; log for journalctl
                     print(f"agent-coord: tick failed: {e}", file=sys.stderr, flush=True)
                 time.sleep(TICK)
 
@@ -1174,6 +1279,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     reply = call({"op": "check", "cores": args.cores, "mem": args.mem,
                   "exclusive": args.exclusive, "locks": args.lock or [],
                   "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
+                  "agent": args.agent or default_agent(), "label": args.label,
                   "expect": args.expect, "disk": {mount_of(p): n for p, n in args.disk or []}})  # fmt: skip
     print("ok" if reply["ok"] else f"no: {reply['reason']}")
     return 0 if reply["ok"] else 1
@@ -1345,6 +1451,7 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--lock", action="append")
         sub.add_argument("--expect", type=parse_expect, help="expected run time, e.g. 10m (default: learned per agent/label, else 30m)")
         if name == "check":
+            sub.add_argument("--label", default="", help="label to match learned run estimates")
             continue
         sub.add_argument("--label", required=True)
         sub.add_argument("--max-wait", type=parse_duration)

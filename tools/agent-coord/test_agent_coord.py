@@ -5,10 +5,10 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import agent_coord as ac
 
@@ -153,7 +153,7 @@ class CoordinatorTest(unittest.TestCase):
         for run in [9999, *range(1, 21)]:
             self.c._log("ended", lease, run=run, code=0)
         self.c._log("ended", lease, run=99999, code=1)
-        self.assertEqual(self.c._estimate("a", "a job"), (20, "history"))
+        self.assertEqual(self.c._estimate("a", "a job"), (18, "history"))
 
     def test_backfill_preserves_headroom_and_disk_rules(self):
         self.ask(4, mem=8 * GIB, expect=60)
@@ -171,11 +171,273 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(lease["expect_source"], "history")
         self.assertGreaterEqual(lease["expect"], 75)
         self.assertLess(lease["expect"], 76)
-        self.assertEqual(self.c._estimate("other", "a job")[1], "default")
+        self.assertEqual(self.c._estimate("other", "a job")[1], "history")
         self.assertEqual(self.c._estimate("a", "other job")[1], "default")
         self.release(second)
         self.assertIn("error", self.ask(1, expect=0))
         self.assertIn("error", self.ask(1, expect=float("inf")))
+
+    def configure(self, cores=8, mem=16, footprint=None):
+        self.c.capacity = lambda: (cores, mem * GIB)
+        if footprint:
+            self.c.footprint = footprint
+        self.c.tick()
+
+    def test_review_sliding_start_and_early_end(self):
+        with patch.object(ac.time, "time", return_value=100000) as clock:
+            a = self.ask(1, mem=5 * GIB, agent="A", expect=1800)
+            self.ask(1, mem=5 * GIB, agent="B", expect=8 * 3600)
+            head = self.ask(1, mem=10 * GIB, agent="big")
+            clock.return_value += 1860
+            r = self.ask(1, mem=6 * GIB, agent="R", expect=7 * 3600)
+            self.assertEqual(r["state"], "waiting")
+            self.release(a)
+            self.assertEqual(self.poll(head), "granted")
+
+    def test_review_tiny_without_projection(self):
+        self.busy = self.c.busy = 6
+        self.ask(4, agent="head")
+        self.assertEqual(self.ask(1, mem=GIB // 2, expect=5)["state"], "granted")
+
+    def test_review_old_and_overdue_holders_still_leave_capacity(self):
+        for old in (False, True):
+            with self.subTest(old=old):
+                self.c.state["leases"].clear()
+                self.c.state["queue"].clear()
+                self.busy = self.c.busy = 0
+                a = self.ask(6, mem=4 * GIB, expect=1800)
+                if old:
+                    self.c.state["leases"][0].pop("expect")
+                    self.c._save()
+                    self.c = self.make()
+                self.age(a, 1900, "granted")
+                self.busy = self.c.busy = 6
+                self.ask(4, agent="head")
+                self.assertEqual(self.ask(1, mem=GIB // 2, expect=5)["state"], "granted")
+                # Release the tiny job so the medium job fits measured CPU.
+                self.release(self.c.state["leases"][-1])
+                self.assertEqual(self.ask(2, mem=GIB, expect=120)["state"], "granted")
+
+    def test_review_available_bound_multiple_backfills(self):
+        self.available = 30 * GIB
+        self.configure(cores=12, mem=58, footprint=lambda pid: 20 * GIB)
+        a = self.ask(1, mem=20 * GIB, expect=600)
+        head = self.ask(1, mem=40 * GIB, agent="big")
+        replies = [self.ask(1, mem=6 * GIB, agent=f"m{i}", expect=7200)
+                   for i in range(3)]
+        self.assertEqual([r["state"] for r in replies], ["granted", "waiting", "waiting"])
+        self.available = self.c.available = 44 * GIB
+        self.release(a)
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_review_ends_before_start_respects_actual_admission(self):
+        self.available = 42 * GIB
+        self.configure(cores=12, mem=58, footprint=lambda pid: 20 * GIB)
+        self.ask(1, mem=20 * GIB, expect=600)
+        self.available = 22 * GIB
+        self.c.tick()
+        self.ask(1, mem=30 * GIB, agent="big")
+        replies = [self.ask(1, mem=8 * GIB, agent=f"m{i}", expect=30)
+                   for i in range(4)]
+        # Preserve _why's existing memory safety and claimed-memory limit.
+        self.assertEqual(sum(r["state"] == "granted" for r in replies), 4)
+        self.assertLessEqual(sum(x["mem"] for x in self.c.state["leases"]), 58 * GIB)
+
+    def test_review_measured_cpu_projection(self):
+        self.configure(cores=12, mem=58)
+        for agent, run in (("A", 7200), ("B", 300)):
+            self.c._log("ended", {"id": "old", "agent": agent, "label": f"{agent} job",
+                                  "cores": 1, "mem": GIB}, run=run, code=0)
+        a = self.ask(8, mem=4 * GIB, agent="A", expect=7200)
+        b = self.ask(1, mem=30 * GIB, agent="B", expect=300)
+        for r in (a, b):
+            self.age(r, 120, "granted")
+        self.busy = self.c.busy = 3
+        head = self.ask(6, mem=40 * GIB, agent="big")
+        self.assertEqual(self.ask(1, mem=20 * GIB, expect=3600)["state"], "waiting")
+        self.assertEqual(self.c.state["queue"][0]["projected_ending"], [b["id"]])
+        self.release(b)
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_review_queued_lock_order(self):
+        self.ask(4, mem=2 * GIB, expect=600)
+        self.ask(6, mem=2 * GIB, agent="big")
+        self.ask(5, agent="g1", locks=["gpu"], expect=600)
+        later = self.ask(1, agent="g2", locks=["gpu"], expect=36000)
+        self.assertEqual(later["state"], "waiting")
+        self.assertIn("lock", later["reason"])
+
+    def test_review_history_volume_and_no_tick_writes(self):
+        for cpu in (False, True):
+            with self.subTest(cpu=cpu):
+                self.c.state["leases"].clear()
+                self.c.state["queue"].clear()
+                self.available = 12 * GIB if not cpu else 64 * GIB
+                self.busy = self.c.busy = 0
+                self.c.tick()
+                a = self.ask(4, mem=4 * GIB, expect=600)
+                if cpu:
+                    self.age(a, 100, "granted")
+                    self.busy = self.c.busy = 5
+                self.ask(6, agent="big")
+                self.ask(4 if cpu else 2, mem=GIB if cpu else 9 * GIB, agent="m", expect=60)
+                self.c.tick()
+                n = len(self.history())
+                with patch.object(self.c, "_save", wraps=self.c._save) as save:
+                    for i in range(50):
+                        if cpu:
+                            self.busy = 5 + (i % 7) / 10
+                        else:
+                            self.available = int((12 + (i % 7) / 10) * GIB)
+                        self.c.tick()
+                    self.assertEqual(len(self.history()), n)
+                    save.assert_not_called()
+
+    def test_review_footprints_cached_per_pass(self):
+        self.available = 40 * GIB
+        self.configure(cores=64, mem=200)
+        for i in range(12):
+            self.ask(1, mem=2 * GIB, agent=f"l{i}", expect=600+i)
+        self.ask(1, mem=60 * GIB, agent="big")
+        for i in range(8):
+            self.ask(1, mem=3 * GIB, agent=f"q{i}", expect=7200)
+        with patch.object(self.c, "footprint", return_value=GIB) as footprint:
+            self.c._admit()
+            self.assertLessEqual(footprint.call_count, len(self.c.state["leases"]))
+
+    def test_review_estimate_filters_percentile_fallback_and_cache(self):
+        x = {"id": "L0", "agent": "a", "label": "work", "cores": 1, "mem": GIB}
+        for run in [*range(1, 20), 90000]:
+            self.c._log("ended", x, run=run, code=0)
+        for extra in ({}, {"why": "process exited"}, {"held": True, "code": 0}, {"code": 1}):
+            self.c._log("ended", x, run=99999, **extra)
+        with patch.object(ac, "read_history", wraps=ac.read_history) as read:
+            self.assertEqual(self.c._estimate("a", "work"), (18, "history"))
+            self.assertEqual(self.c._estimate("other", "work"), (18, "history"))
+            for _ in range(5):
+                self.c._estimate("a", "work")
+            self.assertLessEqual(read.call_count, 1)
+
+    def test_review_check_uses_learned_estimate_with_queue(self):
+        self.ask(4, mem=8 * GIB, expect=600)
+        self.ask(8, mem=12 * GIB, agent="head")
+        x = {"id": "L0", "agent": "probe", "label": "probe job", "cores": 3, "mem": 4 * GIB}
+        self.c._log("ended", x, run=30, code=0)
+        req = {"op": "check", "agent": "probe", "label": "probe job", "cores": 3, "mem": 4 * GIB}
+        self.assertTrue(self.c.handle(req)["ok"])
+        self.assertEqual(self.ask(3, mem=4 * GIB, agent="probe")["state"], "granted")
+
+    def test_review_expect_rejects_boolean_and_nonnumeric(self):
+        for value in (True, False, "10m", [], {}, float("nan"), float("inf"), 0):
+            with self.subTest(value=value):
+                self.assertIn("error", self.ask(1, expect=value))
+                self.assertIn("error", self.c.handle({"op": "check", "expect": value}))
+
+    def test_review_capacity_backfill_cutoff(self):
+        self.ask(4, mem=8 * GIB, expect=600)
+        head = self.ask(6, mem=10 * GIB, agent="head")
+        self.age(head, ac.EXCLUSIVE_PASS_WINDOW + 1)
+        self.assertEqual(self.ask(2, mem=4 * GIB, expect=7200)["state"], "waiting")
+        self.assertEqual(self.ask(1, expect=1)["state"], "waiting")
+
+    def test_review_projection_is_pinned_before_aging_cutoff(self):
+        with patch.object(ac.time, "time", return_value=100000) as clock:
+            a = self.ask(1, mem=5 * GIB, agent="A", expect=60)
+            self.ask(1, mem=5 * GIB, agent="B", expect=8 * 3600)
+            head = self.ask(1, mem=10 * GIB, agent="big")
+            queued = self.c.state["queue"][0]
+            initial = queued.get("projected_start")
+            clock.return_value += 61
+            self.assertEqual(self.ask(1, mem=6 * GIB, expect=7 * 3600)["state"], "waiting")
+            self.assertLessEqual(queued["projected_start"], initial)
+            self.release(a)
+            self.assertEqual(self.poll(head), "granted")
+
+    def test_review_holder_ends_early_and_head_starts_immediately(self):
+        with patch.object(ac.time, "time", return_value=100000) as clock:
+            holder = self.ask(4, mem=8 * GIB, expect=1800)
+            head = self.ask(6, mem=10 * GIB, agent="head")
+            self.assertEqual(self.ask(2, mem=4 * GIB, expect=7200)["state"], "granted")
+            clock.return_value += 30
+            self.release(holder)
+            self.assertEqual(self.poll(head), "granted")
+
+    def test_review_projection_preserves_outside_load_and_headroom(self):
+        holder = self.ask(4, expect=600)
+        self.age(holder, 120, "granted")
+        self.busy = self.c.busy = 6
+        self.vms = self.c.vms = [{"pid": 1, "cores": 2, "mem": GIB}]
+        head = {"cores": 7, "mem": GIB}
+        self.assertFalse(self.c._projected_fit(head, self.c.state["leases"]))
+        self.busy = self.c.busy = 0
+        self.vms = self.c.vms = []
+        head = {"cores": 2, "mem": GIB, "headroom": 4}
+        self.assertFalse(self.c._projected_fit(head, [], {"cores": 1, "mem": GIB}))
+
+    def test_review_combined_exclusive_lock_stuck_and_backfilled_lease(self):
+        holder = self.ask(4, mem=8 * GIB, expect=600)
+        head = self.ask(8, mem=12 * GIB, agent="head")
+        backfill = self.ask(3, mem=4 * GIB, agent="backfill", expect=30)
+        self.assertEqual(backfill["state"], "granted")
+        self.release(head)
+        perf = self.ask(1, agent="perf", exclusive=True)
+        self.age(perf, ac.EXCLUSIVE_PASS_WINDOW + 1)
+        self.assertEqual(self.ask(1, expect=1)["state"], "waiting")
+        self.release(perf)
+        # A held GPU lock still gates a scoped exclusive beside a backfill.
+        self.c.handle({"op": "lock", "agent": "owner", "name": "gpu"})
+        gpu = self.ask(1, agent="gpu", exclusive_locks=["gpu"])
+        self.assertEqual(gpu["state"], "waiting")
+        self.release(holder)
+        self.c.handle({"op": "unlock", "agent": "owner", "name": "gpu"})
+        self.assertEqual(self.poll(gpu), "granted")
+        self.assertEqual(self.poll(backfill), "granted")
+        self.available = 5 * GIB
+        self.c.footprint = lambda pid: 0
+        self.c.tick()
+        stuck = self.ask(1, mem=10 * GIB, agent="stuck", locks=["nas"])
+        self.age(stuck, ac.STUCK_AFTER + 1)
+        self.assertEqual(self.ask(1, mem=GIB // 2, locks=["nas"])["state"], "granted")
+
+    def test_review_unchanged_poll_does_not_rewrite_state(self):
+        holder = self.ask(1)
+        self.c.handle({"op": "poll", "id": holder["id"]})
+        with patch.object(Path, "write_text", wraps=Path.write_text) as write:
+            self.c.handle({"op": "poll", "id": holder["id"]})
+            write.assert_not_called()
+
+    def test_review_check_cli_routes_agent_and_label(self):
+        with patch.object(ac, "call", return_value={"ok": True}) as call:
+            self.assertEqual(ac.main(["--as", "agent", "check", "--cores", "3",
+                                      "--mem", "4G", "--label", "compile"]), 0)
+            self.assertEqual(call.call_args.args[0]["agent"], "agent")
+            self.assertEqual(call.call_args.args[0]["label"], "compile")
+
+    def test_review_authoritative_stale_available_sample(self):
+        self.available = 42 * GIB
+        self.configure(cores=12, mem=58, footprint=lambda pid: 20 * GIB)
+        self.ask(1, mem=20 * GIB, expect=600)
+        self.available = 22 * GIB
+        self.c.tick()
+        self.ask(1, mem=30 * GIB, agent="big")
+        replies = [self.ask(1, mem=8 * GIB, agent=f"m{i}", expect=300)
+                   for i in range(4)]
+        self.assertEqual([r["state"] for r in replies], ["granted", "waiting", "waiting", "waiting"])
+
+    def test_review_holder_median_and_candidate_percentile_are_distinct(self):
+        x = {"id": "old", "agent": "a", "label": "a job", "cores": 1, "mem": GIB}
+        for run in range(10, 210, 10):
+            self.c._log("ended", x, run=run, code=0)
+        with patch.object(ac.time, "time", return_value=100000):
+            self.assertEqual(self.c._estimate("a", "a job"), (180, "history"))
+            self.assertEqual(self.c._holder_end({**x, "granted": 100000, "expect": 180}), 100105)
+            self.assertEqual(self.c._holder_end({**x, "granted": 99000}), 100060)
+
+    def test_review_held_run_never_teaches_an_estimate(self):
+        held = self.ask(1, running=True)
+        self.age(held, 120, "granted")
+        self.release(held, code=0)
+        self.assertEqual(self.c._estimate("a", "a job"), (ac.DEFAULT_EXPECT, "default"))
 
     def test_expect_duration_parser(self):
         self.assertEqual(ac.parse_expect("10m"), 600)
@@ -636,7 +898,7 @@ class FootprintTest(unittest.TestCase):
 
 
 class ArchiveTest(unittest.TestCase):
-    M = ["/mnt/nas"]
+    M = ("/mnt/nas",)
 
     def test_outputs_and_workdir_on_the_archive_are_found(self):
         cmd = ["wgsextract", "realign", "--input", "/mnt/nas/ref/x.cram",
@@ -659,10 +921,10 @@ class ServiceTest(unittest.TestCase):
         self.sock = Path(self.tmp.name, "sock")
         self.server = subprocess.Popen(
             [sys.executable, "-c",
-             "import agent_coord as ac, pathlib, sys; "
+             ("import agent_coord as ac, pathlib, sys; "
              "ac.serve(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), "
              "measure=lambda: {'vms': [], 'busy': 0.0, 'available': 64 * 1024**3}, "
-             "cap=lambda: (8.0, 16 * 1024**3))",
+             "cap=lambda: (8.0, 16 * 1024**3))"),
              str(self.sock), str(Path(self.tmp.name, "state.json"))],
             cwd=Path(__file__).parent, stdout=subprocess.DEVNULL,
         )  # fmt: skip
@@ -683,7 +945,7 @@ class ServiceTest(unittest.TestCase):
                 f"sys.exit(ac.main(sys.argv[1:]))")  # fmt: skip
         return subprocess.run([sys.executable, "-c", code, *args],
                               cwd=Path(__file__).parent,
-                              capture_output=True, text=True, timeout=60)  # fmt: skip
+                              capture_output=True, text=True, timeout=60, check=False)  # fmt: skip
 
     def test_run_executes_capped_and_releases(self):
         result = self.cli("--as", "t", "run", "--cores", "1", "--mem", "256M",
