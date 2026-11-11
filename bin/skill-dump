@@ -413,8 +413,19 @@ install_agent_instructions() {
 
 # --- commands --------------------------------------------------------------
 
+# A git hook reinstalls only from the checkout the install came from. A hook
+# firing in a worktree or another clone (creating one checks it out) must not
+# repoint the installed tools and agent instructions at it; run
+# `skill-dump install` there by hand to switch on purpose.
+hook_owns_install() {
+  local home
+  [[ -f $STATE_DIR/installed ]] || return 0
+  home=$(awk '$1 == "home" { print $2 }' "$STATE_DIR/installed")
+  [[ -z $home || $home == "$SD_HOME" ]]
+}
+
 cmd_install() {
-  local from_update=no
+  local from_update=no from_hook=no
   load_config
   while (($#)); do
     case $1 in
@@ -429,12 +440,16 @@ cmd_install() {
       --no-git-hooks) GIT_HOOKS=no ;;
       --git-hooks) GIT_HOOKS=yes ;;
       --force) FORCE=yes ;;
-      --from-update | --from-git-hook) from_update=yes ;;
+      --from-update) from_update=yes ;;
+      --from-git-hook) from_update=yes; from_hook=yes ;;
       -h | --help) usage; return 0 ;;
       *) die "unknown install option: $1" ;;
     esac
     shift
   done
+  if [[ $from_hook == yes ]] && ! hook_owns_install; then
+    return 0
+  fi
   acquire_lock
   [[ $from_update == yes ]] || save_config
 
