@@ -25,6 +25,7 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 | `op-session` | Persistent 1Password CLI session for fresh agent shells | macOS/Linux, tmux, op, jq |
 | `cli-launchers` | Shared mise launchers for agent CLIs and development tools | mise |
 | `hf-op` | Hugging Face token routing through op-session or an existing hf login | bash |
+| [`agent-usage`](tools/agent-usage/README.md) | Counts-only daily agent tokens, API-rate estimates and weekly tokens per merged PR | Python 3.11+, gh for PR counts |
 
 Tools whose requirements are missing are skipped. Choose tools with `--skip` / `--only`
 (saved in `~/.config/skill-dump/config` and reused when a pull reinstalls):
@@ -64,6 +65,8 @@ UNITS="name.service"                   # optional systemd user units, enabled an
 RESTART_ON_CHANGE="name.service"       # optional; restarted when this tool's files change
 REQUIRES="python3 tmux systemctl"      # commands needed (systemctl = a systemd user session)
 OS="Linux"                             # optional; uname -s values
+INSTALL_ONLY=yes                       # optional; install units without enabling/starting them
+PLISTS="com.example.job.plist"          # optional macOS LaunchAgents; installed, never auto-loaded
 ```
 
 Unit files may use `{{SKILL_DUMP_HOME}}`, `{{HOME}}`, `{{USER}}` and `{{HOST}}`. An optional `agents.md`

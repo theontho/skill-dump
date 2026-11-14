@@ -1,0 +1,24 @@
+# Copy to ~/.config/agent-usage/config.toml. No environment-variable configuration.
+storage = "~/.local/state/agent-usage"
+timezone = "America/Los_Angeles"
+# Defaults to the real hostname. Only override to a stable, accurate machine name.
+# machine = "lin-mid (lin-omarchy)"
+
+[[repositories]]
+name = "WGSExtract/wgsextract-cli"
+aliases = ["theontho/wgsextract-cli"]
+paths = [
+  "~/src/wgsextract-cli",
+  "~/.herdr/worktrees/wgsextract-cli/*",
+  "~/src/wgsextract-cli/scratch/wt-*",
+]
+
+# Source paths can be overridden; absent optional sources are skipped.
+# Put these top-level keys ABOVE [[repositories]]:
+# copilot = "~/.copilot/session-state"
+# opencode = "~/.local/share/opencode/opencode.db"
+# claude = "~/.claude/projects"
+#
+# Public rate overrides: USD / million, [input, cache read, cache write, output].
+# [rates]
+# "my-model" = [2.0, 0.1, 2.5, 10.0]

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Managed by skill-dump; edits are overwritten. -->
+  <key>Label</key><string>com.theontho.agent-usage</string>
+  <key>Disabled</key><true/>
+  <key>ProgramArguments</key>
+  <array><string>{{HOME}}/.local/bin/agent-usage</string><string>collect</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{{HOME}}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>15</integer></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>Umask</key><integer>63</integer>
+</dict>
+</plist>

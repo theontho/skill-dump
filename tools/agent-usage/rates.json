@@ -1,0 +1,25 @@
+{
+  "as_of": "2026-11-13",
+  "sources": [
+    "https://developers.openai.com/api/docs/pricing",
+    "https://platform.claude.com/docs/en/about-claude/pricing"
+  ],
+  "units": "USD per million tokens; input, cached read, cache write, output",
+  "models": {
+    "gpt-6-astra": [10, 1, 12.5, 50],
+    "gpt-6.1-sol": [2, 0.1, 2.5, 10],
+    "gpt-6.1-terra": [1, 0.05, 1.25, 5],
+    "gpt-6-luna": [0.1, 0.01, 0.125, 0.5],
+    "gpt-6-sol": [2, 0.2, 2.5, 10],
+    "gpt-5.6-sol": [4, 0.4, 5, 20],
+    "gpt-5.6-terra": [2, 0.2, 2.5, 12],
+    "gpt-5.6-luna": [0.2, 0.02, 0.25, 1.2],
+    "claude-opus-5.5": [4, 0.2, 5, 20],
+    "claude-opus-5": [5, 0.5, 6.25, 25],
+    "claude-opus-4.6": [5, 0.5, 6.25, 25],
+    "claude-sonnet-5": [2, 0.2, 2.5, 10],
+    "claude-sonnet-4.6": [3, 0.3, 3.75, 15],
+    "claude-haiku-4.5": [1, 0.1, 1.25, 5],
+    "claude-haiku-5.5": [0.1, 0.01, 0.125, 0.5]
+  }
+}
