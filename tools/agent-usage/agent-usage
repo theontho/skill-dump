@@ -53,8 +53,9 @@ def config_at(path):
             "dashes or parentheses, without surrounding whitespace"
         )
     for repo in config["repositories"]:
-        if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo["name"]):
-            raise ValueError("repository must be owner/name")
+        for name in (repo["name"], *repo.get("aliases", [])):
+            if not re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+                raise ValueError("repository names and aliases must be owner/name")
     return config
 
 

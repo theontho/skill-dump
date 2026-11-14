@@ -54,9 +54,17 @@ Labels cannot contain path separators, newlines or Markdown table delimiters.
 The default config path is `~/.config/agent-usage/config.toml`;
 `agent-usage --config PATH …` selects another. No environment-variable settings.
 With no repositories configured collection fails without writing misleading
-empty days. `paths` match directory boundaries (including worktrees beneath
-them); add paths for worktrees outside the configured checkout. Copilot's
-explicit `workspace.yaml` repository name takes precedence over path matching.
+empty days. `aliases = ["theontho/wgsextract-cli"]` on a `[[repositories]]` entry
+maps a fork name to its canonical repository for counts and merged-PR queries.
+Known canonical names/aliases in Copilot's `workspace.yaml` take precedence;
+an unknown name falls back to matching `cwd`, then `git_root`. An unmatched fork
+name therefore cannot veto a configured checkout or worktree path.
+`paths` match directory boundaries and descendants. Glob roots are supported,
+for example `~/.herdr/worktrees/wgsextract-cli/*` and
+`~/src/wgsextract-cli/scratch/wt-*`, including nested working directories in each
+matching worktree. A literal checkout root already covers its scratch worktrees;
+add paths for worktrees outside that checkout. Matching does not require the
+directory to still exist, so old sessions in deleted worktrees remain countable.
 
 ## Collection and reports
 

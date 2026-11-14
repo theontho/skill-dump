@@ -70,21 +70,25 @@ def agent_key(source, identifier):
     return hashlib.sha256(f"{source}:{identifier}".encode()).hexdigest()[:16]
 
 
-def repository(config, directory="", name=""):
+def repository(config, directory="", name="", git_root=""):
     if name:
-        return next(
-            (
-                repo["name"]
-                for repo in config["repositories"]
-                if name.casefold().removesuffix(".git") == repo["name"].casefold()
-            ),
-            None,
-        )
-    for repo in config["repositories"]:
-        for root in repo.get("paths", []):
-            root = str(Path(root).expanduser()).rstrip("/")
-            if directory == root or directory.startswith(root + "/"):
+        normalized = name.casefold().removesuffix(".git")
+        for repo in config["repositories"]:
+            names = (repo["name"], *repo.get("aliases", []))
+            if any(
+                normalized == candidate.casefold().removesuffix(".git")
+                for candidate in names
+            ):
                 return repo["name"]
+    for location in dict.fromkeys((directory, git_root)):
+        if not location:
+            continue
+        path = Path(location).expanduser()
+        for repo in config["repositories"]:
+            for root in repo.get("paths", []):
+                pattern = str(Path(root).expanduser())
+                if any(candidate.match(pattern) for candidate in (path, *path.parents)):
+                    return repo["name"]
     return None
 
 
@@ -135,7 +139,9 @@ def copilot(config):
     seen = set()
     for path in sorted(Path(config["copilot"]).expanduser().glob("*/events.jsonl")):
         ws = workspace(path.parent / "workspace.yaml")
-        repo = repository(config, ws.get("cwd", ""), ws.get("repository", ""))
+        repo = repository(
+            config, ws.get("cwd", ""), ws.get("repository", ""), ws.get("git_root", "")
+        )
         if not repo:
             continue
         with path.open(errors="replace") as stream:

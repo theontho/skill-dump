@@ -6,7 +6,12 @@ timezone = "America/Los_Angeles"
 
 [[repositories]]
 name = "WGSExtract/wgsextract-cli"
-paths = ["~/src/wgsextract-cli"]
+aliases = ["theontho/wgsextract-cli"]
+paths = [
+  "~/src/wgsextract-cli",
+  "~/.herdr/worktrees/wgsextract-cli/*",
+  "~/src/wgsextract-cli/scratch/wt-*",
+]
 
 # Source paths can be overridden; absent optional sources are skipped.
 # Put these top-level keys ABOVE [[repositories]]:

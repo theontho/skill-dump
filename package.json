@@ -14,7 +14,7 @@
     "skills:install:codex": "npx skills add . --skill '*' --agent codex --full-depth -y",
     "skills:install:all": "npx skills add . --skill '*' --agent '*' --full-depth -y",
     "tools:test": "npm run tools:test:credentials && npm run tools:test:launchers && npm run tools:test:usage && cd tools/agent-coord && python3 -m unittest -q test_agent_coord",
-    "tools:test:usage": "cd tools/agent-usage && python3 -m unittest -q test_usage",
+    "tools:test:usage": "cd tools/agent-usage && python3 -m unittest -q test_usage test_repository",
     "tools:test:launchers": "cd tools/cli-launchers && python3 -m unittest -q test_launcher && cd ../hf-op && python3 -m unittest -q test_hf_op",
     "tools:test:credentials": "cd tools/sudo-session && python3 -m unittest -q test_sudo_session && cd ../op-session && python3 -m unittest -q test_session_worker",
     "tools:test:install": "python3 -m unittest -q scripts/test_install.py scripts/test_usage_install.py",
