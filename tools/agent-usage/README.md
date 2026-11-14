@@ -19,6 +19,14 @@ agent-usage timer enable
 agent-usage timer status
 ```
 
+For an explicitly approved preview while the PR remains draft, run
+`./bin/skill-dump update --no-pull` from the retained feature worktree instead.
+This uses the normal installer and saved install options without merging or
+changing the canonical checkout's branch. Installed tool/skill links and units
+point into that worktree, so **retain it while the preview is installed**.
+After merge, run `~/.local/share/skill-dump/bin/skill-dump update` to restore
+canonical-checkout links before removing the preview worktree.
+
 The skill-dump installer links the executable and renders the systemd user
 service/timer (Linux) or `~/Library/LaunchAgents/com.theontho.agent-usage.plist`
 (macOS). **Installation does not activate this tool's schedule**. Activation is
@@ -36,6 +44,12 @@ job; ensure Python 3.11+ and `gh` are on the job's PATH (`~/.local/bin`,
 `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`).
 `launchctl print gui/$(id -u)/com.theontho.agent-usage` shows its last exit status.
 Neither machine should be enabled as part of the lin-mid rollout.
+
+`machine` is a configurable display label, defaulting to the short hostname.
+This host's machine-label name is **lin-mid**, while its hostname is
+**lin-omarchy**; its TOML setting is `machine = "lin-mid (lin-omarchy)"`.
+Spaces and parentheses are supported, including in the storage directory name.
+Labels cannot contain path separators, newlines or Markdown table delimiters.
 
 The default config path is `~/.config/agent-usage/config.toml`;
 `agent-usage --config PATH …` selects another. No environment-variable settings.
@@ -90,13 +104,22 @@ denominator across machines. Missing days/PR queries produce `n/a`, not zero.
   claim about their actual job. No session IDs are saved in cleartext.
 * OpenCode: a private filesystem snapshot of the DB and WAL is made under
   storage (never the system temp directory), queried only for allowlisted
-  `session_v2` usage columns, then removed even on error. No account,
+  `session_v2`/`session_message` usage metadata, then removed even on error. No account,
   credential, title, prompt, or response columns are queried. The raw short-lived
-  copy is not an output or archive. **`session_v2` is cumulative session
-  accounting**, not per-call history: its tokens/cost are attributed to session
-  creation day, as in the prototype. Calls and prompt-size statistics exclude
-  it; `session_records` is separate. Its dates are approximate for long-lived
-  sessions. A parent session ID provides the same root/child proxy.
+  copy is not an output or archive. Assistant messages' `data.tokens` counts
+  are extracted as individual numeric fields inside SQLite, never by returning
+  their full `data` JSON. Usage is bucketed on `data.time.completed` (falling
+  back to message `time_created`), so long-running sessions don't inflate
+  their creation day. These messages contribute API calls and prompt statistics;
+  message model metadata takes precedence over the current session model.
+  Session lifetime totals are **not added** when that session has message usage.
+  A session without message usage falls back to `session_v2` lifetime totals
+  on its creation day, excluded from calls/prompt statistics and counted as a
+  `session_records` fallback. The report explicitly flags this day-inflation
+  caveat whenever fallback records occur in either week.
+  On the inspected DB `session_part` had no token counts; `session_message`
+  provided timestamped assistant usage. A parent session ID supplies the same
+  root/child role proxy.
 * Claude Code: optional recursive project JSONL, whitelist message usage/model,
   ID and timestamp/cwd only. Message/request IDs deduplicate repeated chunks,
   retaining the maximum cumulative usage rather than an early partial output;
@@ -126,6 +149,8 @@ cache rate. OpenAI prompts above 272k use the documented long-context multiplier
 (2× input/cache, 1.5× output); Haiku 5.5 prompts above 100k use its 5× tier.
 OpenCode session aggregates use short-context rates because individual call
 sizes cannot be recovered; applying context tiers to lifetime totals is invalid.
+Timestamped OpenCode message usage uses the same per-call context pricing as
+the other sources.
 Other tier, region, service-speed, volume and
 historical price changes are not inferred. Reasoning is retained separately but
 not charged again: provider output usage already includes reasoning.

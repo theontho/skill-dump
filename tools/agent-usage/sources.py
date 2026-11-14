@@ -121,7 +121,7 @@ def record(
         "model": model or "unknown",
         "role": role,
         "calls": calls,
-        "session_records": int(source == "opencode"),
+        "session_records": int(source == "opencode" and calls == 0),
         "prompt_uncached": uncached,
         "prompt_cached": cached,
         "cache_write": writes,
@@ -219,6 +219,59 @@ def opencode(config, state):
             if not columns:
                 raise ValueError("OpenCode has no session_v2 usage table")
             parent = "parent_id" if "parent_id" in columns else "NULL"
+            message_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(session_message)")
+            }
+            activity_sessions = set()
+            if {"session_id", "type", "time_created", "data"} <= message_columns:
+                # Project only usage and model metadata inside SQLite. Never select data
+                # itself: it also holds message text, commands and tool output.
+                message_parent = "s.parent_id" if "parent_id" in columns else "NULL"
+                message_query = (
+                    "SELECT m.session_id, s.directory, "
+                    "COALESCE(json_extract(m.data, '$.time.completed'), m.time_created), "
+                    "COALESCE(json_extract(m.data, '$.model.id'), s.model), "
+                    "json_extract(m.data, '$.tokens.input'), "
+                    "json_extract(m.data, '$.tokens.output'), "
+                    "json_extract(m.data, '$.tokens.reasoning'), "
+                    "json_extract(m.data, '$.tokens.cache.read'), "
+                    "json_extract(m.data, '$.tokens.cache.write'), "
+                    f"{message_parent} FROM session_message AS m "
+                    "JOIN session_v2 AS s ON s.id = m.session_id "
+                    "WHERE m.type = 'assistant' AND json_type(m.data, '$.tokens') = 'object'"
+                )
+                for (
+                    sid,
+                    directory,
+                    stamp,
+                    model,
+                    tin,
+                    tout,
+                    reasoning,
+                    cached,
+                    writes,
+                    message_parent_id,
+                ) in connection.execute(message_query):
+                    repo = repository(config, directory or "")
+                    if not repo:
+                        continue
+                    activity_sessions.add(sid)
+                    if model and model.startswith("{"):
+                        model = project(model, {"id": True}).get("id")
+                    yield record(
+                        "opencode",
+                        sid,
+                        repo,
+                        datetime.fromtimestamp(stamp / 1000).astimezone().isoformat(),
+                        model,
+                        "implementer" if message_parent_id else "supervisor",
+                        number(tin) + number(writes),
+                        number(cached),
+                        number(writes),
+                        number(tout),
+                        number(reasoning),
+                    )
             query = (
                 "SELECT id, directory, time_created, model, tokens_input, tokens_output, "
                 "tokens_reasoning, tokens_cache_read, tokens_cache_write, cost, "
@@ -238,6 +291,8 @@ def opencode(config, state):
                     _,
                     parent,
                 ) = row
+                if sid in activity_sessions:
+                    continue
                 repo = repository(config, directory or "")
                 if not repo:
                     continue

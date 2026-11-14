@@ -43,9 +43,14 @@ def config_at(path):
     if path.exists():
         with path.open("rb") as stream:
             config.update(tomllib.load(stream))
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", config["machine"]):
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_. ()-]{1,100}", config["machine"])
+        or config["machine"] in (".", "..")
+        or config["machine"] != config["machine"].strip()
+    ):
         raise ValueError(
-            "machine must contain only letters, numbers, dot, underscore or dash"
+            "machine label must be 1–100 letters/numbers, spaces, dots, underscores, "
+            "dashes or parentheses, without surrounding whitespace"
         )
     for repo in config["repositories"]:
         if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo["name"]):
@@ -173,10 +178,25 @@ def weekly(args, config):
         raise ValueError("no daily data for this repository and reporting window")
     lines += [
         "",
-        "¹ OpenCode lifetime session totals contribute tokens/cost, not API calls or prompt-size statistics.",
+        "¹ API calls/prompt statistics include timestamped OpenCode assistant-message usage, when available.",
         "² Standard public API-rate estimate, not actual subscription spend. Missing days make PR ratios n/a.",
         "Root/child role breakdown is in daily JSON; polling share omitted to avoid reading tool/message text.",
     ]
+    if any(
+        row.get("session_records", 0)
+        for periods in groups.values()
+        for rows in periods
+        for row in rows
+    ):
+        lines.append(
+            "Caveat: OpenCode sessions without message usage use lifetime totals bucketed on "
+            "session creation day; this can inflate individual days. These fallback records "
+            "are excluded from API calls and prompt-size statistics."
+        )
+    else:
+        lines.append(
+            "OpenCode uses message activity dates, not session creation dates."
+        )
     text = "\n".join(lines)
     print(text)
     if args.post_issue is not None and not args.dry_run:

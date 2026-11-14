@@ -2,7 +2,7 @@
 storage = "~/.local/state/agent-usage"
 timezone = "America/Los_Angeles"
 # Defaults to the real hostname. Only override to a stable, accurate machine name.
-# machine = "lin-mid"
+# machine = "lin-mid (lin-omarchy)"
 
 [[repositories]]
 name = "WGSExtract/wgsextract-cli"

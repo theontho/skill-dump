@@ -189,8 +189,8 @@ def document(day, machine, zone, rows, repositories, merges, rates):
         "limitations": [
             "Polling share omitted: message/tool bodies are never decoded.",
             "Supervisor means root session; implementer means a child call/session, not job intent.",
-            "OpenCode session_v2 contains lifetime totals bucketed on creation day, not calls.",
-            "Prompt mean/p90 excludes OpenCode session aggregates.",
+            "OpenCode prefers assistant-message activity timestamps; sessions without usage messages fall back to lifetime creation-day totals.",
+            "Prompt mean/p90 excludes lifetime fallback aggregates (session_records), not timestamped message usage.",
             "USD is a public standard API-rate estimate, not subscription cost or Copilot credits.",
         ],
     }

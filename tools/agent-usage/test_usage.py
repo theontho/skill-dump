@@ -227,6 +227,138 @@ class UsageTests(unittest.TestCase):
             connection.execute("SELECT COUNT(*) FROM session_v2").fetchone()[0], 2
         )
 
+    def test_opencode_activity_dates_replace_inflated_session_creation_totals(self):
+        def stamp(day):
+            return int(datetime.fromisoformat(day).timestamp() * 1000)
+
+        with sqlite3.connect(self.db) as connection:
+            connection.executescript("""
+                CREATE TABLE session_v2 (
+                  id TEXT, directory TEXT, time_created INTEGER, model TEXT,
+                  tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+                  tokens_cache_read INTEGER, tokens_cache_write INTEGER, cost REAL,
+                  parent_id TEXT);
+                CREATE TABLE session_message (
+                  id TEXT PRIMARY KEY, session_id TEXT, type TEXT,
+                  time_created INTEGER, data TEXT);
+            """)
+            for sid, total in (("active", 1_000_000_000), ("legacy", 20)):
+                connection.execute(
+                    "INSERT INTO session_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        sid,
+                        "/work/repo",
+                        stamp("2026-11-10T12:00:00+00:00"),
+                        '{"id":"claude-opus-5.5"}',
+                        total,
+                        5,
+                        0,
+                        70,
+                        10,
+                        0,
+                        None,
+                    ),
+                )
+            for index, (day, cached, tin, output) in enumerate(
+                (
+                    ("2026-11-11T08:30:00+00:00", 70, 10, 5),
+                    ("2026-11-12T12:00:00+00:00", 150, 30, 15),
+                )
+            ):
+                data = {
+                    "time": {"completed": stamp(day)},
+                    "model": {"id": "gpt-6.1-sol"},
+                    "tokens": {
+                        "input": tin,
+                        "output": output,
+                        "reasoning": 1,
+                        "cache": {"read": cached, "write": 20},
+                    },
+                    "content": "PRIVATE fixture message must not leave SQLite",
+                }
+                connection.execute(
+                    "INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                    (
+                        f"message-{index}",
+                        "active",
+                        "assistant",
+                        stamp("2026-11-10T12:00:00+00:00"),
+                        json.dumps(data),
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, ?, ?)",
+                (
+                    "user",
+                    "active",
+                    "user",
+                    stamp("2026-11-12T12:00:00+00:00"),
+                    '{"tokens":{"input":999999999},"text":"PRIVATE fixture user text"}',
+                ),
+            )
+        self.run_cli("collect", "--days", "3", "--end", "2026-11-12", "--no-github")
+        for day, expected in (
+            ("2026-11-10", 100),
+            ("2026-11-11", 100),
+            ("2026-11-12", 200),
+        ):
+            doc = self.daily(day)
+            total = doc["repositories"][REPO]
+            self.assertEqual(
+                total["prompt_uncached"] + total["prompt_cached"], expected
+            )
+            self.assertEqual(total["calls"], 0 if day.endswith("10") else 1)
+            self.assertNotIn("PRIVATE", json.dumps(doc))
+        total = self.daily()["repositories"][REPO]
+        self.assertEqual(total["prompt_mean"], 200)
+        self.assertEqual(total["session_records"], 0)
+        self.assertEqual(
+            self.daily("2026-11-10")["repositories"][REPO]["session_records"], 1
+        )
+        report = self.run_cli(
+            "report", "--weekly", "--repo", REPO, "--end", "2026-11-12"
+        )
+        self.assertIn("Caveat:", report)
+        self.assertIn("creation day", report)
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("DELETE FROM session_v2 WHERE id='legacy'")
+        self.run_cli("collect", "--days", "3", "--end", "2026-11-12", "--no-github")
+        report = self.run_cli(
+            "report", "--weekly", "--repo", REPO, "--end", "2026-11-12"
+        )
+        self.assertNotIn("Caveat:", report)
+        self.assertIn("message activity dates", report)
+
+    def test_report_machine_label_supports_spaces_and_parentheses_without_path_escape(
+        self,
+    ):
+        self.config.write_text(
+            self.config.read_text().replace(
+                'machine = "fixture-machine"', 'machine = "lin-mid (lin-omarchy)"'
+            )
+        )
+        self.events("root", [self.usage()])
+        self.run_cli("collect", "--days", "1", "--end", "2026-11-12", "--no-github")
+        output = self.state / "lin-mid (lin-omarchy)" / "2026-11-12.json"
+        self.assertEqual(
+            json.loads(output.read_text())["machine"], "lin-mid (lin-omarchy)"
+        )
+        report = self.run_cli(
+            "report", "--weekly", "--repo", REPO, "--end", "2026-11-12"
+        )
+        self.assertIn("Machine: lin-mid (lin-omarchy)", report)
+        self.config.write_text(
+            self.config.read_text().replace(
+                'machine = "lin-mid (lin-omarchy)"', 'machine = "../outside"'
+            )
+        )
+        self.assertIn(
+            "machine label",
+            self.run_cli(
+                "collect", "--days", "1", "--end", "2026-11-12", "--no-github", ok=False
+            ),
+        )
+
     def test_claude_message_chunks_count_usage_once_without_decoding_content(self):
         folder = self.claude / "project"
         folder.mkdir(parents=True)
