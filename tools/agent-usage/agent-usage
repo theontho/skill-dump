@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Collect daily agent counts and compare two seven-day windows."""
+
+import argparse
+import fcntl
+import itertools
+import json
+import os
+import platform
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+if sys.version_info < (3, 11):  # noqa: UP036 -- deployed hosts need an actionable prerequisite check
+    sys.exit("agent-usage requires Python 3.11+; install it before using this tool")
+
+import tomllib
+
+# Resolve the installed symlink before importing the adjacent modules.
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from sources import claude, copilot, opencode
+from usage import aggregate, document, gh, merged_counts, summarize
+
+
+def config_at(path):
+    config: dict[str, Any] = {
+        "storage": "~/.local/state/agent-usage",
+        "timezone": "UTC",
+        "machine": platform.node().split(".")[0],
+        "copilot": "~/.copilot/session-state",
+        "opencode": "~/.local/share/opencode/opencode.db",
+        "claude": "~/.claude/projects",
+        "repositories": [],
+    }
+    if path.exists():
+        with path.open("rb") as stream:
+            config.update(tomllib.load(stream))
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", config["machine"]):
+        raise ValueError(
+            "machine must contain only letters, numbers, dot, underscore or dash"
+        )
+    for repo in config["repositories"]:
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo["name"]):
+            raise ValueError("repository must be owner/name")
+    return config
+
+
+@contextmanager
+def locked(state):
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / ".lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def collect(args, config):
+    if not config["repositories"]:
+        raise ValueError(
+            "configure at least one [[repositories]] entry first (see README)"
+        )
+    zone = ZoneInfo(config["timezone"])
+    end = args.end or datetime.now(zone).date() - timedelta(days=1)
+    start = end - timedelta(days=args.days - 1)
+    state = Path(config["storage"]).expanduser()
+    rates = json.loads((ROOT / "rates.json").read_text())
+    rates["models"].update(config.get("rates", {}))
+    repos = [repo["name"] for repo in config["repositories"]]
+    with locked(state):
+        records = itertools.chain(
+            copilot(config), opencode(config, state), claude(config)
+        )
+        days = aggregate(records, start, end, zone, rates)
+        merges = {
+            repo: None if args.no_github else merged_counts(repo, start, end, zone)
+            for repo in repos
+        }
+        for offset in range(args.days):
+            day = (start + timedelta(days=offset)).isoformat()
+            doc = document(
+                day, config["machine"], zone, days.get(day, []), repos, merges, rates
+            )
+            destination = state / config["machine"] / f"{day}.json"
+            destination.parent.mkdir(mode=0o700, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w", dir=destination.parent, delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                try:
+                    json.dump(doc, stream, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            print(destination)
+
+
+def weekly(args, config):
+    if args.post_issue is not None and (
+        args.repo.casefold() != "wgsextract/wgsextract-cli" or args.post_issue != 765
+    ):
+        raise ValueError(
+            "posting is restricted to WGSExtract/wgsextract-cli issue 765 (agent token waste)"
+        )
+    zone = ZoneInfo(config["timezone"])
+    end = args.end or datetime.now(zone).date() - timedelta(days=1)
+    start = end - timedelta(days=13)
+    state = Path(config["storage"]).expanduser()
+    groups: dict[str, list[list[dict[str, Any]]]] = {}
+    for path in sorted(state.glob("*/*.json")):
+        if not start.isoformat() <= path.stem <= end.isoformat():
+            continue
+        doc = json.loads(path.read_text())
+        if doc.get("timezone") != str(zone):
+            raise ValueError("cannot compare daily files with different timezones")
+        repo = doc.get("repositories", {}).get(args.repo)
+        if repo is not None:
+            index = 0 if doc["day"] > (end - timedelta(days=7)).isoformat() else 1
+            groups.setdefault(doc["machine"], [[], []])[index].append(repo)
+    lines = [
+        f"(AI): Agent usage — {args.repo}",
+        f"Rolling seven-day windows, {zone}; total tokens = cached + uncached prompt + output.",
+    ]
+    for machine, periods in sorted(groups.items()):
+        lines += [
+            "",
+            f"### Machine: {machine}",
+            "| Period | Days | Calls¹ | Prompt M | Cached M | Output M | API USD² | Mean/p90 prompt¹ | Merged PRs | Tokens/PR |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for index, rows in enumerate(periods):
+            summary = summarize(rows)
+            last = end - timedelta(days=7 * index)
+            first = last - timedelta(days=6)
+            complete = len(rows) == 7
+            merged = (
+                sum(row["merged_prs"] for row in rows)
+                if complete and all(row.get("merged_prs") is not None for row in rows)
+                else None
+            )
+            total = (
+                summary["prompt_uncached"]
+                + summary["prompt_cached"]
+                + summary["output"]
+            )
+            cost = summary["estimated_usd"]
+            cost_str = f"${cost:,.2f}" if cost is not None else "unpriced models"
+            if summary["prompt_mean"] is None:
+                sizes = "n/a"
+            else:
+                sizes = f"{summary['prompt_mean']:,.0f}/{summary['prompt_p90']:,}"
+            label = "This week" if index == 0 else "Last week"
+            lines.append(
+                f"| {label} {first}–{last} | {len(rows)}/7 | {summary['calls']:,} | "
+                f"{(summary['prompt_uncached'] + summary['prompt_cached']) / 1e6:,.2f} | "
+                f"{summary['prompt_cached'] / 1e6:,.2f} | {summary['output'] / 1e6:,.2f} | "
+                f"{cost_str} | {sizes} | {merged if merged is not None else 'n/a'} | "
+                f"{f'{total / merged:,.0f}' if merged else 'n/a'} |"
+            )
+    if not groups:
+        raise ValueError("no daily data for this repository and reporting window")
+    lines += [
+        "",
+        "¹ OpenCode lifetime session totals contribute tokens/cost, not API calls or prompt-size statistics.",
+        "² Standard public API-rate estimate, not actual subscription spend. Missing days make PR ratios n/a.",
+        "Root/child role breakdown is in daily JSON; polling share omitted to avoid reading tool/message text.",
+    ]
+    text = "\n".join(lines)
+    print(text)
+    if args.post_issue is not None and not args.dry_run:
+        owner = gh(
+            "api", "repos/WGSExtract/wgsextract-cli/issues/765", "--jq", ".user.login"
+        ).strip()
+        if owner != "theontho":
+            raise ValueError(
+                "refusing to post: target issue is not authored by the owner"
+            )
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                "765",
+                "--repo",
+                "WGSExtract/wgsextract-cli",
+                "--body-file",
+                "-",
+            ],
+            input=text,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+
+
+def timer(args):
+    if platform.system() == "Linux":
+        command = ["systemctl", "--user"]
+        command += (
+            ["enable", "--now", "agent-usage.timer"]
+            if args.action == "enable"
+            else ["disable", "--now", "agent-usage.timer"]
+            if args.action == "disable"
+            else ["status", "--no-pager", "agent-usage.timer"]
+        )
+    elif platform.system() == "Darwin":
+        domain = f"gui/{os.getuid()}"
+        label = "com.theontho.agent-usage"
+        plist = str(Path.home() / "Library/LaunchAgents" / f"{label}.plist")
+        command = (
+            ["launchctl", "bootstrap", domain, plist]
+            if args.action == "enable"
+            else ["launchctl", "bootout", f"{domain}/{label}"]
+            if args.action == "disable"
+            else ["launchctl", "print", f"{domain}/{label}"]
+        )
+    else:
+        raise ValueError("timers require Linux systemd or macOS launchd")
+    subprocess.run(command, check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=Path, default=Path.home() / ".config/agent-usage/config.toml"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    collect_parser = sub.add_parser("collect", help="rebuild the last 14 complete days")
+    collect_parser.add_argument("--days", type=int, default=14)
+    collect_parser.add_argument("--end", type=date.fromisoformat)
+    collect_parser.add_argument(
+        "--no-github", action="store_true", help="mark PR counts unavailable, not zero"
+    )
+    report_parser = sub.add_parser(
+        "report", help="print weekly markdown; posting requires --post-issue"
+    )
+    report_parser.add_argument("--weekly", action="store_true", required=True)
+    report_parser.add_argument("--repo", required=True)
+    report_parser.add_argument("--end", type=date.fromisoformat)
+    report_parser.add_argument("--post-issue", type=int)
+    report_parser.add_argument("--dry-run", action="store_true")
+    timer_parser = sub.add_parser("timer", help="opt in/out of the installed daily job")
+    timer_parser.add_argument("action", choices=("enable", "disable", "status"))
+    args = parser.parse_args()
+    try:
+        if args.command == "timer":
+            timer(args)
+        elif args.command == "collect":
+            if not 1 <= args.days <= 366:
+                raise ValueError("--days must be between 1 and 366")
+            collect(args, config_at(args.config))
+        else:
+            weekly(args, config_at(args.config))
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+        print(f"agent-usage: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

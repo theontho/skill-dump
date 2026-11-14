@@ -15,6 +15,7 @@ CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/skill-dump
 CONFIG=$CONFIG_DIR/config
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/skill-dump
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+LAUNCH_DIR=$HOME/Library/LaunchAgents
 MARKER="Managed by skill-dump"
 BEGIN_MARK="<!-- BEGIN skill-dump: generated from github.com/theontho/skill-dump; edits inside this block are overwritten -->"
 END_MARK="<!-- END skill-dump -->"
@@ -196,6 +197,7 @@ remove_stale() {
     if [[ -L $path ]] || { [[ -f $path ]] && grep -Fq "$MARKER" "$path"; }; then
       case $path in
         "$UNIT_DIR"/*) have_systemd_user && systemctl --user disable --now "$(basename "$path")" >/dev/null 2>&1 || true ;;
+        "$LAUNCH_DIR"/*) launchctl bootout "gui/$(id -u)/$(basename "$path" .plist)" >/dev/null 2>&1 || true ;;
       esac
       rm -f "$path"
       log "removed $path"
@@ -212,8 +214,8 @@ tool_dirs() {
   done
 }
 
-load_tool() { # sets DESCRIPTION BINS UNITS RESTART_ON_CHANGE REQUIRES OS
-  DESCRIPTION="" BINS="" UNITS="" RESTART_ON_CHANGE="" REQUIRES="" OS=""
+load_tool() { # sets tool.conf fields (schedules may be installed without activation)
+  DESCRIPTION="" BINS="" UNITS="" PLISTS="" INSTALL_ONLY=no RESTART_ON_CHANGE="" REQUIRES="" OS=""
   # shellcheck source=/dev/null
   . "$SD_HOME/tools/$1/tool.conf"
 }
@@ -281,11 +283,14 @@ install_tools() {
     echo "$tool $new_hash" >>"$STATE_DIR/hashes.new"
     for unit in $UNITS; do
       write_rendered "$SD_HOME/tools/$tool/$unit" "$UNIT_DIR/$unit" "#" || continue
-      ENABLE_UNITS+=("$unit")
+      [[ $INSTALL_ONLY == yes ]] || ENABLE_UNITS+=("$unit")
       if in_list "$unit" "$RESTART_ON_CHANGE" &&
         { [[ $old_hash != "$new_hash" ]] || in_list "$unit" "${CHANGED_UNITS[*]+"${CHANGED_UNITS[*]}"}"; }; then
         RESTART_UNITS+=("$unit")
       fi
+    done
+    for file in $PLISTS; do
+      write_rendered "$SD_HOME/tools/$tool/$file" "$LAUNCH_DIR/$file" || continue
     done
   done
 }
