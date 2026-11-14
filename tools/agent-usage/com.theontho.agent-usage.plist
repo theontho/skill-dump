@@ -4,6 +4,7 @@
 <dict>
   <!-- Managed by skill-dump; edits are overwritten. -->
   <key>Label</key><string>com.theontho.agent-usage</string>
+  <key>Disabled</key><true/>
   <key>ProgramArguments</key>
   <array><string>{{HOME}}/.local/bin/agent-usage</string><string>collect</string></array>
   <key>EnvironmentVariables</key>

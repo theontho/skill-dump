@@ -1,8 +1,10 @@
 """Synthetic, counts-only CLI integration tests; no real user records or network."""
 
+import argparse
 import json
 import os
 import plistlib
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +12,8 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 from metadata import project
 from sources import record
@@ -226,7 +230,7 @@ class UsageTests(unittest.TestCase):
     def test_claude_message_chunks_count_usage_once_without_decoding_content(self):
         folder = self.claude / "project"
         folder.mkdir(parents=True)
-        event = {
+        event: dict[str, Any] = {
             "type": "assistant",
             "timestamp": "2026-11-12T12:00:00Z",
             "cwd": "/work/repo",
@@ -246,13 +250,16 @@ class UsageTests(unittest.TestCase):
                 },
             },
         }
-        (folder / "session.jsonl").write_text((json.dumps(event) + "\n") * 2)
+        first = json.dumps(event) + "\n"
+        event["message"]["usage"]["output_tokens"] = 17
+        (folder / "session.jsonl").write_text(first + json.dumps(event) + "\n" + first)
         self.run_cli("collect", "--days", "1", "--end", "2026-11-12", "--no-github")
         doc = self.daily()
         total = doc["repositories"][REPO]
         self.assertEqual(total["calls"], 1)
         self.assertEqual(total["prompt_uncached"], 30)
         self.assertEqual(total["prompt_cached"], 70)
+        self.assertEqual(total["output"], 17)
         self.assertEqual(doc["agents"][0]["role"], "implementer")
         self.assertNotIn("PRIVATE", json.dumps(doc))
 
@@ -335,7 +342,44 @@ class UsageTests(unittest.TestCase):
         with (ROOT / "com.theontho.agent-usage.plist").open("rb") as stream:
             plist = plistlib.load(stream)
         self.assertEqual(plist["ProgramArguments"][-1], "collect")
+        self.assertTrue(plist["Disabled"])
         self.assertIn("Hour", plist["StartCalendarInterval"])
+
+    def test_launchd_opt_in_and_opt_out_persist_across_login(self):
+        state = self.base / "launchd.json"
+        state.write_text('{"disabled":true,"loaded":false}')
+        binary = self.base / "launchctl"
+        binary.write_text(
+            "#!" + sys.executable + "\n"
+            "import json,sys\nfrom pathlib import Path\n"
+            f"path=Path({str(state)!r})\n"
+            "state=json.loads(path.read_text())\naction=sys.argv[1]\n"
+            "if action=='enable': state['disabled']=False\n"
+            "elif action=='disable': state['disabled']=True\n"
+            "elif action=='print': sys.exit(0 if state['loaded'] else 1)\n"
+            "elif action=='bootstrap':\n"
+            " if state['disabled']: sys.exit(1)\n"
+            " state['loaded']=True\n"
+            "elif action=='bootout': state['loaded']=False\n"
+            "path.write_text(json.dumps(state))\n"
+        )
+        binary.chmod(0o755)
+        program = runpy.run_path(str(ROOT / "agent-usage"))
+        with (
+            patch("platform.system", return_value="Darwin"),
+            patch.dict(
+                os.environ, PATH=str(self.base) + os.pathsep + os.environ["PATH"]
+            ),
+        ):
+            for _ in range(2):
+                program["timer"](argparse.Namespace(action="enable"))
+            self.assertEqual(
+                json.loads(state.read_text()), {"disabled": False, "loaded": True}
+            )
+            for _ in range(2):
+                program["timer"](argparse.Namespace(action="disable"))
+            after = json.loads(state.read_text())
+            self.assertEqual(after, {"disabled": True, "loaded": False})
 
 
 if __name__ == "__main__":

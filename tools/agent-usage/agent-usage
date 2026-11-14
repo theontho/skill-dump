@@ -116,10 +116,13 @@ def weekly(args, config):
     start = end - timedelta(days=13)
     state = Path(config["storage"]).expanduser()
     groups: dict[str, list[list[dict[str, Any]]]] = {}
-    for path in sorted(state.glob("*/*.json")):
-        if not start.isoformat() <= path.stem <= end.isoformat():
-            continue
-        doc = json.loads(path.read_text())
+    with locked(state):
+        documents = [
+            json.loads(path.read_text())
+            for path in sorted(state.glob("*/*.json"))
+            if start.isoformat() <= path.stem <= end.isoformat()
+        ]
+    for doc in documents:
         if doc.get("timezone") != str(zone):
             raise ValueError("cannot compare daily files with different timezones")
         repo = doc.get("repositories", {}).get(args.repo)
@@ -215,14 +218,26 @@ def timer(args):
     elif platform.system() == "Darwin":
         domain = f"gui/{os.getuid()}"
         label = "com.theontho.agent-usage"
+        target = f"{domain}/{label}"
         plist = str(Path.home() / "Library/LaunchAgents" / f"{label}.plist")
-        command = (
-            ["launchctl", "bootstrap", domain, plist]
-            if args.action == "enable"
-            else ["launchctl", "bootout", f"{domain}/{label}"]
-            if args.action == "disable"
-            else ["launchctl", "print", f"{domain}/{label}"]
-        )
+        if args.action == "status":
+            command = ["launchctl", "print", target]
+        else:
+            subprocess.run(["launchctl", args.action, target], check=True)
+            loaded = (
+                subprocess.run(
+                    ["launchctl", "print", target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+                == 0
+            )
+            if args.action == "enable" and not loaded:
+                subprocess.run(["launchctl", "bootstrap", domain, plist], check=True)
+            elif args.action == "disable" and loaded:
+                subprocess.run(["launchctl", "bootout", target], check=True)
+            return
     else:
         raise ValueError("timers require Linux systemd or macOS launchd")
     subprocess.run(command, check=True)

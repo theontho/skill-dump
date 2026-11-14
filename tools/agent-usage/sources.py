@@ -9,6 +9,7 @@ import tempfile
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from metadata import project
 
@@ -260,11 +261,11 @@ def opencode(config, state):
 
 
 def claude(config):
-    seen = set()
+    records: dict[tuple[object, object], dict[str, Any]] = {}
     root = Path(config["claude"]).expanduser()
     for path in sorted(root.glob("**/*.jsonl")):
         with path.open(errors="replace") as stream:
-            for line in stream:
+            for index, line in enumerate(stream):
                 if '"usage"' not in line:
                     continue
                 try:
@@ -281,12 +282,10 @@ def claude(config):
                 if not repo:
                     continue
                 identity = (event.get("requestId"), message.get("id"))
-                if any(identity):
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
+                if not any(identity):
+                    identity = (str(path), index)
                 writes = number(usage.get("cache_creation_input_tokens"))
-                yield record(
+                item = record(
                     "claude",
                     path.stem,
                     repo,
@@ -300,3 +299,16 @@ def claude(config):
                     writes,
                     number(usage.get("output_tokens")),
                 )
+                if identity in records:
+                    # Streaming message chunks can repeat cumulative usage.
+                    previous = records[identity]
+                    for key in (
+                        "prompt_uncached",
+                        "prompt_cached",
+                        "cache_write",
+                        "output",
+                    ):
+                        previous[key] = max(previous[key], item[key])
+                else:
+                    records[identity] = item
+    yield from records.values()

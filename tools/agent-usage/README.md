@@ -25,6 +25,9 @@ service/timer (Linux) or `~/Library/LaunchAgents/com.theontho.agent-usage.plist`
 explicit and per machine. It runs daily at 03:15 local time (systemd adds up to
 15 minutes of jitter and catches missed runs). It only collects, never posts.
 Use `agent-usage timer disable` to opt out.
+The launchd plist ships disabled; enable/disable persists in launchd's override
+database, so installation alone never opts a Mac in at its next login and
+disabling it survives subsequent logins.
 
 For **lin-big** later: `skill-dump update`, copy/edit the example config, run one
 collection, then `agent-usage timer enable`. Do not reuse lin-mid's machine name.
@@ -95,7 +98,8 @@ denominator across machines. Missing days/PR queries produce `n/a`, not zero.
   it; `session_records` is separate. Its dates are approximate for long-lived
   sessions. A parent session ID provides the same root/child proxy.
 * Claude Code: optional recursive project JSONL, whitelist message usage/model,
-  ID and timestamp/cwd only. Message/request IDs deduplicate repeated chunks;
+  ID and timestamp/cwd only. Message/request IDs deduplicate repeated chunks,
+  retaining the maximum cumulative usage rather than an early partial output;
   `isSidechain`/a subagents directory marks implementers. No content is decoded.
 * The JSON projector scans past unwanted values as opaque lexical tokens; it
   never deserializes prompt/response strings or tool arguments. No message
