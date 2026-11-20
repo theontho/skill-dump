@@ -14,7 +14,7 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 - writes a managed block of usage notes for the installed tools into the agents' global instruction files
   (`~/.copilot/copilot-instructions.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, ... for agents that are present),
   plus `agents/hosts/<hostname>.md` when one exists for that computer;
-- sets git hooks in the clone (`core.hooksPath=githooks`), so every `git pull` or checkout there reinstalls.
+- sets git hooks in the clone (`core.hooksPath=githooks`), so every `git pull` or checkout there reinstalls. Hooks in other checkouts of the repository (a `git worktree` or a second clone) do nothing, so working on skill-dump never repoints your install; run `skill-dump install` in a checkout by hand to install from it.
   There is no background update service: sync a computer with `skill-dump update` (or `git pull` in the clone).
   Services whose tool changed are restarted.
 
