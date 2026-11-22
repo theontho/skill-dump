@@ -949,7 +949,7 @@ class CoordinatorTest(unittest.TestCase):
                                 "cores": 1, "mem": GIB, "label": "y",
                                 "disk": {"/": 50 * GIB}})  # fmt: skip
         self.assertEqual(second["state"], "waiting")
-        self.assertIn("of disk free on /", second["reason"])
+        self.assertIn(f"of disk free on {ac.mount_of('/')}", second["reason"])
 
     def test_named_locks(self):
         self.assertIn("locked", self.c.handle(
@@ -1146,7 +1146,68 @@ class ServiceTest(unittest.TestCase):
         self.server.wait(10)
         result = self.cli("status")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("systemctl --user start agent-coord", result.stderr)
+        self.assertIn(ac.START_HINT, result.stderr)
+
+
+@unittest.skipUnless(ac.WINDOWS, "Windows backend")
+class WindowsTest(unittest.TestCase):
+    def test_alive_checks_without_killing(self):
+        # os.kill(pid, 0) would TerminateProcess the target on Windows.
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE)  # fmt: skip
+        try:
+            self.assertTrue(ac.alive(child.pid))
+            self.assertTrue(ac.alive(child.pid))
+            self.assertIsNone(child.poll())
+        finally:
+            child.stdin.close()
+            child.wait(10)
+        self.assertFalse(ac.alive(child.pid))
+        self.assertFalse(ac.alive(0))
+
+    def test_measurements(self):
+        sample = ac.measure(0.2)
+        self.assertGreater(sample["available"], 0)
+        self.assertGreater(ac.mem_total(), sample["available"] // 2)
+        self.assertGreaterEqual(sample["busy"], 0)
+        self.assertIsNotNone(ac._cpu_seconds(os.getpid()))
+        self.assertTrue(ac.mount_of(__file__).endswith("\\"))
+        self.assertGreater(ac.disk_free(ac.mount_of(__file__)), 0)
+
+    def test_job_object_caps_memory_and_reports_cores(self):
+        code = ("import os, sys\n"
+                "assert os.environ['COMPUTE_LEASE_CORES'] == '1'\n"
+                "try:\n    x = bytearray(int(sys.argv[1]))\nexcept MemoryError:\n    sys.exit(7)\n")
+        env = dict(os.environ, COMPUTE_LEASE_CORES="1")
+        for size, expected in ((16 * 1024**2, 0), (512 * 1024**2, 7)):
+            child, job = ac.spawn_limited([sys.executable, "-c", code, str(size)], 1, 128 * 1024**2, env)
+            self.assertIsNotNone(job)
+            self.assertEqual(child.wait(30), expected)
+
+    def test_archive_paths_from_the_environment(self):
+        with tempfile.TemporaryDirectory() as nas, patch.dict(os.environ, {"AGENT_COORD_ARCHIVE": nas}):
+            mounts = ac.archive_mounts()
+            self.assertEqual(len(ac.archive_writes(["x", "-o", os.path.join(nas, "out")], "C:\\", mounts)), 1)
+            self.assertEqual(ac.archive_writes(["x", "-o", nas + "ty"], "C:\\", mounts), [])
+
+
+@unittest.skipUnless(ac.WINDOWS, "Windows backend")
+class WindowsServiceTest(ServiceTest):
+    def test_one_server_per_endpoint(self):
+        second = subprocess.run(
+            [sys.executable, "-c", "import agent_coord as ac, pathlib, sys; ac.serve(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]))",
+             str(self.sock), str(Path(self.tmp.name, "other.json"))],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=30)  # fmt: skip
+        self.assertIn("already serving", second.stdout)
+        self.assertEqual(self.cli("status").returncode, 0)
+
+    def test_requests_need_the_token(self):
+        endpoint = json.loads(self.sock.read_text())
+        bad = Path(self.tmp.name, "bad.json")
+        bad.write_text(json.dumps({**endpoint, "token": "wrong"}))
+        with self.assertRaises(SystemExit) as caught:
+            ac.call({"op": "status"}, bad)
+        self.assertIn("bad token", str(caught.exception))
 
 
 if __name__ == "__main__":

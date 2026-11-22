@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """agent-coord: a local coordinator for the agents (and people) on this computer.
 
-A user service (agent-coord.service) keeps the state; agents talk to it with
-this same file as a CLI. It hands out CPU/RAM leases first come, first served
-(running QEMU guests count at their measured use), so heavy jobs queue instead
-of piling up, and it carries messages between agents.
+A user service keeps the state; agents talk to it with this same file as a
+CLI. It hands out CPU/RAM leases first come, first served (running QEMU guests
+count at their measured use), so heavy jobs queue instead of piling up, and it
+carries messages between agents.
+
+On Linux the service is agent-coord.service (systemd user unit) on a Unix
+socket. On Windows it is a background process on a loopback TCP port, found
+through a token-protected endpoint file, started on demand by the CLI (and at
+logon after "agent-coord service install").
 """
 
 import argparse
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -22,13 +29,19 @@ import threading
 import time
 from pathlib import Path
 
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
-SOCKET = RUNTIME / "sock"
-STATE_FILE = (
-    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    / "agent-coord"
-    / "state.json"
-)
+WINDOWS = sys.platform == "win32"
+
+if WINDOWS:
+    _LOCAL = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    RUNTIME = _LOCAL / "agent-coord"
+    # The endpoint file (port, token, pid) stands in for the Unix socket.
+    SOCKET = RUNTIME / "endpoint.json"
+    _STATE_HOME = Path(os.environ["XDG_STATE_HOME"]) if os.environ.get("XDG_STATE_HOME") else _LOCAL
+else:
+    RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
+    SOCKET = RUNTIME / "sock"
+    _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+STATE_FILE = _STATE_HOME / "agent-coord" / "state.json"
 # One JSON line per lease event, next to the state; rotated by size.
 HISTORY_FILE = STATE_FILE.with_name("history.jsonl")
 HISTORY_MAX_BYTES = 8 * 1024**2
@@ -72,7 +85,9 @@ QUOTA
                   [--headroom N] [--expect D] [--max-wait D] -- CMD ...
       Wait in line until N cores and SIZE of RAM are free, then run CMD capped
       at them (systemd scope: CPUQuota, MemoryMax; exceeding MemoryMax kills
-      CMD) at nice 19 and idle IO priority. CMD sees COMPUTE_LEASE_CORES=N:
+      CMD) at nice 19 and idle IO priority. On Windows CMD runs in a job object
+      (hard CPU rate cap, job memory limit, idle priority; allocations past the
+      limit fail). CMD sees COMPUTE_LEASE_CORES=N:
       give its tools that many threads. The lease ends when CMD exits.
   agent-coord hold --cores N --mem SIZE --label TEXT --pid PID [--exclusive]
       Register a job that is already running (no waiting: it is running),
@@ -121,9 +136,14 @@ MESSAGES
                                            started, ended, cancelled) with
                                            wait/run times; default last 24h.
 
+SERVICE (Windows; on Linux use systemctl --user ... agent-coord)
+  agent-coord service install|uninstall|start|stop|restart|status
+      install starts the service at logon (HKCU Run key) and now. Without it,
+      the CLI starts the service on demand.
+
 Lease anything using more than 2 cores or 2 GB for more than a few minutes.
 Running QEMU guests and other unleased load are measured and counted. --as NAME sets who you are
-(default: your git worktree's folder name). Sizes: 512M, 8G.
+(default: $AGENT_COORD_AS, else your git worktree's folder name). Sizes: 512M, 8G.
 """
 
 
@@ -283,6 +303,8 @@ def measure_vms(sample: float = 1.0) -> list[dict]:
 
 
 def default_agent() -> str:
+    if name := os.environ.get("AGENT_COORD_AS", "").strip():
+        return name
     try:
         top = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -293,6 +315,227 @@ def default_agent() -> str:
     except (OSError, subprocess.SubprocessError):
         pass
     return Path.cwd().name
+
+
+def load_average() -> list[float] | None:
+    return list(os.getloadavg()) if hasattr(os, "getloadavg") else None
+
+
+# ---------------------------------------------------------------- Windows
+# The same measurements from the Win32 API instead of /proc.
+
+if WINDOWS:
+    import ctypes
+    import msvcrt
+    import winreg
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+    _HANDLE, _DWORD, _BOOL = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+    _U64 = ctypes.c_uint64
+    _SIZE = ctypes.c_size_t
+
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", _DWORD), ("dwMemoryLoad", _DWORD),
+                    ("ullTotalPhys", _U64), ("ullAvailPhys", _U64),
+                    ("ullTotalPageFile", _U64), ("ullAvailPageFile", _U64),
+                    ("ullTotalVirtual", _U64), ("ullAvailVirtual", _U64),
+                    ("ullAvailExtendedVirtual", _U64)]  # fmt: skip
+
+    class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [("cb", _DWORD), ("PageFaultCount", _DWORD),
+                    ("PeakWorkingSetSize", _SIZE), ("WorkingSetSize", _SIZE),
+                    ("QuotaPeakPagedPoolUsage", _SIZE), ("QuotaPagedPoolUsage", _SIZE),
+                    ("QuotaPeakNonPagedPoolUsage", _SIZE), ("QuotaNonPagedPoolUsage", _SIZE),
+                    ("PagefileUsage", _SIZE), ("PeakPagefileUsage", _SIZE),
+                    ("PrivateUsage", _SIZE)]  # fmt: skip
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", _DWORD), ("cntUsage", _DWORD), ("th32ProcessID", _DWORD),
+                    ("th32DefaultHeapID", _SIZE), ("th32ModuleID", _DWORD),
+                    ("cntThreads", _DWORD), ("th32ParentProcessID", _DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", _DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]  # fmt: skip
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", _DWORD),
+                    ("MinimumWorkingSetSize", _SIZE), ("MaximumWorkingSetSize", _SIZE),
+                    ("ActiveProcessLimit", _DWORD), ("Affinity", _SIZE),
+                    ("PriorityClass", _DWORD), ("SchedulingClass", _DWORD)]  # fmt: skip
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, _U64) for n in ("ReadOperationCount", "WriteOperationCount",
+                                        "OtherOperationCount", "ReadTransferCount",
+                                        "WriteTransferCount", "OtherTransferCount")]  # fmt: skip
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", _IO_COUNTERS), ("ProcessMemoryLimit", _SIZE),
+                    ("JobMemoryLimit", _SIZE), ("PeakProcessMemoryUsed", _SIZE),
+                    ("PeakJobMemoryUsed", _SIZE)]  # fmt: skip
+
+    class _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+        _fields_ = [("ControlFlags", _DWORD), ("CpuRate", _DWORD)]
+
+    def _sig(fn, restype, *argtypes):
+        fn.restype, fn.argtypes = restype, list(argtypes)
+        return fn
+
+    _OpenProcess = _sig(_k32.OpenProcess, _HANDLE, _DWORD, _BOOL, _DWORD)
+    _CloseHandle = _sig(_k32.CloseHandle, _BOOL, _HANDLE)
+    _WaitForSingleObject = _sig(_k32.WaitForSingleObject, _DWORD, _HANDLE, _DWORD)
+    _GetProcessTimes = _sig(_k32.GetProcessTimes, _BOOL, _HANDLE, *[ctypes.POINTER(_U64)] * 4)
+    _GetSystemTimes = _sig(_k32.GetSystemTimes, _BOOL, *[ctypes.POINTER(_U64)] * 3)
+    _GlobalMemoryStatusEx = _sig(_k32.GlobalMemoryStatusEx, _BOOL,
+                                 ctypes.POINTER(_MEMORYSTATUSEX))
+    _GetProcessMemoryInfo = _sig(_k32.K32GetProcessMemoryInfo, _BOOL, _HANDLE,
+                                 ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX), _DWORD)
+    _CreateToolhelp32Snapshot = _sig(_k32.CreateToolhelp32Snapshot, _HANDLE, _DWORD, _DWORD)
+    _Process32FirstW = _sig(_k32.Process32FirstW, _BOOL, _HANDLE,
+                            ctypes.POINTER(_PROCESSENTRY32W))
+    _Process32NextW = _sig(_k32.Process32NextW, _BOOL, _HANDLE,
+                           ctypes.POINTER(_PROCESSENTRY32W))
+    _GetVolumePathNameW = _sig(_k32.GetVolumePathNameW, _BOOL, wintypes.LPCWSTR,
+                               wintypes.LPWSTR, _DWORD)
+    _CreateJobObjectW = _sig(_k32.CreateJobObjectW, _HANDLE, ctypes.c_void_p, wintypes.LPCWSTR)
+    _SetInformationJobObject = _sig(_k32.SetInformationJobObject, _BOOL, _HANDLE,
+                                    ctypes.c_int, ctypes.c_void_p, _DWORD)
+    _AssignProcessToJobObject = _sig(_k32.AssignProcessToJobObject, _BOOL, _HANDLE, _HANDLE)
+    _NtResumeProcess = _sig(_ntdll.NtResumeProcess, ctypes.c_long, _HANDLE)
+
+    _SYNCHRONIZE, _QUERY_LIMITED = 0x00100000, 0x1000
+    _WAIT_TIMEOUT, _ERROR_ACCESS_DENIED = 0x102, 5
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _TICKS = 10_000_000  # FILETIME units (100 ns) per second
+
+    def _open(pid: int, access: int = _QUERY_LIMITED):
+        return _OpenProcess(access, False, pid) if pid > 0 else None
+
+    def alive(pid: int) -> bool:  # noqa: F811 - os.kill(pid, 0) would terminate it
+        handle = _open(pid, _SYNCHRONIZE | _QUERY_LIMITED)
+        if not handle:
+            return pid > 0 and ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            return _WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
+        finally:
+            _CloseHandle(handle)
+
+    def _memory_status() -> "_MEMORYSTATUSEX":
+        status = _MEMORYSTATUSEX(dwLength=ctypes.sizeof(_MEMORYSTATUSEX))
+        if not _GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return status
+
+    def mem_total() -> int:  # noqa: F811
+        return int(_memory_status().ullTotalPhys)
+
+    def mem_available() -> int:  # noqa: F811
+        return int(_memory_status().ullAvailPhys)
+
+    def _process_times(pid: int) -> tuple[int, float] | None:
+        """(creation time, CPU seconds) of a running pid, else None."""
+        handle = _open(pid, _SYNCHRONIZE | _QUERY_LIMITED)
+        if not handle:
+            return None
+        try:
+            if _WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT:
+                return None
+            created, ended, kernel, user = _U64(), _U64(), _U64(), _U64()
+            if not _GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(ended),
+                                    ctypes.byref(kernel), ctypes.byref(user)):  # fmt: skip
+                return None
+            return created.value, (kernel.value + user.value) / _TICKS
+        finally:
+            _CloseHandle(handle)
+
+    def _cpu_seconds(pid: int) -> float | None:  # noqa: F811
+        times = _process_times(pid)
+        return times[1] if times else None
+
+    def _footprint(pid: int) -> int:  # noqa: F811
+        """Working set or private commit, whichever is larger: what the
+        process needs in RAM (the counterpart of VmRSS + VmSwap)."""
+        handle = _open(pid, _SYNCHRONIZE | _QUERY_LIMITED)
+        if not handle:
+            return 0
+        try:
+            if _WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT:
+                return 0
+            counters = _PROCESS_MEMORY_COUNTERS_EX(cb=ctypes.sizeof(_PROCESS_MEMORY_COUNTERS_EX))
+            if not _GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return 0
+            return int(max(counters.WorkingSetSize, counters.PrivateUsage))
+        finally:
+            _CloseHandle(handle)
+
+    def _processes() -> list[tuple[int, int, str]]:
+        """(pid, parent pid, exe name) of every process."""
+        snap = _CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == _INVALID_HANDLE:
+            return []
+        found = []
+        try:
+            entry = _PROCESSENTRY32W(dwSize=ctypes.sizeof(_PROCESSENTRY32W))
+            ok = _Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                found.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+                ok = _Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            _CloseHandle(snap)
+        return found
+
+    def tree_footprint(pid: int) -> int:  # noqa: F811
+        """Footprint of pid and its descendants. Windows reuses parent pids,
+        so a child counts only if it was created after its parent."""
+        root = _process_times(pid)
+        if root is None:
+            return 0
+        children: dict[int, list[int]] = {}
+        for child, parent, _name in _processes():
+            if child != parent:
+                children.setdefault(parent, []).append(child)
+        total, seen, stack = 0, set(), [(pid, root[0])]
+        while stack:
+            current, created = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            total += _footprint(current)
+            for child in children.get(current, ()):
+                times = _process_times(child)
+                if times and times[0] >= created:
+                    stack.append((child, times[0]))
+        return total
+
+    def _host_busy() -> tuple[float, float]:  # noqa: F811
+        idle, kernel, user = _U64(), _U64(), _U64()
+        if not _GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        total = kernel.value + user.value  # kernel time includes idle time
+        return (total - idle.value) / _TICKS, total / _TICKS
+
+    def measure_vms(sample: float = 1.0) -> list[dict]:  # noqa: F811
+        """Running QEMU guests and WSL2/Hyper-V worker processes (vmmem)."""
+        guests: dict[int, dict] = {}
+        for pid, _parent, exe in _processes():
+            name = exe.lower()
+            if name.startswith("qemu-system"):
+                guests[pid] = {"pid": pid, "name": Path(exe).stem}
+            elif name in ("vmmem", "vmmem.exe", "vmmemwsl", "vmmemwsl.exe"):
+                guests[pid] = {"pid": pid, "name": "wsl" if "wsl" in name else "hyper-v"}
+        before = {pid: _cpu_seconds(pid) for pid in guests}
+        if guests:
+            time.sleep(sample)
+        for pid, guest in guests.items():
+            after, start = _cpu_seconds(pid), before[pid]
+            guest["cores"] = (round((after - start) / sample, 1)
+                              if after is not None and start is not None else 0.0)  # fmt: skip
+            guest["mem"] = _footprint(pid)
+        # Worker processes this user may not open measure as nothing: leave
+        # them to the available-memory check instead of listing zeros.
+        return [g for g in guests.values() if g["mem"] or g["cores"]]
 
 
 # ---------------------------------------------------------------- service
@@ -1024,6 +1267,9 @@ class Coordinator:
             )
         return {"messages": mine}
 
+    def op_ping(self, _req: dict, _agent: str) -> dict:
+        return {"pid": os.getpid()}
+
     def op_agents(self, _req: dict, _agent: str) -> dict:
         agents = sorted(self.state["agents"].items(),
                         key=lambda kv: -kv[1].get("last_seen", 0))  # fmt: skip
@@ -1038,7 +1284,7 @@ class Coordinator:
             "leases": self.state["leases"],
             "queue": [{**x, "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
                       for x in self.state["queue"]],
-            "vms": self._vms(), "load": os.getloadavg(),
+            "vms": self._vms(), "load": load_average(),
             "locks": self.state["locks"],
             "disks": {m: {"free": self.disk_free(m), "reserved": self._reserved(m)}
                       for m in sorted({m for x in self.state["leases"]
@@ -1052,30 +1298,61 @@ class Coordinator:
 def serve(
     socket_path: Path | None = None, state_file: Path | None = None, **coordinator_args
 ) -> None:
+    """Serve requests until stopped. On Windows socket_path is the endpoint
+    file, and a second server for the same endpoint exits at once."""
     socket_path, state_file = socket_path or SOCKET, state_file or STATE_FILE
-    coordinator = Coordinator(state_file, **coordinator_args)
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    socket_path.unlink(missing_ok=True)
+    instance = None
+    if WINDOWS:
+        instance = _claim_instance(socket_path)
+        if instance is None:
+            print(f"agent-coord: already serving {socket_path}", flush=True)
+            return
+    else:
+        socket_path.unlink(missing_ok=True)
+    coordinator = Coordinator(state_file, **coordinator_args)
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self) -> None:
             line = self.rfile.readline()
             try:
-                reply = coordinator.handle(json.loads(line))
-            except (ValueError, TypeError, KeyError) as e:
+                req = json.loads(line)
+                if WINDOWS and not hmac.compare_digest(
+                        str(req.pop("token", "")), self.server.token):  # fmt: skip
+                    reply = {"error": "bad token (is another service using this endpoint?)"}
+                elif WINDOWS and req.get("op") == "shutdown":
+                    reply = {"stopping": os.getpid()}
+                    threading.Thread(target=self.server.shutdown).start()
+                else:
+                    reply = coordinator.handle(req)
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
                 reply = {"error": f"bad request: {e}"}
             self.wfile.write(json.dumps(reply).encode() + b"\n")
 
-    class Server(socketserver.ThreadingUnixStreamServer):
-        daemon_threads = True
+    if WINDOWS:
+        class Server(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = False  # SO_REUSEADDR would let others share the port
+
+        address = ("127.0.0.1", 0)
+    else:
+        class Server(socketserver.ThreadingUnixStreamServer):
+            daemon_threads = True
+
+        address = str(socket_path)
 
     # Measure before answering anyone: admission needs real numbers, and the
     # smoothed CPU starts from a real reading rather than zero.
     first = coordinator.measure()
     coordinator.vms, coordinator.available = first["vms"], first["available"]
     coordinator.busy = first["busy"]
-    with Server(str(socket_path), Handler) as server:
-        os.chmod(socket_path, 0o600)
+    with Server(address, Handler) as server:
+        if WINDOWS:
+            server.token = secrets.token_hex(16)
+            _write_endpoint(socket_path, {"port": server.server_address[1],
+                                          "token": server.token, "pid": os.getpid()})  # fmt: skip
+        else:
+            os.chmod(socket_path, 0o600)
 
         def ticker() -> None:
             while True:
@@ -1089,31 +1366,91 @@ def serve(
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(
             target=server.shutdown).start())  # fmt: skip
         print(f"agent-coord: serving on {socket_path}", flush=True)
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        finally:
+            if WINDOWS:
+                _remove_endpoint(socket_path)
+                _release_instance(instance)
+                print("agent-coord: stopped", flush=True)
+
+
+def _claim_instance(endpoint: Path):
+    """An open file holding the endpoint's lock, or None if a server holds it."""
+    handle = open(endpoint.with_name(endpoint.name + ".lock"), "a+b")  # noqa: SIM115
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_instance(handle) -> None:
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    handle.close()
+
+
+def _write_endpoint(path: Path, data: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+def _remove_endpoint(path: Path) -> None:
+    """Remove the endpoint file if it still names this process."""
+    try:
+        if json.loads(path.read_text()).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 # ---------------------------------------------------------------- client
 
+_DEFAULT_SOCKET = SOCKET
+START_HINT = ("Start it: agent-coord service start (agent-coord service status shows its log)"
+              if WINDOWS else "Start it: systemctl --user start agent-coord")
 
-def call(request: dict, socket_path: Path | None = None, retry: float = 0) -> dict:
-    """Send request; retry for up to retry seconds while the service restarts."""
+
+def call(request: dict, socket_path: Path | None = None, retry: float = 0,
+         autostart: bool = True) -> dict:
+    """Send request; retry for up to retry seconds while the service restarts.
+    On Windows the default service is started on demand."""
     deadline = time.monotonic() + retry
+    started = False
     while True:
         try:
             return _call(request, socket_path or SOCKET)
         except _ServiceError:
             raise
         except SystemExit:
-            if time.monotonic() >= deadline:
+            if (WINDOWS and autostart and not started and socket_path is None
+                    and SOCKET == _DEFAULT_SOCKET):  # fmt: skip
+                started = True
+                start_service()
+                deadline = max(deadline, time.monotonic() + 20)
+            elif time.monotonic() >= deadline:
                 raise
-            time.sleep(1)
+            time.sleep(0.5 if started else 1)
 
 
 def _call(request: dict, socket_path: Path) -> dict:
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        if WINDOWS:
+            endpoint = json.loads(socket_path.read_text())
+            request = {**request, "token": endpoint["token"]}
+            sock = socket.create_connection(("127.0.0.1", int(endpoint["port"])), timeout=30)
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(30)
             sock.connect(str(socket_path))
+        with sock:
             sock.sendall(json.dumps(request).encode() + b"\n")
             data = b""
             while not data.endswith(b"\n"):
@@ -1121,11 +1458,8 @@ def _call(request: dict, socket_path: Path) -> dict:
                 if not chunk:
                     break
                 data += chunk
-    except OSError as e:
-        raise SystemExit(
-            f"agent-coord: the service isn't reachable ({e}). "
-            "Start it: systemctl --user start agent-coord"
-        ) from e
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f"agent-coord: the service isn't reachable ({e}). {START_HINT}") from e
     try:
         reply = json.loads(data)
     except ValueError as e:  # cut off mid-reply, e.g. by a service restart
@@ -1137,6 +1471,121 @@ def _call(request: dict, socket_path: Path) -> dict:
 
 class _ServiceError(SystemExit):
     """The service answered with an error (not worth retrying)."""
+
+
+# ---------------------------------------------------------------- Windows service
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+SERVICE_LOG = RUNTIME / "service.log"
+
+
+def _service_command() -> list[str]:
+    exe = Path(sys.executable)
+    windowless = exe.with_name("pythonw.exe")
+    return [str(windowless if windowless.exists() else exe), os.path.realpath(__file__), "serve"]
+
+
+def start_service() -> None:
+    """Start the service detached from this console and, where the job
+    allows it, from the calling job (an agent's shell)."""
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    try:
+        if SERVICE_LOG.stat().st_size > 1024**2:
+            SERVICE_LOG.replace(SERVICE_LOG.with_name(SERVICE_LOG.name + ".1"))
+    except OSError:
+        pass
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    flags = 0x00000008 | 0x00000200 | 0x08000000
+    with open(SERVICE_LOG, "ab") as log:
+        for breakaway in (0x01000000, 0):  # CREATE_BREAKAWAY_FROM_JOB, if allowed
+            try:
+                subprocess.Popen(_service_command(), stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=log, cwd=str(RUNTIME), close_fds=True,
+                                 creationflags=flags | breakaway)  # fmt: skip
+                return
+            except OSError:
+                if not breakaway:
+                    raise
+
+
+def _service_pid() -> int | None:
+    try:
+        return int(call({"op": "ping"}, autostart=False)["pid"])
+    except SystemExit:
+        return None
+
+
+def _wait(predicate, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.3)
+    return predicate()
+
+
+def _stop_service() -> bool:
+    """Stop the service; True if it was running."""
+    pid = _service_pid()
+    if pid is None:
+        return False
+    try:
+        call({"op": "shutdown"}, autostart=False)
+    except SystemExit:
+        pass
+    if not _wait(lambda: not alive(pid), 15):
+        os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+        _wait(lambda: not alive(pid), 5)
+    return True
+
+
+def _logon_command() -> str | None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            return winreg.QueryValueEx(key, "agent-coord")[0]
+    except OSError:
+        return None
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    action = args.service_action
+    if not WINDOWS:
+        raise SystemExit("agent-coord service is for Windows; here use "
+                         f"systemctl --user {action} agent-coord")  # fmt: skip
+    if action == "install":
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            winreg.SetValueEx(key, "agent-coord", 0, winreg.REG_SZ,
+                              subprocess.list2cmdline(_service_command()))  # fmt: skip
+        print("agent-coord: starts at logon (HKCU Run key)")
+        action = "start"
+    if action == "uninstall":
+        _stop_service()
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:  # fmt: skip
+                winreg.DeleteValue(key, "agent-coord")
+        except OSError:
+            pass
+        print("agent-coord: stopped; no longer starts at logon")
+        return 0
+    if action in ("stop", "restart"):
+        print("agent-coord: stopped" if _stop_service() else "agent-coord: was not running")
+        if action == "stop":
+            return 0
+    if action in ("start", "restart"):
+        if (pid := _service_pid()) is None:
+            start_service()
+            _wait(lambda: _service_pid() is not None, 20)
+            pid = _service_pid()
+        if pid is None:
+            raise SystemExit(f"agent-coord: the service did not start; see {SERVICE_LOG}")
+        print(f"agent-coord: running (pid {pid})")
+        return 0
+    pid = _service_pid()
+    print(f"service:  {f'running (pid {pid})' if pid else 'not running'}")
+    print(f"logon:    {_logon_command() or 'not installed (starts on demand)'}")
+    print(f"endpoint: {SOCKET}\nstate:    {STATE_FILE}\nlog:      {SERVICE_LOG}")
+    return 0 if pid else 3
 
 
 def _wait_for(lease_id: str, reply: dict, max_wait: float | None) -> None:
@@ -1163,6 +1612,11 @@ def mount_of(path: str) -> str:
     full = Path(os.path.realpath(os.path.expanduser(path)))
     while not full.exists() and full != full.parent:
         full = full.parent
+    if WINDOWS:
+        buf = ctypes.create_unicode_buffer(1024)
+        if _GetVolumePathNameW(str(full), buf, len(buf)):
+            return buf.value
+        return full.anchor or str(full)
     best = "/"
     for line in Path("/proc/mounts").read_text().splitlines():
         point = line.split()[1].replace("\\040", " ")
@@ -1174,6 +1628,8 @@ def mount_of(path: str) -> str:
 
 
 def disk_free(mount: str) -> int:
+    if WINDOWS:
+        return shutil.disk_usage(mount).free  # free to this user, like f_bavail
     st = os.statvfs(mount)
     return st.f_bavail * st.f_frsize
 
@@ -1187,8 +1643,12 @@ _OUTPUT_OPTIONS = {"-o", "-O", "--output", "--out", "--outdir", "--output-dir",
 
 def archive_mounts() -> list[str]:
     """Mount points of the HDD archive pools (ZFS): reference archives only;
-    active work (alignment, sorting, calling) belongs on the SSDs."""
-    mounts = []
+    active work (alignment, sorting, calling) belongs on the SSDs.
+    AGENT_COORD_ARCHIVE (paths separated by os.pathsep) adds more, e.g. a
+    NAS share on Windows, which has no /proc/mounts."""
+    mounts = [p for p in os.environ.get("AGENT_COORD_ARCHIVE", "").split(os.pathsep) if p]
+    if WINDOWS:
+        return [os.path.realpath(os.path.expanduser(m)) for m in mounts]
     for line in Path("/proc/mounts").read_text().splitlines():
         fields = line.split()
         if len(fields) > 2 and fields[2] == "zfs":
@@ -1197,8 +1657,12 @@ def archive_mounts() -> list[str]:
 
 
 def _on_archive(path: str, mounts: list[str]) -> str | None:
-    full = os.path.realpath(os.path.expanduser(path))
-    return next((m for m in mounts if full == m or full.startswith(m.rstrip("/") + "/")), None)
+    full = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+    for m in mounts:
+        root = os.path.normcase(os.path.realpath(m))
+        if full == root or full.startswith(root.rstrip(os.sep) + os.sep):
+            return m
+    return None
 
 
 def archive_writes(cmd: list[str], cwd: str, mounts: list[str]) -> list[str]:
@@ -1235,6 +1699,54 @@ def limited(cmd: list[str], cores: float, mem: int) -> list[str]:
     ]  # fmt: skip
 
 
+def _job_for(cores: float, mem: int):
+    """A Windows job object capping its processes at cores (hard CPU rate
+    cap) and mem (job commit limit) at idle priority, killed when the last
+    handle (this client's) closes: the counterpart of the systemd scope."""
+    job = _CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    # PRIORITY_CLASS | JOB_MEMORY | KILL_ON_JOB_CLOSE
+    limits.BasicLimitInformation.LimitFlags = 0x20 | 0x200 | 0x2000
+    limits.BasicLimitInformation.PriorityClass = 0x40  # IDLE_PRIORITY_CLASS ~ nice 19
+    limits.JobMemoryLimit = max(int(mem), 16 * 1024**2)
+    if not _SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    total = os.cpu_count() or 1
+    if cores < total:
+        rate = _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
+            ControlFlags=0x1 | 0x4,  # ENABLE | HARD_CAP
+            CpuRate=min(max(int(cores / total * 10000), 1), 10000))  # fmt: skip
+        if not _SetInformationJobObject(job, 15, ctypes.byref(rate), ctypes.sizeof(rate)):
+            print(f"agent-coord: no CPU rate cap ({ctypes.WinError(ctypes.get_last_error())})",
+                  file=sys.stderr)  # fmt: skip
+    return job
+
+
+def spawn_limited(cmd: list[str], cores: float, mem: int, env: dict):
+    """(Popen, keep-alive handle) for cmd capped at cores and mem."""
+    if not WINDOWS:
+        return subprocess.Popen(limited(cmd, cores, mem), env=env), None
+    # CreateProcess finds only .exe on PATH itself: resolve .cmd/.bat etc.
+    # through PATHEXT, as a shell would.
+    exe = shutil.which(cmd[0], path=env.get("PATH"))
+    cmd = [exe or cmd[0], *cmd[1:]]
+    try:
+        job = _job_for(cores, mem)
+    except OSError as e:
+        print(f"agent-coord: no job object ({e}); running uncapped at low priority",
+              file=sys.stderr)  # fmt: skip
+        return subprocess.Popen(cmd, env=env, creationflags=0x40), None
+    # Start suspended, so nothing the command starts escapes the job.
+    child = subprocess.Popen(cmd, env=env, creationflags=0x4)  # CREATE_SUSPENDED
+    if not _AssignProcessToJobObject(job, int(child._handle)):  # noqa: SLF001
+        print(f"agent-coord: not capped ({ctypes.WinError(ctypes.get_last_error())})",
+              file=sys.stderr)  # fmt: skip
+    _NtResumeProcess(int(child._handle))  # noqa: SLF001
+    return child, job
+
+
 def parse_disk(text: str) -> tuple[str, int]:
     path, sep, size = text.rpartition(":")
     if not sep or not path:
@@ -1269,12 +1781,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     def forward(signum: int, _frame: object) -> None:
         if child is not None and child.poll() is None:
-            child.send_signal(signum)
+            if not WINDOWS:
+                child.send_signal(signum)
+            elif signum == signal.SIGTERM:
+                child.terminate()
+            # Windows: Ctrl+C/Ctrl+Break reach the child through the console.
         else:
             raise KeyboardInterrupt
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, forward)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), forward)
     try:
         _wait_for(lease_id, reply, args.max_wait)
         print(f"agent-coord: {lease_id} started ({args.cores:g} cores, "
@@ -1284,9 +1801,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         # get killed at it: tell them the lease's memory (heap up to 60% of it).
         java = f"-XX:MaxRAM={args.mem} -XX:MaxRAMPercentage=60"
         env["JAVA_TOOL_OPTIONS"] = f"{env.get('JAVA_TOOL_OPTIONS', '')} {java}".strip()
-        child = subprocess.Popen(limited(command, args.cores, args.mem), env=env)
+        child, _job = spawn_limited(command, args.cores, args.mem, env)
         code = child.wait()
-        if code == -signal.SIGKILL:
+        if code == -getattr(signal, "SIGKILL", 9):
             print(f"agent-coord: {lease_id} was killed; if it used more than "
                   f"--mem {human(args.mem)}, lease more", file=sys.stderr)  # fmt: skip
         end["code"] = 128 - code if code < 0 else code
@@ -1325,10 +1842,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(s, indent=2))
         return 0
     cap, free = s["capacity"], s["free"]
-    load = " ".join(f"{x:.1f}" for x in s["load"])
+    load = " ".join(f"{x:.1f}" for x in s["load"]) if s.get("load") else None
     print(f"{cap['cores']:g} cores, {human(cap['mem'])} for leases "
           f"({human(cap['reserve'])} kept back); free {free['cores']:.1f} cores, "
-          f"{human(free['mem'])}; load {load}")  # fmt: skip
+          f"{human(free['mem'])}" + (f"; load {load}" if load else ""))  # fmt: skip
     if s.get("available") is not None:
         print(f"memory actually available now: {human(s['available'])} "
               f"(leases need theirs plus {human(cap['reserve'])} of it)")
@@ -1515,6 +2032,8 @@ def main(argv: list[str] | None = None) -> int:
     unlock.add_argument("--force", action="store_true")
     subs.add_parser("release").add_argument("id")
     subs.add_parser("serve")
+    subs.add_parser("service").add_argument(
+        "service_action", choices=["install", "uninstall", "start", "stop", "restart", "status"])
     args = parser.parse_args(argv)
     args.agent = args.agent or default_agent()
     if getattr(args, "exclusive", False) and getattr(args, "exclusive_lock", None):
@@ -1527,6 +2046,7 @@ def main(argv: list[str] | None = None) -> int:
         "history": cmd_history,
         "send": cmd_send, "inbox": cmd_inbox, "agents": cmd_agents,
         "release": cmd_release, "lock": cmd_lock, "unlock": cmd_unlock,
+        "service": cmd_service,
     }[args.action](args)  # fmt: skip
 
 

@@ -12,5 +12,6 @@ Several agents share this computer. Coordinate heavy work through the `agent-coo
 - **Messages:** read `agent-coord inbox` at the start of work, before heavy jobs, and when a lease waits a long time. Use `agent-coord send --to AGENT|all "…"` to tell others about things that affect them, such as long IO, VM ownership or when you will finish.
 - Reserve disk for big outputs and temp files with `--disk PATH:SIZE`, sized for the job's peak (for example `--disk /home:150G` for a 30x realign).
 - Own things that can't be shared (a VM, the GPU, the NAS link during a timed run) with `agent-coord lock NAME --reason "…" [--pid PID]` until `unlock NAME`, or pass `--lock NAME` to `run`. Check `status` before touching something another agent owns.
-- Your name is your git worktree's folder name; use `--as NAME` to set another.
-- If the service is down, start it with `systemctl --user start agent-coord`; do not work around it.
+- Your name is your git worktree's folder name; use `--as NAME` (or `AGENT_COORD_AS=NAME`) to set another. Several sessions in the same folder share that name and its inbox, so give each its own name when they need to tell each other apart.
+- If the service is down, start it with `systemctl --user start agent-coord` (Linux) or `agent-coord service start` (Windows, where commands also start it on demand); do not work around it.
+- On Windows, `run` caps the command with a job object (CPU rate, memory limit, idle priority), and disk paths are drives, e.g. `--disk D:\:150G`.

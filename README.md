@@ -20,12 +20,26 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 
 | Tool | What it does | Needs |
 | --- | --- | --- |
-| `agent-coord` | CPU/RAM/disk leases, named locks and messages between agents | Linux, systemd user session, python3 |
+| [`agent-coord`](tools/agent-coord/README.md) | CPU/RAM/disk leases, named locks and messages between agents | Linux with a systemd user session, or Windows; Python 3.10+ |
 | `sudo-session` | Share a time-limited, audited sudo credential with fresh agent shells | macOS/Linux, python3, tmux, sudo |
 | `op-session` | Persistent 1Password CLI session for fresh agent shells | macOS/Linux, tmux, op, jq |
 | `cli-launchers` | Shared mise launchers for agent CLIs and development tools | mise |
 | `hf-op` | Hugging Face token routing through op-session or an existing hf login | bash |
 | [`agent-usage`](tools/agent-usage/README.md) | Counts-only daily agent tokens, API-rate estimates and weekly tokens per merged PR | Python 3.11+, gh for PR counts |
+
+### Windows
+
+Run the same installer from Git Bash or MSYS2 (Developer Mode on, so `ln -s` makes real symlinks):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theontho/skill-dump/main/install.sh | bash
+```
+
+Only tools whose `OS` lists `Windows` install there (today: `agent-coord`). Each command gets a `sh`
+launcher and a `.cmd` launcher in `~/.local/bin` (put it on the user PATH), both naming a real Python 3.10+
+interpreter: `SKILL_DUMP_PYTHON`, else `uv python find`, else `py -3`, else a `python3`/`python` that is not
+the Microsoft Store stub. There are no systemd units; `agent-coord` starts at logon (an HKCU Run entry) and on
+demand, and is restarted when it changes. Skills are linked and agent instructions written as on Linux.
 
 Tools whose requirements are missing are skipped. Choose tools with `--skip` / `--only`
 (saved in `~/.config/skill-dump/config` and reused when a pull reinstalls):
@@ -46,7 +60,8 @@ The credential helpers share one implementation per tool across macOS and Linux:
 pending approval is preserved, and grants default to one hour. Sudo retains
 command streams, working directories and active-session extension; 1Password
 keepalives use the authorized foreground TTY. Run `npm run tools:test:credentials`
-on either platform; the full `npm run tools:test` also needs Linux for agent-coord.
+on either platform; the full `npm run tools:test` also needs Linux for agent-coord
+(its own suite, `cd tools/agent-coord && python -m unittest test_agent_coord`, also runs on Windows).
 
 ### Adopting it on a computer that already has these tools
 
@@ -64,7 +79,8 @@ BINS="command-name=file-in-this-dir"   # space-separated; linked into ~/.local/b
 UNITS="name.service"                   # optional systemd user units, enabled and started
 RESTART_ON_CHANGE="name.service"       # optional; restarted when this tool's files change
 REQUIRES="python3 tmux systemctl"      # commands needed (systemctl = a systemd user session)
-OS="Linux"                             # optional; uname -s values
+OS="Linux"                             # optional; uname -s values, or Windows (must be listed to install there)
+WINDOWS_SERVICE="command-name"         # optional; on Windows, run "command-name service install|restart|uninstall"
 INSTALL_ONLY=yes                       # optional; install units without enabling/starting them
 PLISTS="com.example.job.plist"          # optional macOS LaunchAgents; installed, never auto-loaded
 ```
