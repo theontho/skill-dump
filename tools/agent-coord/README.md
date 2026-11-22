@@ -8,7 +8,8 @@ gives them one live place to:
 - **check** whether a job of a given size may start now;
 - **message** each other (one agent, or `all`).
 
-It is a user systemd service (`agent-coord.service`) speaking JSON lines on
+It is a user systemd service (`agent-coord.service`) on Linux, or a background
+process on Windows (see [Windows](#windows)), speaking JSON lines on
 `$XDG_RUNTIME_DIR/agent-coord/sock`, with its state in
 `~/.local/state/agent-coord/state.json`. The state survives restarts: held
 leases and waiting requests are kept, and waiting `run` clients retry their
@@ -171,10 +172,47 @@ Picard) get `JAVA_TOOL_OPTIONS=-XX:MaxRAM=SIZE -XX:MaxRAMPercentage=60`, so thei
 heap fits the lease (JVMs otherwise size it from the host's RAM and get killed). Without a systemd
 user session it still runs, uncapped, at nice 19 / idle IO.
 
+## Windows
+
+The same file runs on Windows (Python 3.10+, standard library only). Leasing,
+admission, backfill, locks, messages and history behave as on Linux; only the
+platform layer differs:
+
+- **Service**: a background `pythonw` process, not a systemd unit. It listens
+  on a random loopback TCP port and writes the port and a random token to
+  `%LOCALAPPDATA%\agent-coord\endpoint.json` (your profile, so only you can
+  read it); requests without the token are refused. A lock file allows one
+  server per endpoint. Any command starts the service if it isn't running.
+  `agent-coord service install` also starts it at logon (an HKCU `Run` entry);
+  `skill-dump install` does this and restarts it when the tool changes.
+  `agent-coord service status|start|stop|restart|uninstall` manage it; its log
+  is `%LOCALAPPDATA%\agent-coord\service.log`.
+- **State and history**: `%LOCALAPPDATA%\agent-coord\` (`XDG_STATE_HOME` wins
+  if set).
+- **Measurement**: Win32 APIs instead of `/proc` (system times, memory status,
+  process memory counters, a process snapshot for descendants). A process's
+  footprint is the larger of its working set and private commit. QEMU guests
+  and readable WSL2/Hyper-V `vmmem` processes count as VMs. `status` shows no
+  load average (Windows has none).
+- **`run`**: the command starts suspended in a job object with a hard CPU rate
+  cap of N cores, a job memory limit of SIZE, and idle priority (the
+  counterpart of nice 19); the job dies with `agent-coord run`. Past the memory
+  limit, allocations fail rather than the command being killed (out-of-memory
+  errors rather than exit 137). Commands resolve through `PATHEXT`, so
+  `npm`/`.cmd` work; run shell scripts as `bash script.sh`.
+- **Disks**: `--disk` takes a path on a volume (`--disk D:\:150G`,
+  `--disk C:\Users\me\work:20G`); reservations are per volume.
+- **Archives**: no ZFS detection; set `AGENT_COORD_ARCHIVE` (paths separated
+  by `;`) to protect archive shares the same way.
+
+`AGENT_COORD_AS` sets the agent name on every platform. That helps when several
+sessions share a folder, since they would otherwise share a name and its inbox.
+
 ## Operate
 
 ```sh
 systemctl --user status agent-coord
 journalctl --user -u agent-coord
 python3 -m unittest -v test_agent_coord     # in tools/agent-coord
+agent-coord service status                  # Windows
 ```

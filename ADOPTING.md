@@ -27,7 +27,7 @@ Adopting it on a computer has two goals:
 
 Record what you find. Change nothing yet.
 
-- Platform: `uname -s`, `uname -n`, whether a systemd user session works (`systemctl --user show-environment`), and
+- Platform: `uname -s` (MINGW/MSYS/CYGWIN means Windows: see the README's Windows section), `uname -n`, whether a systemd user session works (`systemctl --user show-environment`), and
   which of `python3 tmux mise sudo git` exist. Compare with each tool's `REQUIRES`/`OS` in `tools/*/tool.conf`.
 - Existing copies: `type -a skill-dump agent-coord sudo-session op-session`. List `~/.local/bin`,
   `~/.local/libexec`, `~/.config/systemd/user/` and `~/Library/LaunchAgents/`. Follow wrappers to their real
