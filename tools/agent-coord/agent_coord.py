@@ -41,6 +41,8 @@ POLL = 3.0
 NUDGE_AFTER = 60
 # A new lease counts at its full size this long, until its use is measured.
 WARMUP = 60
+IO_HINT_AFTER = 10 * 60
+IO_DEFAULT_MEM = 512 * 1024**2
 # Estimate until this agent/label has completed a run.
 DEFAULT_EXPECT = 30 * 60
 PROJECTION_GRACE = 60
@@ -66,19 +68,23 @@ HELP = """\
 agent-coord - share this computer's CPU and RAM between agents, and message them
 
 QUOTA
-  agent-coord check --cores N --mem SIZE [--exclusive | --exclusive-lock NAME]
+  agent-coord check [--io] [--cores N] [--mem SIZE] [--exclusive | --exclusive-lock NAME]
       Exit 0 if a lease that size would start now, else 1 with the reason.
-  agent-coord run --cores N --mem SIZE --label TEXT [--exclusive | --exclusive-lock NAME]
+  agent-coord run [--io] [--cores N] [--mem SIZE] --label TEXT [--exclusive | --exclusive-lock NAME]
                   [--headroom N] [--expect D] [--max-wait D] -- CMD ...
       Wait in line until N cores and SIZE of RAM are free, then run CMD capped
       at them (systemd scope: CPUQuota, MemoryMax; exceeding MemoryMax kills
       CMD) at nice 19 and idle IO priority. CMD sees COMPUTE_LEASE_CORES=N:
       give its tools that many threads. The lease ends when CMD exits.
-  agent-coord hold --cores N --mem SIZE --label TEXT --pid PID [--exclusive]
+  agent-coord hold [--io] [--cores N] [--mem SIZE] --label TEXT --pid PID [--exclusive]
       Register a job that is already running (no waiting: it is running),
       until PID exits. Prints the lease ID. Holding a VM's qemu PID replaces
       its measured use with the lease.
   agent-coord release ID
+  --io          For downloads, uploads and disk streaming: count measured CPU
+                use, even during warmup. Defaults to 1 core and 512M; both
+                sizes are required without --io. Memory counts at least the
+                requested size, or more if the process tree uses more.
   --exclusive   Whole-machine exclusive: wait until no other lease is held,
                 then keep new ones waiting until this one ends. Small requests
                 (<= 2 cores, 6G, no disk) may still start while it waits, for
@@ -86,11 +92,11 @@ QUOTA
   --exclusive-lock NAME
                 Exclusive on resource NAME only (e.g. gpu, for a GPU timing
                 run): holds NAME like --lock, waits until nobody else holds it,
-                and its cores count in full (not measured use) so they stay
+                and its cores count in full (unless --io) so they stay
                 guaranteed. CPU-only leases still run beside it in the rest of
                 the machine. Repeatable. Prefer it to --exclusive.
   --headroom N  Start only when N cores beyond this lease are unclaimed
-                (leases counted at their full size), and keep them unclaimed
+                (non-IO leases counted at their full size), and keep them unclaimed
                 while it runs: bounds CPU contention for timing runs.
   --expect D    Expected run time (e.g. 10m), not a time limit. Defaults to the
                 90th percentile of the last 20 successful runs for this agent/label,
@@ -184,12 +190,13 @@ def capacity() -> tuple[float, int]:
     return float(os.cpu_count() or 1), mem_total() - RESERVE_MEM
 
 
-def _cpu_seconds(pid: int) -> float | None:
+def _cpu_seconds(pid: int, include_children: bool = False) -> float | None:
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     except OSError:
         return None
-    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    end = 15 if include_children else 13
+    return sum(int(ticks) for ticks in fields[11:end]) / os.sysconf("SC_CLK_TCK")
 
 
 def _footprint(pid: int) -> int:
@@ -204,21 +211,33 @@ def _footprint(pid: int) -> int:
     return total
 
 
-def tree_footprint(pid: int) -> int:
-    """Resident plus swapped-out memory of pid and its descendants."""
-    total, seen, stack = 0, set(), [pid]
+def _tree_pids(pid: int):
+    seen, stack = set(), [pid]
     while stack:
         current = stack.pop()
         if current in seen:
             continue
         seen.add(current)
-        total += _footprint(current)
+        yield current
         try:
             for task in Path(f"/proc/{current}/task").iterdir():
                 stack.extend(int(x) for x in (task / "children").read_text().split())
         except OSError:
             pass  # exited, or no children file: counts as what was read so far
-    return total
+
+
+def tree_footprint(pid: int) -> int:
+    """Resident plus swapped-out memory of pid and its descendants."""
+    return sum(_footprint(current) for current in _tree_pids(pid))
+
+
+def tree_cpu_seconds(pid: int) -> float | None:
+    """Cumulative CPU time of live and already reaped processes in the tree."""
+    pids = _tree_pids(pid)
+    root = _cpu_seconds(next(pids), include_children=True)
+    if root is None:
+        return None
+    return root + sum(_cpu_seconds(child, include_children=True) or 0 for child in pids)
 
 
 def _host_busy() -> tuple[float, float]:
@@ -302,12 +321,17 @@ class Coordinator:
     """All state, guarded by one lock; saved to STATE_FILE on every change."""
 
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
-                 history_file: Path | None = None, footprint=tree_footprint):
+                 history_file: Path | None = None, footprint=tree_footprint,
+                 cpu_seconds=tree_cpu_seconds):
         self._saved = None
         self._samples = None
         self._footprints = None
         self.disk_free = disk_free
         self.footprint = footprint
+        self.cpu_seconds = cpu_seconds
+        self._cpu_sample: tuple[float, dict[str, float]] | None = None
+        self._measured_cores: dict[str, float] = {}
+        self._low_since: dict[tuple[str, str], float] = {}
         self.state_file = state_file
         self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
         self.measure = measure
@@ -345,7 +369,7 @@ class Coordinator:
         entry = {"time": round(time.time(), 1), "event": event, "id": x["id"],
                  "agent": x["agent"], "label": x["label"], "cores": x["cores"],
                  "mem": x["mem"], "locks": x.get("locks", []),
-                 "exclusive": exclusive_mode(x)}  # fmt: skip
+                 "exclusive": exclusive_mode(x), "io": bool(x.get("io"))}  # fmt: skip
         if x.get("exclusive_locks"):
             entry["exclusive_locks"] = x["exclusive_locks"]
         for key in ("headroom", "disk", "expect", "expect_source", "backfill_reason", "backfill_head"):
@@ -431,8 +455,22 @@ class Coordinator:
 
     def _unleased(self) -> float:
         """Cores busy with work nobody leased (agents not using agent-coord)."""
-        leased = sum(x["cores"] for x in self.state["leases"])
-        return max(0.0, self.busy - sum(g["cores"] for g in self.vms) - leased)
+        leased = sum(self._cpu_claim(x) for x in self.state["leases"])
+        return max(0.0, self.busy - sum(g["cores"] for g in self._vms()) - leased)
+
+    def _cpu_claim(self, lease: dict) -> float:
+        """Full size for a CPU lease; observed use for IO (zero before sampling)."""
+        return self._measured_cores.get(lease.get("id"), 0.0) if lease.get("io") else lease["cores"]
+
+    def _mem_claim(self, lease: dict) -> int:
+        if lease.get("io") and "granted" in lease:
+            return max(lease["mem"], self._footprint(lease["pid"]))
+        return lease["mem"]
+
+    def _reserved_cpu(self, leases: list[dict]) -> float:
+        warming = {x["id"] for x in self._warming()}
+        return sum(x["cores"] for x in leases
+                   if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")))
 
     def _warming(self) -> list[dict]:
         """Leases started in the last WARMUP seconds: not yet at full speed,
@@ -447,26 +485,25 @@ class Coordinator:
         lease is capped at its size, at nice 19); new leases count at their
         size until they ramp up. Memory counts every lease at its size, since
         running out of it means swapping or killing."""
-        warming = {x["id"] for x in self._warming()}
         # Leases exclusive on a lock (timing runs) count in full all along, so
         # their cores stay guaranteed. Conservative: their measured use is in
         # self.busy too.
-        cores = self.busy + sum(x["cores"] for x in self.state["leases"]
-                                if x["id"] in warming or x.get("exclusive_locks"))  # fmt: skip
+        leases = self.state["leases"]
+        cores = max(self.busy, sum(self._cpu_claim(x) for x in leases if x.get("io")))
+        cores += self._reserved_cpu(leases)
         vms = self._vms()
-        mem = sum(x["mem"] for x in self.state["leases"]) + sum(g["mem"] for g in vms)
+        mem = sum(self._mem_claim(x) for x in leases) + sum(g["mem"] for g in vms)
         return cores, mem
 
     def _claimed(self) -> float:
-        """Cores claimed: every lease at its full size, plus VMs and unleased
-        load as measured. --headroom is kept against this, not measured use,
-        since a lease may speed up at any moment (up to its CPUQuota)."""
-        leased = sum(x["cores"] for x in self.state["leases"])
+        """Cores claimed: full size for CPU leases, measured use otherwise."""
+        leased = sum(self._cpu_claim(x) for x in self.state["leases"])
         return leased + sum(g["cores"] for g in self._vms()) + self._unleased()
 
     def _too_big(self, req: dict) -> str | None:
         cores, mem = self.capacity()
-        if req["cores"] + req.get("headroom", 0) > cores or req["mem"] > mem:
+        if (max(req["cores"], self._cpu_claim(req) + req.get("headroom", 0)) > cores
+                or req["mem"] > mem):
             return f"more than this computer has ({cores:g} cores, {human(mem)})"
         return None
 
@@ -492,7 +529,8 @@ class Coordinator:
             return "too-big", too_big
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
-        if used_cores + req["cores"] > cores:
+        req_cores = self._cpu_claim(req)
+        if used_cores + req_cores > cores:
             return "cores", f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
         if used_mem + req["mem"] > mem:
             return "mem", f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
@@ -508,7 +546,7 @@ class Coordinator:
         keeper = max([req, *leases], key=lambda x: x.get("headroom", 0))
         if need := keeper.get("headroom", 0):
             claimed = self._claimed()
-            if claimed + req["cores"] + need > cores:
+            if claimed + req_cores + need > cores:
                 whose = "this request" if keeper is req else (
                     f"{keeper['agent']}'s lease {keeper['id']} ({keeper['label']})")
                 return "headroom", (f"{max(cores - claimed, 0):.1f} cores unclaimed; "
@@ -526,7 +564,7 @@ class Coordinator:
             return False
         if req["mem"] <= self.available - RESERVE_MEM:
             return False  # fits now: anything holding it up is not memory
-        freed = sum(min(x["mem"], self._footprint(x["pid"])) for x in self.state["leases"])
+        freed = sum(min(self._mem_claim(x), self._footprint(x["pid"])) for x in self.state["leases"])
         return req["mem"] > self.available + freed - RESERVE_MEM
 
     def _blocked(self, req: dict) -> str | None:
@@ -570,6 +608,8 @@ class Coordinator:
                 if not head.get("nudged") and time.time() - head["asked"] > NUDGE_AFTER:
                     head["nudged"] = True
                     for holder in self.state["leases"]:
+                        if holder.get("io") and self._cpu_claim(holder) < holder["cores"] / 2:
+                            continue
                         self._post(
                             "agent-coord", holder["agent"],
                             f"{head['agent']} has waited "
@@ -621,17 +661,20 @@ class Coordinator:
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
         ending = [x for x in self.state["leases"] if waiting_for & set(x.get("locks", ()))]
-        freed_cores = sum(x["cores"] for x in ending)
-        freed_mem = sum(x["mem"] for x in ending)
-        if used_cores - freed_cores + req["cores"] + head["cores"] > cores:
+        freed_cores = sum(self._cpu_claim(x) for x in ending)
+        freed_mem = sum(self._mem_claim(x) for x in ending)
+        need_cores = self._cpu_claim(req) + self._cpu_claim(head)
+        if used_cores - freed_cores + need_cores > cores:
             return False
         if used_mem - freed_mem + req["mem"] + head["mem"] > mem:
             return False
-        if head.get("headroom") and (self._claimed() - freed_cores + req["cores"]
-                                     + head["cores"] + head["headroom"] > cores):  # fmt: skip
+        if head.get("headroom") and (self._claimed() - freed_cores + need_cores
+                                     + head["headroom"] > cores):  # fmt: skip
             return False
-        return self.available is None or (
-            req["mem"] + head["mem"] <= self.available + freed_mem - RESERVE_MEM)
+        if self.available is None:
+            return True
+        freed_available = sum(self._footprint(x["pid"]) if x.get("io") else x["mem"] for x in ending)
+        return req["mem"] + head["mem"] <= self.available + freed_available - RESERVE_MEM
 
     def _remember(self, entry: dict) -> None:
         run = entry.get("run")
@@ -682,23 +725,22 @@ class Coordinator:
         remaining = [x for x in self.state["leases"] if x not in ending]
         jobs = [*remaining, head, *([req] if req else [])]
         cores, mem = self.capacity()
-        if sum(x["mem"] for x in jobs) + sum(g["mem"] for g in self._vms()) > mem:
+        if sum(self._mem_claim(x) for x in jobs) + sum(g["mem"] for g in self._vms()) > mem:
             return False
-        warming = self._warming()
+        io_used = sum(self._cpu_claim(x) for x in remaining if x.get("io"))
         outside = self._unleased() + sum(g["cores"] for g in self._vms())
         if req is None:
             # Measured use finds the head's likely start, but subtracting a
             # full ending claim can undercount holders that remain.
-            used = max(outside, self.busy - sum(x["cores"] for x in ending))
+            used = self.busy - sum(self._cpu_claim(x) for x in ending)
         else:
-            used = outside + min(sum(x["cores"] for x in remaining),
+            used = outside + min(sum(self._cpu_claim(x) for x in remaining),
                                  max(0, self.busy - outside))
-        used += sum(x["cores"] for x in remaining if x in warming or x.get("exclusive_locks"))
-        if used + head["cores"] + (req["cores"] if req else 0) > cores:
+        used = max(outside + io_used, used) + self._reserved_cpu(remaining)
+        if used + self._cpu_claim(head) + (self._cpu_claim(req) if req else 0) > cores:
             return False
         headroom = max(x.get("headroom", 0) for x in jobs)
-        if headroom and (sum(x["cores"] for x in jobs) + self._unleased()
-                         + sum(g["cores"] for g in self._vms()) + headroom > cores):
+        if headroom and sum(self._cpu_claim(x) for x in jobs) + outside + headroom > cores:
             return False
         if self.available is not None:
             # Multiple leases may name the same process. Its measured memory
@@ -708,10 +750,10 @@ class Coordinator:
             for x in self.state["leases"]:
                 pid = x["pid"]
                 budget = measured.setdefault(pid, self._footprint(pid))
-                footprints[x["id"]] = min(x["mem"], budget)
+                footprints[x["id"]] = min(self._mem_claim(x), budget)
                 measured[pid] -= footprints[x["id"]]
             freed = sum(footprints[x["id"]] for x in ending)
-            growth = sum(max(0, x["mem"] - footprints[x["id"]]) for x in remaining)
+            growth = sum(self._mem_claim(x) - footprints[x["id"]] for x in remaining)
             need = head["mem"] + (req["mem"] if req else 0)
             if need > self.available + freed - growth - RESERVE_MEM:
                 return False
@@ -824,7 +866,8 @@ class Coordinator:
             if not self._stuck(x) and set(req.get("locks", ())) & set(x.get("locks", ())):
                 return hold(f"lock order behind {x.get('id', 'queued request')}")
         now = time.time()
-        small = req["cores"] <= SMALL_CORES and req["mem"] <= SMALL_MEM and not req.get("disk")
+        req_cores = self._cpu_claim(req)
+        small = req_cores <= SMALL_CORES and req["mem"] <= SMALL_MEM and not req.get("disk")
         for x in ahead:
             if x["exclusive"] and not (
                 small and now - x["asked"] < EXCLUSIVE_PASS_WINDOW
@@ -844,9 +887,9 @@ class Coordinator:
         if head.get("locks"):
             return hold("lock-owning head waits for capacity")
         if skipped_stuck:
-            return (req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
+            return (req_cores <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM
                     and not req.get("disk")) or hold("ordering behind a stuck head")
-        if req["cores"] <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk"):
+        if req_cores <= BACKFILL_CORES and req["mem"] <= BACKFILL_MEM and not req.get("disk"):
             return True
         if now - head.get("head_since", now) >= BACKFILL_PASS_WINDOW:
             return hold("capacity pass window expired")
@@ -858,14 +901,66 @@ class Coordinator:
             req["backfill_head"] = head.get("id")
         return allowed
 
+    def _sample_lease_cpu(self, now: float, samples: dict[str, float]) -> None:
+        previous = self._cpu_sample
+        self._cpu_sample = now, samples
+        self._measured_cores = {}
+        if previous is None or now <= previous[0]:
+            return
+        for x in self.state["leases"]:
+            lease_id = x["id"]
+            if lease_id in samples and lease_id in previous[1]:
+                delta = samples[lease_id] - previous[1][lease_id]
+                self._measured_cores[lease_id] = min(x["cores"], max(0, delta) / (now - previous[0]))
+
+    def _hint_io(self, now: float) -> bool:
+        low_since = {}
+        changed = False
+        for x in self.state["leases"]:
+            if x.get("io") or x.get("io_hint") or time.time() - x["granted"] < WARMUP:
+                continue
+            lease_id = x["id"]
+            cpu = self._measured_cores.get(lease_id)
+            mem = self._footprint(x["pid"]) if x["mem"] else 0
+            low = []
+            if x["cores"] >= 2 and cpu is not None and cpu < 0.15 * x["cores"]:
+                low.append(("cpu", f"{cpu:.2f} of {x['cores']:g} cores"))
+            if mem < 0.15 * x["mem"]:
+                low.append(("mem", f"{human(mem)} of {human(x['mem'])} RAM"))
+            due = []
+            for resource, detail in low:
+                key = lease_id, resource
+                low_since[key] = self._low_since.get(key, now)
+                if now - low_since[key] >= IO_HINT_AFTER:
+                    due.append(detail)
+            if due:
+                x["io_hint"] = True
+                self._post(
+                    "agent-coord", x["agent"],
+                    f"{lease_id} ({x['label']}) is using {', '.join(due)} held. "
+                    "If this is a download or other IO-bound job, use --io "
+                    "(or --cores 1); if it needs less RAM, use a smaller --mem.",
+                )
+                changed = True
+        self._low_since = low_since
+        return changed
+
     def tick(self) -> None:
         sample = self.measure()
         with self.lock:
+            targets = [(x["id"], x["pid"]) for x in self.state["leases"]
+                       if x.get("io") or (x["cores"] >= 2 and not x.get("io_hint"))]
+        now = time.monotonic()
+        by_pid = {pid: self.cpu_seconds(pid) for pid in {pid for _, pid in targets}}
+        samples = {lease_id: by_pid[pid] for lease_id, pid in targets if by_pid[pid] is not None}
+        with self.lock:
+            self._sample_lease_cpu(now, samples)
             self.vms = sample["vms"]
             self.available = sample["available"]
             # Smoothed over ~10 s: a moment's burst shouldn't hold the line.
             self.busy += 0.2 * (sample["busy"] - self.busy)
             changed = self._prune()
+            changed |= self._hint_io(now)
             changed |= self._admit()
             if changed:
                 self._save()
@@ -888,6 +983,8 @@ class Coordinator:
             return reply
 
     def op_acquire(self, req: dict, agent: str) -> dict:
+        if req.get("io"):
+            req = {"cores": 1, "mem": IO_DEFAULT_MEM, **req}
         for key in ("cores", "mem", "pid", "label"):
             if key not in req:
                 return {"error": f"missing {key}"}
@@ -916,6 +1013,8 @@ class Coordinator:
         # Only set when used, so the state stays readable by older versions.
         if scoped:
             lease["exclusive_locks"] = scoped
+        if req.get("io"):
+            lease["io"] = True
         if headroom:
             lease["headroom"] = headroom
         self.state["next"] += 1
@@ -968,7 +1067,9 @@ class Coordinator:
         if expect is None:
             expect, _ = self._estimate(_agent, str(req.get("label", "")))
         scoped = list(req.get("exclusive_locks") or [])
-        probe = {"cores": float(req.get("cores", 1)), "mem": int(req.get("mem", 0)),
+        io = bool(req.get("io"))
+        probe = {"cores": float(req.get("cores", 1)), "io": io,
+                 "mem": int(req.get("mem", IO_DEFAULT_MEM if io else 0)),
                  "exclusive": bool(req.get("exclusive")),
                  "locks": list(dict.fromkeys([*req.get("locks", []), *scoped])),
                  "exclusive_locks": scoped, "headroom": float(req.get("headroom") or 0),
@@ -1035,7 +1136,9 @@ class Coordinator:
         return {
             "capacity": {"cores": cores, "mem": mem, "reserve": RESERVE_MEM},
             "free": {"cores": cores - used_cores, "mem": mem - used_mem},
-            "leases": self.state["leases"],
+            "leases": [{**x, "measured_cores": round(self._cpu_claim(x), 2),
+                        "claimed_mem": self._mem_claim(x)} if x.get("io") else x
+                       for x in self.state["leases"]],
             "queue": [{**x, "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
                       for x in self.state["queue"]],
             "vms": self._vms(), "load": os.getloadavg(),
@@ -1244,7 +1347,7 @@ def parse_disk(text: str) -> tuple[str, int]:
 
 def _lease_request(args: argparse.Namespace, pid: int) -> dict:
     return {"op": "acquire", "agent": args.agent, "cwd": os.getcwd(), "pid": pid,
-            "cores": args.cores, "mem": args.mem, "label": args.label,
+            "cores": args.cores, "mem": args.mem, "label": args.label, "io": args.io,
             "exclusive": args.exclusive, "locks": args.lock or [],
             "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
             "expect": args.expect, "disk": dict(args.disk or [])}  # fmt: skip
@@ -1310,7 +1413,7 @@ def cmd_hold(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    reply = call({"op": "check", "cores": args.cores, "mem": args.mem,
+    reply = call({"op": "check", "cores": args.cores, "mem": args.mem, "io": args.io,
                   "exclusive": args.exclusive, "locks": args.lock or [],
                   "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
                   "agent": args.agent or default_agent(), "label": args.label,
@@ -1346,11 +1449,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             flag += " disk " + ",".join(f"{m}:{human(n)}" for m, n in x["disk"].items())
         detail = x.get("reason") if state == "waiting" else x.get("overrun_reason") or x.get("backfill_reason")
         why = f" -- {detail}" if detail else ""
-        print(f"  {x['id']:<6} {state:<7} {x['cores']:>4g} cores {human(x['mem']):>6} "
+        cpu = f"{x['cores']:>4g} cores"
+        mem = x.get("claimed_mem", x["mem"])
+        if x.get("io"):
+            flag += " io"
+            cpu = f"{x['cores']:g}-core cap"
+            if state == "held":
+                cpu += f", {x['measured_cores']:g} used"
+        print(f"  {x['id']:<6} {state:<7} {cpu} {human(mem):>6} "
               f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){why}")
     if "busy_cores" in s:
         print(f"cores busy now (measured): {s['busy_cores']:g} of {cap['cores']:g}; "
-              "CPU admission uses this, memory admission uses lease sizes")
+              "CPU admission uses this; memory admission reserves at least lease sizes")
     if s.get("unleased_cores"):
         print(f"  other  running {s['unleased_cores']:>4g} cores"
               "                   work not leased through agent-coord (measured)")
@@ -1405,6 +1515,8 @@ def cmd_history(args: argparse.Namespace) -> int:
                 + ",".join(e.get("exclusive_locks", []))}.get(e.get("exclusive"), "")  # fmt: skip
         if e.get("locks"):
             flag += f" locks {','.join(e['locks'])}"
+        if e.get("io"):
+            flag += " io"
         times = []
         for key in ("wait", "waited", "run"):
             if key in e:
@@ -1476,8 +1588,9 @@ def main(argv: list[str] | None = None) -> int:
     subs = parser.add_subparsers(dest="action", required=True)
     for name in ("run", "hold", "check"):
         sub = subs.add_parser(name)
-        sub.add_argument("--cores", type=float, required=True)
-        sub.add_argument("--mem", type=parse_size, required=True)
+        sub.add_argument("--io", action="store_true", help="IO-bound job (defaults: 1 core, 512M)")
+        sub.add_argument("--cores", type=float)
+        sub.add_argument("--mem", type=parse_size)
         sub.add_argument("--exclusive", action="store_true")
         sub.add_argument("--exclusive-lock", action="append")
         sub.add_argument("--headroom", type=float, default=0.0)
@@ -1516,6 +1629,13 @@ def main(argv: list[str] | None = None) -> int:
     subs.add_parser("release").add_argument("id")
     subs.add_parser("serve")
     args = parser.parse_args(argv)
+    if args.action in ("run", "hold", "check"):
+        if not args.io and (args.cores is None or args.mem is None):
+            parser.error("--cores and --mem are required without --io")
+        if args.cores is None:
+            args.cores = 1.0
+        if args.mem is None:
+            args.mem = IO_DEFAULT_MEM
     args.agent = args.agent or default_agent()
     if getattr(args, "exclusive", False) and getattr(args, "exclusive_lock", None):
         parser.error("--exclusive already excludes everything; drop --exclusive-lock")
