@@ -467,6 +467,16 @@ class Coordinator:
             return max(lease["mem"], self._footprint(lease["pid"]))
         return lease["mem"]
 
+    def _measured_mem(self, leases: list[dict]) -> dict[str, int]:
+        """Attribute a PID's footprint only once, even across multiple leases."""
+        remaining, footprints = {}, {}
+        for x in leases:
+            pid = x["pid"]
+            budget = remaining.setdefault(pid, self._footprint(pid))
+            footprints[x["id"]] = min(self._mem_claim(x), budget)
+            remaining[pid] -= footprints[x["id"]]
+        return footprints
+
     def _reserved_cpu(self, leases: list[dict]) -> float:
         warming = {x["id"] for x in self._warming()}
         return sum(x["cores"] for x in leases
@@ -564,7 +574,7 @@ class Coordinator:
             return False
         if req["mem"] <= self.available - RESERVE_MEM:
             return False  # fits now: anything holding it up is not memory
-        freed = sum(min(self._mem_claim(x), self._footprint(x["pid"])) for x in self.state["leases"])
+        freed = sum(self._measured_mem(self.state["leases"]).values())
         return req["mem"] > self.available + freed - RESERVE_MEM
 
     def _blocked(self, req: dict) -> str | None:
@@ -673,7 +683,7 @@ class Coordinator:
             return False
         if self.available is None:
             return True
-        freed_available = sum(self._footprint(x["pid"]) if x.get("io") else x["mem"] for x in ending)
+        freed_available = sum(self._measured_mem(ending).values())
         return req["mem"] + head["mem"] <= self.available + freed_available - RESERVE_MEM
 
     def _remember(self, entry: dict) -> None:
@@ -743,15 +753,7 @@ class Coordinator:
         if headroom and sum(self._cpu_claim(x) for x in jobs) + outside + headroom > cores:
             return False
         if self.available is not None:
-            # Multiple leases may name the same process. Its measured memory
-            # can be returned/reserved only once, including within this pass.
-            measured = {}
-            footprints = {}
-            for x in self.state["leases"]:
-                pid = x["pid"]
-                budget = measured.setdefault(pid, self._footprint(pid))
-                footprints[x["id"]] = min(self._mem_claim(x), budget)
-                measured[pid] -= footprints[x["id"]]
+            footprints = self._measured_mem(self.state["leases"])
             freed = sum(footprints[x["id"]] for x in ending)
             growth = sum(self._mem_claim(x) - footprints[x["id"]] for x in remaining)
             need = head["mem"] + (req["mem"] if req else 0)

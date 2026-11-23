@@ -1077,6 +1077,25 @@ class CoordinatorTest(unittest.TestCase):
         lease, = self.c.handle({"op": "status"})["leases"]
         self.assertEqual(lease["claimed_mem"], 2 * GIB)
 
+    def test_duplicate_io_holds_do_not_hide_a_stuck_head(self):
+        self.c.footprint = lambda pid: 4 * GIB
+        for agent in ("stream", "download"):
+            self.ask(1, mem=GIB, io=True, running=True, agent=agent)
+        head = self.stuck_head(10 * GIB, locks=())
+        self.assertEqual(self.ask(2, mem=2 * GIB)["state"], "granted")
+        hint, = self.c.handle({"op": "inbox", "agent": "big"})["messages"]
+        self.assertIn(head["id"], hint["text"])
+
+    def test_duplicate_io_holds_do_not_let_backfill_spend_memory_twice(self):
+        self.c.footprint = lambda pid: 4 * GIB
+        self.available = 10 * GIB
+        self.c.tick()
+        for agent in ("stream", "download"):
+            self.ask(1, mem=GIB, io=True, running=True, agent=agent, locks=["wan"])
+        head = self.ask(1, mem=8 * GIB, agent="head", locks=["wan"])
+        self.assertEqual(head["state"], "waiting")
+        self.assertEqual(self.ask(2, mem=4 * GIB)["state"], "waiting")
+
     def test_sustained_low_cpu_or_memory_hints_once(self):
         busy_pid = os.getppid()
         with (patch.object(ac.time, "time", return_value=100000) as wall,
