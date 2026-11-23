@@ -1006,6 +1006,128 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.c.handle({"op": "poll", "id": waiting["id"]})["state"],
                          "waiting")  # fmt: skip
 
+    def sample_io(self, usage):
+        cpu = {pid: 0 for pid in usage}
+        self.c.cpu_seconds = cpu.get
+        self.c.footprint = lambda pid: GIB
+        self.busy = self.c.busy = sum(usage.values())
+        with patch.object(ac.time, "monotonic", return_value=1000) as clock:
+            self.c.tick()
+            clock.return_value += 4
+            for pid, cores in usage.items():
+                cpu[pid] += cores * 4
+            self.c.tick()
+
+    def test_io_skips_cpu_warmup_but_reserves_memory(self):
+        self.ask(3, mem=12 * GIB, io=True, exclusive_locks=["wan"])
+        self.assertEqual(self.ask(7, mem=5 * GIB)["state"], "waiting")
+        self.assertIn("of 16.0G free", self.c.handle({"op": "status"})["queue"][0]["reason"])
+        self.release(self.c.state["queue"][0])
+        self.assertEqual(self.ask(7, mem=2 * GIB)["state"], "granted")
+
+    def test_io_uses_measured_cpu_for_headroom(self):
+        self.ask(3, io=True)
+        self.sample_io({os.getpid(): 0.25})
+        probe = {"op": "check", "cores": 5, "mem": GIB, "headroom": 2}
+        self.assertTrue(self.c.handle(probe)["ok"])
+        self.assertFalse(self.c.handle({**probe, "cores": 6})["ok"])
+        lease, = self.c.handle({"op": "status"})["leases"]
+        self.assertEqual(lease["measured_cores"], 0.25)
+
+    def test_backfill_leaves_headroom_beside_measured_io(self):
+        self.ask(3, agent="download", io=True, expect=7200)
+        self.sample_io({os.getpid(): 0.25})
+        holder = self.ask(4, mem=8 * GIB, expect=600)
+        head = self.ask(5, mem=10 * GIB, agent="head", headroom=1)
+        backfill = self.ask(1.5, mem=2 * GIB, expect=3600)
+        self.assertEqual(backfill["state"], "granted")
+        self.assertIn("leaves capacity", self.history()[-1]["backfill_reason"])
+        self.release(holder)
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_lock_wait_backfill_uses_measured_io(self):
+        self.ask(3, agent="download", io=True)
+        self.sample_io({os.getpid(): 0.25})
+        self.c.handle({"op": "lock", "name": "gpu"})
+        head = self.ask(5, locks=["gpu"], headroom=1)
+        self.assertEqual(self.ask(1.5, mem=2 * GIB)["state"], "granted")
+        self.c.handle({"op": "unlock", "name": "gpu"})
+        self.assertEqual(self.poll(head), "granted")
+
+    def test_io_nudges_skip_idle_holders_but_not_busy_ones(self):
+        self.ask(1, agent="idle", io=True)
+        self.ask(1, agent="busy", io=True, pid=os.getppid())
+        self.sample_io({os.getpid(): 0.1, os.getppid(): 0.5})
+        waiting = self.ask(8, agent="head")
+        self.age(waiting, ac.NUDGE_AFTER + 1)
+        self.poll(waiting)
+        self.assertEqual(self.c.handle({"op": "inbox", "agent": "idle"})["messages"], [])
+        busy, = self.c.handle({"op": "inbox", "agent": "busy"})["messages"]
+        self.assertIn("head has waited", busy["text"])
+
+    def test_io_memory_uses_footprint_above_declared_size(self):
+        footprint = GIB // 4
+        self.c.footprint = lambda pid: footprint
+        self.ask(1, mem=GIB, io=True, running=True)
+        probe = {"op": "check", "cores": 1, "mem": 15 * GIB}
+        self.assertTrue(self.c.handle(probe)["ok"])
+        self.assertFalse(self.c.handle({**probe, "mem": 16 * GIB})["ok"])
+        footprint = 2 * GIB
+        self.assertFalse(self.c.handle(probe)["ok"])
+        lease, = self.c.handle({"op": "status"})["leases"]
+        self.assertEqual(lease["claimed_mem"], 2 * GIB)
+
+    def test_duplicate_io_holds_do_not_hide_a_stuck_head(self):
+        self.c.footprint = lambda pid: 4 * GIB
+        for agent in ("stream", "download"):
+            self.ask(1, mem=GIB, io=True, running=True, agent=agent)
+        head = self.stuck_head(10 * GIB, locks=())
+        self.assertEqual(self.ask(2, mem=2 * GIB)["state"], "granted")
+        hint, = self.c.handle({"op": "inbox", "agent": "big"})["messages"]
+        self.assertIn(head["id"], hint["text"])
+
+    def test_duplicate_io_holds_do_not_let_backfill_spend_memory_twice(self):
+        self.c.footprint = lambda pid: 4 * GIB
+        self.available = 10 * GIB
+        self.c.tick()
+        for agent in ("stream", "download"):
+            self.ask(1, mem=GIB, io=True, running=True, agent=agent, locks=["wan"])
+        head = self.ask(1, mem=8 * GIB, agent="head", locks=["wan"])
+        self.assertEqual(head["state"], "waiting")
+        self.assertEqual(self.ask(2, mem=4 * GIB)["state"], "waiting")
+
+    def test_sustained_low_cpu_or_memory_hints_once(self):
+        busy_pid = os.getppid()
+        with (patch.object(ac.time, "time", return_value=100000) as wall,
+              patch.object(ac.time, "monotonic", return_value=1000) as clock):
+            idle = self.ask(3, agent="idle", mem=GIB)
+            self.ask(3, agent="busy", pid=busy_pid, mem=GIB)
+            memory = self.ask(1, agent="memory", mem=8 * GIB)
+            self.ask(3, agent="io", mem=GIB, io=True)
+            self.c.cpu_seconds = lambda pid: clock.return_value * (2 if pid == busy_pid else 0.2)
+            self.c.footprint = lambda pid: GIB
+
+            def advance(seconds):
+                wall.return_value += seconds
+                clock.return_value += seconds
+                self.c.tick()
+
+            self.c.tick()
+            advance(ac.WARMUP)
+            advance(ac.IO_HINT_AFTER - 1)
+            self.assertFalse(self.c.handle({"op": "inbox", "agent": "idle"})["messages"])
+            advance(1)
+            advance(ac.IO_HINT_AFTER)
+            for agent, lease, detail in (("idle", idle, "0.20 of 3 cores"),
+                                         ("memory", memory, "1.0G of 8.0G RAM")):
+                hint, = self.c.handle({"op": "inbox", "agent": agent})["messages"]
+                self.assertIn(lease["id"], hint["text"])
+                self.assertIn(f"{agent} job", hint["text"])
+                self.assertIn(detail, hint["text"])
+                self.assertIn("--io", hint["text"])
+            for agent in ("io", "busy"):
+                self.assertFalse(self.c.handle({"op": "inbox", "agent": agent})["messages"])
+
     def test_messages_to_one_agent_and_to_all(self):
         self.c.handle({"op": "send", "agent": "a", "to": "b", "text": "hi b"})
         self.c.handle({"op": "send", "agent": "a", "to": "all", "text": "hi all"})
@@ -1043,6 +1165,21 @@ class FootprintTest(unittest.TestCase):
 
     def test_tree_footprint_of_a_dead_pid_is_zero(self):
         self.assertEqual(ac.tree_footprint(dead_pid()), 0)
+
+    def test_tree_cpu_counts_child_cpu_even_after_reaping(self):
+        pid = os.getpid()
+        before = ac.tree_cpu_seconds(pid)
+        code = ("import time; start = time.process_time()\n"
+                "while time.process_time() - start < 0.1: pass\n"
+                "print('ready', flush=True); input()")
+        with subprocess.Popen([sys.executable, "-c", code], text=True,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            active = ac.tree_cpu_seconds(pid)
+            child.communicate("\n", timeout=5)
+        reaped = ac.tree_cpu_seconds(pid)
+        self.assertGreater(active - before, 0.07)
+        self.assertGreaterEqual(reaped, active)
 
 
 class ArchiveTest(unittest.TestCase):
@@ -1103,6 +1240,22 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "1")
         status = json.loads(self.cli("status", "--json").stdout)
         self.assertEqual(status["leases"], [])
+
+    def test_io_defaults_and_history_round_trip(self):
+        self.assertEqual(self.cli("check", "--io").returncode, 0)
+        self.assertNotEqual(self.cli("check", "--mem", "512M").returncode, 0)
+        run = self.cli("run", "--io", "--label", "download", "--", sys.executable,
+                       "-c", "import os; print(os.environ['COMPUTE_LEASE_CORES'])")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), "1")
+        events = [json.loads(line) for line in self.cli("history", "--json").stdout.splitlines()]
+        self.assertTrue(events)
+        self.assertTrue(all(e["io"] and e["mem"] == GIB // 2 for e in events))
+        hold = self.cli("hold", "--io", "--label", "stream", "--pid", str(os.getpid()))
+        self.assertEqual(hold.returncode, 0, hold.stderr)
+        status = self.cli("status")
+        self.assertIn("1-core cap", status.stdout)
+        self.assertIn("stream io", status.stdout)
 
     def test_run_returns_the_commands_exit_code(self):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "x",

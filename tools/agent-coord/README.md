@@ -25,6 +25,9 @@ agent-coord check --cores 4 --mem 8G     # exit 0 if it would start now
 agent-coord run --cores 4 --mem 8G --label "ultima chr20 realign" -- \
     wgsextract realign --threads 4 ...
 
+# Download: capped at 1 core and 512M by default; override either size if needed.
+agent-coord run --io --label "reference download" -- curl -fLO https://example.org/reference
+
 # GPU timing run: exclusive on the GPU only, with its 6 cores guaranteed and
 # 2 more kept unclaimed; CPU-only leases still run in the rest.
 agent-coord run --cores 6 --mem 40G --exclusive-lock gpu --headroom 2 --label "gpu timing" -- ...
@@ -58,11 +61,19 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
 - Capacity is all cores, and RAM minus 4 GB kept for the desktop and the agents
   themselves.
 - **CPU is admitted on measured use**: host-wide busy cores (smoothed over ~10 s),
-  plus each lease started in the last minute at its full size while it ramps up.
+  plus each non-IO lease started in the last minute at its full size while it ramps up.
   Leases usually use less than they ask, and sharing CPU only slows jobs a
   little, since each is capped at its size at nice 19. CPU should therefore stay
   busy, not idle behind reservations. Time spent waiting on disk is not CPU use.
-- **Memory is admitted on reservations**: every lease at its requested size, plus
+- **`--io`** on `run`, `hold`, and `check` marks downloads, uploads, and disk
+  streaming. CPU counts at measured process-tree use, up to `--cores`, even
+  during startup, headroom checks, and backfill. Before the first sample it
+  counts as zero. With `--io`, `--cores` defaults to 1 and `--mem` to 512M;
+  both are still caps for `run`. Use `--lock wan` if large transfers should
+  take turns; `--io` does not take a lock on its own. `status --json` shows
+  `io`, `measured_cores`, and `claimed_mem` for running IO leases.
+- **Memory is admitted on reservations**: every lease at its requested size (or
+  its measured tree footprint if larger for `--io`), plus
   running QEMU guests (resident + swapped) that no lease holds. A request also
   needs its memory *actually available* now (MemAvailable minus the 4 GB), so
   nothing is admitted into swap.
@@ -135,18 +146,21 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
     the next capacity-blocked request without a named lock.
 
   A request that has waited a minute tells the holders (once) through their inbox.
+  IO holders only get these messages when using at least half their CPU cap.
+  A non-IO holder gets one sizing hint if a lease uses under 15% of its CPU
+  (for caps of at least 2 cores) or memory for 10 minutes after warmup.
 - `--exclusive` (whole machine) waits until no other lease is held, then keeps
   new ones waiting until it ends. Use it only when the whole machine must be quiet.
 - `--exclusive-lock NAME` (e.g. `gpu`) is exclusive on that resource only: it
   holds NAME like `--lock` (waiting while anyone else holds it, and keeping
   others from taking it), its cores count at their full size rather than
-  measured use, so they stay guaranteed, and CPU-only leases keep running in the
-  rest of the machine. This is what GPU timing runs should use.
+  measured use (unless marked `--io`), so they stay guaranteed, and CPU-only
+  leases keep running in the rest of the machine. This is what GPU timing runs
+  should use.
 - `--headroom N` keeps N cores unclaimed beside the lease: it starts only when
-  its cores plus N fit with every lease counted at its full size (each is capped
-  at that by CPUQuota), and while it runs nothing is admitted into those N
-  cores. That bounds CPU contention, and so timing noise, without stopping all
-  other work.
+  its CPU claim plus N fit with non-IO leases counted at their full size and IO
+  leases at measured use. While it runs, admission keeps those N cores free
+  under the same accounting. IO jobs can still burst up to their cap.
 - A lease ends when its process exits; dead holders and waiters are dropped.
 
 ## History
@@ -159,7 +173,7 @@ of the line's reason, logged when its kind changes: `exclusive`, `lock:NAME`,
 backfill hold reasons), `started` (with `wait` seconds and any backfill reason),
 `overrun` (with the delaying lease's notice), `ended` (with `wait`, `run` seconds
 and the command's exit `code` when `run` reports it) and `cancelled` (released or died while waiting). Each
-carries the lease id, agent, label, cores, mem, locks, expected seconds and
+carries the lease id, agent, label, cores, mem, IO flag, locks, expected seconds and
 estimate source, and exclusive mode
 (`machine`, `lock` or null); never commands, paths or environment.
 `agent-coord history [--since 6h] [--json]` prints it (default: last 24 h).
