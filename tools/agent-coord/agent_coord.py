@@ -22,9 +22,9 @@ import threading
 import time
 from pathlib import Path
 
-# AGENT_COORD_RUNTIME_DIR and AGENT_COORD_STATE_DIR point a private instance
-# (tests, trials) at its own socket, lease files, state and history, away from
-# the shared service.
+# Tests and throwaway trials only: AGENT_COORD_RUNTIME_DIR and
+# AGENT_COORD_STATE_DIR point an instance at its own socket, state and history.
+# Set for the shared service, it would start from an empty state.
 RUNTIME = Path(
     os.environ.get("AGENT_COORD_RUNTIME_DIR")
     or Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
@@ -474,13 +474,8 @@ class Coordinator:
         return [g for g in self.vms if g["pid"] not in held]
 
     def _unleased(self) -> float:
-        """Cores busy with work nobody leased (agents not using agent-coord).
-        A lease measured above its claim (sampling noise) is its own load, not
-        someone else's; a lease inside another's process tree counts once."""
-        covered = self._covered()
-        leased = sum(max(self._cpu_claim(x), 0.0 if x["id"] in covered
-                         else self._own_cores.get(x["id"], 0.0))
-                     for x in self.state["leases"])  # fmt: skip
+        """Cores busy with work nobody leased (agents not using agent-coord)."""
+        leased = sum(self._cpu_claim(x) for x in self.state["leases"])
         return max(0.0, self.busy - sum(g["cores"] for g in self._vms()) - leased)
 
     def _cpu_claim(self, lease: dict) -> float:
@@ -502,16 +497,10 @@ class Coordinator:
             remaining[pid] -= footprints[x["id"]]
         return footprints
 
-    def _full_ids(self) -> set[str]:
-        """Leases counted at their full size rather than measured use: those
-        warming up, and those exclusive on a lock (timing runs), unless IO."""
-        warming = {x["id"] for x in self._warming()}
-        return {x["id"] for x in self.state["leases"]
-                if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks"))}
-
     def _reserved_cpu(self, leases: list[dict]) -> float:
-        full = self._full_ids()
-        return sum(x["cores"] for x in leases if x["id"] in full)
+        warming = {x["id"] for x in self._warming()}
+        return sum(x["cores"] for x in leases
+                   if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")))
 
     def _covered(self) -> set[str]:
         """Measured leases whose process is inside another measured lease's
@@ -529,18 +518,27 @@ class Coordinator:
                     break
         return covered
 
+    def _counted_once(self) -> set[str]:
+        """Leases exclusive on a lock (timing runs), unless IO: reserved at
+        their full size all along, so their own measured use comes out of the
+        measured load. (Warming leases keep main's conservative double count.)"""
+        return {x["id"] for x in self.state["leases"]
+                if not x.get("io") and x.get("exclusive_locks")}
+
     def _net_busy(self) -> float:
-        """Measured busy cores, less the own use of leases counted at full
-        size, so a timing run counts once, at its size, not at its size plus
-        its measured use. Lease use is smoothed like the busy figure, and
-        counted once per process tree."""
-        full = self._full_ids()
+        """Measured busy cores, less the own use of exclusive-lock leases, so
+        a timing run counts once, at its size, not at its size plus its
+        measured use. Only use up to its size comes off: use above it (a job
+        in its process tree but in a scope of its own, an uncapped hold,
+        noise) stays counted as load. Lease use is smoothed like the busy
+        figure, and counted once per process tree."""
+        once = self._counted_once()
         covered = self._covered()
         net = self.busy
         for x in self.state["leases"]:
             own = self._own_cores.get(x["id"])
-            if own is not None and x["id"] in full and x["id"] not in covered:
-                net -= own
+            if own is not None and x["id"] in once and x["id"] not in covered:
+                net -= min(own, x["cores"])
         return max(0.0, net)
 
     def _warming(self) -> list[dict]:
@@ -800,15 +798,15 @@ class Coordinator:
             return False
         io_used = sum(self._cpu_claim(x) for x in remaining if x.get("io"))
         outside = self._unleased() + sum(g["cores"] for g in self._vms())
-        full = self._full_ids()  # counted by _reserved_cpu, not in _net_busy
+        once = self._counted_once()  # in _reserved_cpu, out of _net_busy
         net = self._net_busy()
         if req is None:
             # Measured use finds the head's likely start, but subtracting a
             # full ending claim can undercount holders that remain.
-            used = net - sum(self._cpu_claim(x) for x in ending if x["id"] not in full)
+            used = net - sum(self._cpu_claim(x) for x in ending if x["id"] not in once)
         else:
             used = outside + min(sum(self._cpu_claim(x) for x in remaining
-                                     if x["id"] not in full),
+                                     if x["id"] not in once),
                                  max(0, net - outside))
         used = max(outside + io_used, used) + self._reserved_cpu(remaining)
         if used + self._cpu_claim(head) + (self._cpu_claim(req) if req else 0) > cores:
