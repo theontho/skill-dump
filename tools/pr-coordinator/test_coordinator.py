@@ -129,6 +129,108 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             "resolved",
         )
 
+    def fake_draft(self, head, *, statuses, review_head=None):
+        state = self.root / "ready"
+        review = {
+            "state": "OPEN",
+            "baseRefName": "trunk",
+            "headRefOid": head,
+            "isCrossRepository": False,
+            "author": {"login": "owner"},
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewDecision": None,
+        }
+        command = self.root / "gh"
+        command.write_text(
+            f"""#!{sys.executable}
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+state = Path({str(state)!r})
+if args[:2] == ["api", "user"]:
+    print(json.dumps({{"login": "owner"}}))
+elif args[:2] == ["api", "graphql"]:
+    row = {review!r}
+    row["isDraft"] = not state.exists()
+    print(json.dumps({{"data": {{"repository": {{"pullRequest": row}}}}}}))
+elif args[:2] == ["pr", "view"]:
+    print(json.dumps({{"headRefName": "feature", "headRefOid": {head!r}}}))
+elif args[:2] == ["pr", "ready"]:
+    state.touch()
+elif args[1].endswith("/reviews"):
+    print(json.dumps([[{{"commit_id": {(review_head or head)!r},
+        "state": "COMMENTED", "user": {{"login": "copilot-pull-request-reviewer[bot]", "type": "Bot"}}}}]]))
+elif args[1].endswith("/statuses"):
+    print(json.dumps([{statuses!r}]))
+elif "/actions/workflows/" in args[1]:
+    print(json.dumps({{"workflow_runs": [{{"head_sha": {head!r}, "head_branch": "feature",
+        "head_repository": {{"full_name": "example/gadgets"}}, "pull_requests": [],
+        "display_title": "PR area / ready_for_review / ready"}}]}}))
+else:
+    raise SystemExit(f"unexpected fake gh invocation: {{args}}")
+"""
+        )
+        command.chmod(0o700)
+        self.env["PATH"] = str(self.root) + os.pathsep + os.environ["PATH"]
+        return state
+
+    def draft_config(self):
+        gate = self.root / "gate.py"
+        gate.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "assert sys.argv[1] == '7'\n"
+            "count = Path(sys.argv[0]).with_suffix('.count')\n"
+            "seen = count.exists()\n"
+            "count.touch()\n"
+            "raise SystemExit(0 if seen else 3)\n"
+        )
+        with self.config.open("a") as f:
+            f.write(
+                f'\nci_capacity = [{json.dumps(sys.executable)}, {json.dumps(str(gate))}, "{{pr}}"]\n'
+                '[drafts]\nrequired_statuses = ["local-ci/generic", "local-ci/macos"]\n'
+                "idle_seconds = 0\ncapacity_retry_seconds = 0\n"
+                'ready_workflow = "pull_request.yml"\nready_run_timeout = 0\n'
+            )
+
+    def test_finish_draft_retries_capacity_and_reuses_certification_worktree(self):
+        _, head = self.create_git()
+        self.git("switch", "trunk")
+        cert = self.root / "wt-cert7"
+        self.git("worktree", "add", str(cert), "feature")
+        self.draft_config()
+        state = self.fake_draft(
+            head,
+            statuses=[
+                {"context": "local-ci/generic", "state": "success"},
+                {"context": "local-ci/macos", "state": "success"},
+                {"context": "local-ci/generic", "state": "failure"},  # superseded
+            ],
+        )
+        result = self.command("finish-draft", "7")
+        self.assertIn("handed to the landing train", result.stdout)
+        self.assertTrue(state.exists())
+        self.assertFalse((self.data / "ready-admission.json").exists())
+        self.assertEqual(
+            json.loads((self.data / "train.json").read_text())[0]["worktree"], str(cert)
+        )
+
+    def test_finish_draft_rejects_stale_review_and_missing_certification(self):
+        self.draft_config()
+        for stale in (False, True):
+            statuses = [{"context": "local-ci/generic", "state": "success"}]
+            if stale:
+                statuses.append({"context": "local-ci/macos", "state": "success"})
+            state = self.fake_draft(
+                "a" * 40, statuses=statuses, review_head="b" * 40 if stale else None
+            )
+            result = self.command("finish-draft", "7", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ATTENTION", result.stdout)
+            self.assertFalse(state.exists())
+            self.assertFalse((self.data / "train.json").exists())
+
     def git(self, *args, cwd=None):
         return subprocess.run(
             ["git", *args],

@@ -39,6 +39,9 @@ results and candidates for less frequent execution. The HTTP server has no
 authentication. Keep it on loopback and use an SSH tunnel, or put it behind an
 authenticated proxy on a trusted network. Turn on `dashboard.allow_answers` to
 enable owner answers from the UI; otherwise use `pr-coord answer ID TEXT`.
+Agent questions are separate from owner questions. Read or answer them with
+`pr-coord agent-questions [ID ANSWER]`; `dashboard.show_agent_questions` exposes
+that queue to dashboard readers but does not put it in the owner answer form.
 
 ## Configuration and command contracts
 
@@ -75,6 +78,29 @@ enable owner answers from the UI; otherwise use `pr-coord answer ID TEXT`.
   limits and teardown. `cert-pr` uses an existing clean worktree on the PR
   branch or prepares a dedicated one, then waits for the configured targets;
   run it in a managed background shell if needed.
+- **Draft handoff:** `watch-draft PR` waits for a submitted bot review and
+  terminal successful certification statuses on the exact head, with no
+  certification still running. Configure `drafts.required_statuses` to require
+  particular status contexts and `drafts.reviewer_pattern` to override the
+  default Copilot bot login regex. `finish-draft PR` additionally checks review
+  threads and ownership, runs `landing.ci_capacity` (plus optional
+  `drafts.capacity_args`), retries exit 3, marks the PR ready and submits it to
+  the train. If `drafts.ready_workflow` is set, the next adoption waits for the
+  previous admission's run with `drafts.ready_run_suffix` (default `/ ready`).
+  `ATTENTION` means an operator must investigate; already-ready PRs can be
+  submitted with `handoff PR`. It reuses the clean PR branch worktree or creates
+  one and fast-forwards only; it does not discard local changes.
+- **Remote implementers:** opt a POSIX host in with `remote_agents = true`
+  and configure `[remote_agents]` with `command` (agent argv before `-p PROMPT`),
+  `report` (controller reporter argv), and an optional `runbook` file.
+  `remote-agent HOST NAME PROMPT_FILE` sends the prompt and optional runbook
+  over SSH to that trusted host and starts a tmux agent. Set a host's
+  `agent_env_session` to require an existing session for its windows. For a
+  keychain inaccessible over SSH, an operator can explicitly pipe an authorized
+  credential to `agent-env HOST`; it initializes that tmux session in memory
+  without storing the credential in settings or logs. Only do this for a host
+  authorized to receive the credential. Closing the session drops its tmux
+  environment; already-running programs retain their own environment.
 - **Remote tests:** `rt HOST WORKTREE -- COMMAND ...` sends the current
   worktree, including uncommitted changes, to the configured SSH worker. Only
   point this at trusted machines. `remote_tests.prepare` must provision the

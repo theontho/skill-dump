@@ -14,6 +14,7 @@ from runtime import P, questions
 HERE = P.data
 STATE = HERE / "state.json"
 QUESTIONS = HERE / "questions.json"
+AGENT_QUESTIONS = HERE / "agent_questions.json"
 ANSWER_TOKEN = token_urlsafe(32)
 READ_ONLY = True
 
@@ -264,6 +265,17 @@ def runners_panel(s):
 def page():
     s = load(STATE, {})
     qs = load(QUESTIONS, [])
+    agent_q = ""
+    if P.get("dashboard", "show_agent_questions", False):
+        awaiting = [q for q in load(AGENT_QUESTIONS, []) if not q.get("answer")]
+        rows = "".join(
+            f"<li><b>{esc(q.get('agent'))}</b> {esc(q.get('pr'))}: "
+            f"{esc(q.get('question'))}</li>"
+            for q in awaiting
+        )
+        agent_q = (
+            f"<h2>Questions for the coordinator ({len(awaiting)})</h2><ul>{rows}</ul>"
+        )
     triage = {}
     try:
         for line in (HERE / "triage.jsonl").read_text().splitlines():
@@ -491,6 +503,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;
 <h2>PR dependency graph</h2><div><small>red arrow = waits for (conflicts with a queued PR or lane holder); ✕ = number of PRs it conflicts with; orange border = priority. Hover/click a PR for details. Updated {esc(s.get("graph", {}).get("at"))}</small></div>
 <div style='overflow-x:auto'>{graph_svg(s.get("graph", {}))}</div>
 <h2>Questions for you ({len(open_q)})</h2>{qhtml}
+{agent_q}
 <h2>Active work</h2><table><tr><th>Agent</th><th>Status</th><th>PR / issue</th><th>Doing</th><th>Runs on</th><th>Updated</th></tr>{agents}</table>
 <details><summary><b>Finished ({agents_done_count})</b></summary><table><tr><th>Agent</th><th>Status</th><th>PR / issue</th><th>Result</th><th>Ran on</th><th>Updated</th></tr>{agents_done}</table></details>
 <details><summary>Remote test runs</summary><table><tr><th>Host</th><th>For</th><th>Command</th><th>Status</th><th>Started</th></tr>{runs}</table></details>
@@ -516,11 +529,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/state.json":
+            payload = {"state": load(STATE, {}), "questions": load(QUESTIONS, [])}
+            if P.get("dashboard", "show_agent_questions", False):
+                payload["agent_questions"] = load(AGENT_QUESTIONS, [])
             self._send(
                 200,
-                json.dumps(
-                    {"state": load(STATE, {}), "questions": load(QUESTIONS, [])}
-                ),
+                json.dumps(payload),
                 "application/json",
             )
         elif self.path == "/lifecycle":

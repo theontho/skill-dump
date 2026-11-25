@@ -111,7 +111,7 @@ def checks_ready(n):
     return checks(n)
 
 
-retried: dict[int | tuple[str, int], bool] = {}
+retried: dict[tuple[str, int] | tuple[str, int, str], bool] = {}
 
 
 def only_cancelled_run(run_id):
@@ -156,7 +156,8 @@ def only_cancelled(n):
     )
 
 
-def wait_merged_or_removed(n, since, active=lambda: True):
+def wait_merged_or_removed(n, head, since, active=lambda: True):
+    retry_key = ("merge-group", n, head)
     while active():
         info = pr_info(n)
         if info and info["state"] == "MERGED":
@@ -165,20 +166,24 @@ def wait_merged_or_removed(n, since, active=lambda: True):
         if not in_queue(n):
             reason, at = last_removal(n)
             if at and at >= since:
+                if paused():
+                    time.sleep(120)
+                    continue
                 if (
                     reason == "failed_checks"
                     and only_cancelled(n)
-                    and not retried.get(n)
+                    and not retried.get(retry_key)
                 ):
                     # The merge-group run was cancelled (queue rebuilt), not failed: re-enqueue once.
-                    retried[n] = True
-                    head = pr_info(n)["headRefOid"]
-                    if not active() or not enqueue(n, head):
+                    if not active():
+                        return False
+                    if not info or info["headRefOid"] != head or not enqueue(n, head):
                         need_agent(
                             n,
                             f"#{n}: cancellation-only retry could not safely enqueue.",
                         )
                         return False
+                    retried[retry_key] = True
                     status(
                         n,
                         "queued",
@@ -400,7 +405,10 @@ def land(entry):
         if in_queue(n):
             status(n, "queued", "already in the merge queue; watching")
             wait_merged_or_removed(
-                n, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), active
+                n,
+                info["headRefOid"],
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                active,
             )
             return
         # Source conflicts with main need an agent; flag them now instead of after the lane wait.
@@ -561,7 +569,7 @@ def land(entry):
             )
             return
         status(n, "queued", f"enqueued at {head[:9]}")
-        wait_merged_or_removed(n, since, active)
+        wait_merged_or_removed(n, head, since, active)
         return
 
 

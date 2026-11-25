@@ -18,6 +18,7 @@ cert_pattern = "cert-pr-{pr}"
 host = "127.0.0.1"
 port = 8787
 allow_answers = false
+show_agent_questions = false
 headline_hours = 24
 # headline_since = "2026-01-01T00:00:00Z"
 # runner_limit = 20
@@ -50,6 +51,17 @@ quick_gate = ["python3", "-m", "pytest", "-q"]
 # quick_local_prefix = ["agent-coord", "run", "--cores", "2", "--mem", "4G", "--",]
 # provision = ["./scripts/prepare", "--locked"]
 # regenerate = ["./scripts/regenerate"]
+
+[drafts]
+required_statuses = ["local-ci/generic", "local-ci/linux-x64"]
+# capacity_args = ["--pr", "{pr}"]
+# ready_workflow = "pull_request.yml"
+# ready_run_suffix = "/ ready"
+
+[remote_agents]
+# command = ["copilot", "--model", "model-name"]
+# report = ["coordinator-report"]
+# runbook = "~/src/project/RUNBOOK.md"
 
 [events]
 interval = 90
@@ -86,6 +98,8 @@ windows = false
 agent_coord = true
 slots = 1
 rt = true
+# remote_agents = true
+# agent_env_session = "coordenv"
 cert_priority = "linux"
 rt_prefix = ["agent-coord", "run", "--cores", "2", "--mem", "4G", "--"]
 # cert_prepare/cert_cleanup override the shared hooks on this host.

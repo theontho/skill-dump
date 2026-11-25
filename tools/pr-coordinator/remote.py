@@ -347,62 +347,12 @@ def cert_pr_main():
     )
     if pr["isCrossRepository"]:
         raise ValueError("cert-pr needs a branch in the configured repository")
-    sha, branch = pr["headRefOid"], pr["headRefName"]
-    wt = P.worktree(args.pr, "cert")
+    from worktrees import prepare
+
+    sha = pr["headRefOid"]
     with locked(f"cert-pr-{args.pr}.lock", wait=False):
-        git(
-            P.checkout,
-            "fetch",
-            "-q",
-            P.remote,
-            f"+refs/heads/{branch}:refs/remotes/{P.remote}/{branch}",
-        )
-        if git(P.checkout, "rev-parse", f"{P.remote}/{branch}") != sha:
-            raise ValueError("published head changed while fetching; retry")
-        # Some project controllers verify that HEAD is on the named PR branch, not detached.
-        for entry in git(P.checkout, "worktree", "list", "--porcelain", "-z").split(
-            "\0\0"
-        ):
-            fields = entry.split("\0")
-            if (
-                fields[0].startswith("worktree ")
-                and f"branch refs/heads/{branch}" in fields
-            ):
-                wt = Path(fields[0].removeprefix("worktree ")).resolve()
-                break
-        else:
-            if wt.exists():
-                raise ValueError(f"expected a new certification worktree at {wt}")
-            if git(P.checkout, "branch", "--list", branch):
-                git(P.checkout, "worktree", "add", "-q", str(wt), branch)
-            else:
-                git(
-                    P.checkout,
-                    "worktree",
-                    "add",
-                    "-q",
-                    "--track",
-                    "-b",
-                    branch,
-                    str(wt),
-                    f"{P.remote}/{branch}",
-                )
-        if wt == P.checkout:
-            raise ValueError(
-                "refusing to certify from the primary checkout; move the PR to a worktree"
-            )
-        if git(wt, "status", "--porcelain"):
-            raise ValueError(f"certification worktree has local changes: {wt}")
-        if git(wt, "rev-parse", "HEAD") != sha:
-            if wt != P.worktree(args.pr, "cert"):
-                raise ValueError(
-                    f"existing worktree is not at the published head: {wt}"
-                )
-            git(wt, "merge", "--ff-only", sha)
-            if git(wt, "rev-parse", "HEAD") != sha:
-                raise ValueError(
-                    f"certification worktree contains unpushed commits: {wt}"
-                )
+        with locked(f"worktree-pr-{args.pr}.lock"):
+            wt = prepare(args.pr, pr, "cert")
         prep = P.command(
             "certification", "controller_prepare", pr=args.pr, sha=sha, worktree=wt
         )
