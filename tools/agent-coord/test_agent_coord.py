@@ -1,10 +1,12 @@
 """Tests for agent-coord: python3 -m unittest -v test_agent_coord"""
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -13,6 +15,9 @@ from unittest.mock import patch
 import agent_coord as ac
 
 GIB = 1024**3
+# Tests that create real (transient, uniquely named) systemd user scopes run
+# only when AGENT_COORD_SYSTEMD_TESTS=1; by default a seam stands in for them.
+REAL_SCOPES = os.environ.get("AGENT_COORD_SYSTEMD_TESTS") == "1"
 
 
 def dead_pid() -> int:
@@ -34,15 +39,15 @@ class CoordinatorTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def make(self):
-        return ac.Coordinator(
+        coordinator = ac.Coordinator(
             self.state,
             measure=lambda: {"vms": list(self.vms), "busy": self.busy,
                              "available": self.available},
             cap=lambda: (8.0, 16 * GIB),
-            # No real CPU readings (the test process's own CPU time would leak
-            # into admission): tests that need lease use inject it.
+            # No real CPU readings: tests that need lease use inject it.
             cpu_seconds=lambda pid: None,
         )
+        return coordinator
 
     def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=(),
             **extra):
@@ -871,17 +876,30 @@ class CoordinatorTest(unittest.TestCase):
         self.assertAdmissible(2.0)
 
     def test_nested_exclusive_lock_leases_are_measured_once(self):
-        # Two timing leases, the inner one in the outer's tree (whose
-        # measurement includes it): neither is subtracted twice.
+        # Two timing leases, the inner one in the outer's tree: the outer
+        # tree's measurement includes the inner one (6 + 2 = 8). Per
+        # outermost tree, its use up to both sizes comes off, once.
         outer = os.getpid()
         self.timed(size=6, headroom=0, pid=outer)
         inner = self.ask(2, agent="perf", exclusive_locks=["nas"], pid=os.getppid())
         self.age(inner, ac.WARMUP + 1, "granted")
-        self.measure_leases({outer: 6.0, os.getppid(): 2.0}, busy=7.0,
+        self.measure_leases({outer: 8.0, os.getppid(): 2.0}, busy=9.0,
                             trees={outer: {outer, os.getppid()}})
-        # 6 + 2 reserved; 7 busy less the outer tree's 6: 1 of other work.
+        # 6 + 2 reserved; 9 busy less the tree's 8: 1 of other work.
         self.assertAlmostEqual(self.free_cores(), 3.0, places=1)
 
+    def test_process_trees_are_walked_only_for_leases_counted_once(self):
+        calls = []
+        self.configure(cores=12, mem=58, footprint=lambda pid: GIB)  # in use: no IO hint
+        for pid in (os.getpid(), os.getppid()):
+            self.age(self.ask(3, pid=pid), ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 1.0, os.getppid(): 1.0})
+        self.c.tree_pids = lambda pid: calls.append(pid) or {pid}
+        self.c.tick()
+        self.assertEqual(calls, [])  # ordinary leases only: no walk
+        self.ask(2, agent="perf", exclusive_locks=["gpu"])
+        self.c.tick()
+        self.assertTrue(calls)
     def test_a_ramping_exclusive_lock_lease_is_not_over_subtracted(self):
         # Its own use is smoothed from zero like the host figure, so while it
         # ramps up it never takes more out of the busy figure than that holds.
@@ -1278,79 +1296,1145 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(len(self.c.handle({"op": "inbox", "agent": "b"})["messages"]), 1)
 
 
-class SameAsMainWithoutExclusiveLeasesTest(unittest.TestCase):
-    """Without exclusive-lock leases, admission decides exactly as main's
-    code (the merge base with origin/main) on the same random workloads."""
+class ElasticTest(unittest.TestCase):
+    """MIN:MAX leases, preemption and fair shares (in-process
+    coordinator with injected clocks, measurements and scope resizing;
+    nothing reaches systemd and nothing is signalled)."""
 
-    @classmethod
-    def setUpClass(cls):
-        here = Path(__file__).resolve().parent
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name, "state.json")
+        self.cores = 8.0
+        self.busy = 0.0
+        self.outside = 0.0  # load not leased through agent-coord
+        self.now = 100000.0
+        self.mono = 1000.0
+        self.cpu: dict[int, float] = {}
+        self.children = []
+        self.check_grants = True
+        self.resized: list[tuple[str, float]] = []
+        self.failing: set[str] = set()  # scopes whose resize fails
+        self.c = ac.Coordinator(
+            self.state,
+            measure=lambda: {"vms": [], "busy": self.busy, "available": 64 * GIB},
+            cap=lambda: (self.cores, 64 * GIB),
+            cpu_seconds=lambda pid: self.cpu.get(pid),
+            footprint=lambda pid: 0,
+            tree_pids=lambda pid: {pid},
+            resize=self.resize,
+        )
+        patchers = [patch.object(ac.time, "time", side_effect=lambda: self.now),
+                    patch.object(ac.time, "monotonic", side_effect=lambda: self.mono)]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        for child in self.children:
+            child.kill()
+            child.wait()
+        self.tmp.cleanup()
+
+    def resize(self, scope, cores):
+        """The seam for systemctl set-property: records, or fails."""
+        self.resized.append((scope, cores))
+        return scope not in self.failing
+
+    def pid(self) -> int:
+        """A real, live process of our own to hold a lease (only ever probed
+        with signal 0 by the coordinator's liveness check)."""
+        child = subprocess.Popen(["sleep", "300"])
+        self.children.append(child)
+        return child.pid
+
+    def ask(self, cores, high=None, project="p", agent=None, **extra):
+        req = {"op": "acquire", "agent": agent or project, "pid": extra.pop("pid", None) or self.pid(),
+               "cores": cores, "mem": extra.pop("mem", GIB), "label": f"{project} job",
+               "project": project, "repo": extra.pop("repo", project),
+               "client": extra.pop("client", ac.CLIENT_VERSION),
+               "resizable": extra.pop("resizable", True), **extra}
+        if high is not None:
+            req["max_cores"] = high
+        return self.c.handle(req)
+
+    def lease(self, reply) -> dict:
+        return next(x for x in self.c.state["leases"] + self.c.state["queue"]
+                    if x["id"] == reply["id"])
+
+    def state_of(self, reply) -> str:
+        return self.c._ticket(reply["id"])["state"]
+
+    def reason(self, reply) -> str:
+        return self.c._ticket(reply["id"]).get("reason", "")
+
+    def sizes(self, *replies):
+        return tuple(self.lease(r)["cores"] for r in replies)
+
+    def ready(self):
+        """What each MIN:MAX client does once its command runs in its scope:
+        report it (a lease is resized only after that)."""
+        for x in list(self.c.state["leases"]):
+            if x.get("elastic") and not x.get("scope_ready"):
+                self.c.handle({"op": "poll", "id": x["id"], "pid": x["pid"], "scope_ready": True})
+
+    def later(self, seconds=10):
+        """Let the running leases' clients report their scopes, and time pass."""
+        self.ready()
+        self.now += seconds
+
+    def assert_grants_fit(self):
+        """The invariant: sizes in force add up to at most the machine. (Not
+        checked where, as before this change, fixed sizes and MINs were
+        admitted on measured use of leases using less than they hold.)"""
+        if self.check_grants:
+            total = sum(self.c._size(x) for x in self.c.state["leases"] if not x.get("io"))
+            self.assertLessEqual(total, self.cores + 1e-9,
+                                 [(x["id"], x["cores"]) for x in self.c.state["leases"]])
+
+    def advance(self, seconds, usage=None):
+        """Let seconds pass, with each lease (by id) using usage[id] cores
+        (default: all its cap allows), and tick."""
+        step = min(seconds, ac.TICK)
+        while seconds > 0:
+            self.ready()
+            use = {x["id"]: (usage or {}).get(x["id"], self.c._size(x))
+                   for x in self.c.state["leases"]}
+            self.busy = sum(use.values()) + self.outside  # smoothed by tick
+            self.now += step
+            self.mono += step
+            for x in self.c.state["leases"]:
+                self.cpu[x["pid"]] = self.cpu.get(x["pid"], 0.0) + use[x["id"]] * step
+            self.c.tick()
+            self.assert_grants_fit()
+            seconds -= step
+
+    def history(self):
+        return ac.read_history(0, Path(self.tmp.name, "history.jsonl"))
+
+    # -- request form
+
+    def test_cores_parser(self):
+        self.assertEqual(ac.parse_cores("4"), (4.0, None))
+        self.assertEqual(ac.parse_cores("2:8"), (2.0, 8.0))
+        self.assertEqual(ac.parse_cores("1.5:3"), (1.5, 3.0))
+        self.assertEqual(ac.parse_cores("3:3"), (3.0, None))
+        for bad in ("0", "8:2", "2:", ":4", "x", "-1:2"):
+            with self.subTest(bad=bad), self.assertRaises(ac.argparse.ArgumentTypeError):
+                ac.parse_cores(bad)
+
+    def test_cli_sends_min_max_and_refuses_ranges_for_timing_runs(self):
+        with patch.object(ac, "call", return_value={"ok": True, "cores": 6.0}) as call, \
+                patch("sys.stdout", io.StringIO()):
+            self.assertEqual(ac.main(["--as", "x", "check", "--cores", "2:8", "--mem", "1G",
+                                      "--project", "proj"]), 0)
+            sent = call.call_args.args[0]
+            self.assertEqual((sent["cores"], sent["max_cores"], sent["project"]), (2.0, 8.0, "proj"))
+            for extra in (["--exclusive-lock", "gpu"], ["--headroom", "1"], ["--exclusive"], ["--io"]):
+                with self.subTest(extra=extra), self.assertRaises(SystemExit), \
+                        patch("sys.stderr"):
+                    ac.main(["check", "--cores", "2:8", "--mem", "1G", *extra])
+            with self.assertRaises(SystemExit), patch("sys.stderr"):
+                ac.main(["hold", "--cores", "2:8", "--mem", "1G", "--label", "x", "--pid", "1"])
+        self.assertIn("error", self.ask(2, 8, exclusive_locks=["gpu"]))
+        self.assertIn("error", self.ask(2, 8, headroom=1))
+        self.assertIn("error", self.ask(4, 2))
+
+    def test_hold_takes_the_project_from_the_held_process(self):
+        with patch.object(ac, "call", return_value={"id": "L1"}) as call, \
+                patch.object(ac, "default_project", return_value="theirs") as project, \
+                patch("sys.stdout", io.StringIO()):
+            ac.main(["--as", "x", "hold", "--cores", "1", "--mem", "1G", "--label", "x",
+                     "--pid", str(os.getpid())])
+        self.assertEqual(project.call_args.args[1], os.getcwd())  # /proc/PID/cwd of the held pid
+        self.assertEqual(call.call_args.args[0]["project"], "theirs")
+
+    def test_scope_names_are_the_services(self):
+        a = self.ask(2, 8)
+        lease = self.lease(a)
+        self.assertEqual(lease["scope"], f"agent-coord-{a['id']}-{lease['pid']}.scope")
+        self.assertEqual(self.c._ticket(a["id"])["scope"], lease["scope"])
+        self.assertTrue(self.c._ticket(a["id"])["elastic"])
+        self.c.handle({"op": "release", "id": a["id"]})
+        fixed = self.ask(2, 8, resizable=False)  # no systemd scope: sized once, then fixed
+        self.assertNotIn("scope", self.lease(fixed))
+        self.assertFalse(self.c._ticket(fixed["id"])["elastic"])
+
+    # -- large timing runs, and the elastic pool beside a timing run
+
+    def test_timing_runs_of_any_size_are_accepted_as_on_main(self):
+        # Review 4, finding 4: no reserve, so a large timing run is admitted
+        # (or waits) exactly as before.
+        self.cores = 12.0
+        self.assertEqual(self.ask(11, project="t", exclusive_locks=["gpu"], headroom=1)["state"],
+                         "granted")
+        self.c.state["leases"].clear()
+        self.c.state["locks"].clear()
+        self.assertEqual(self.ask(12, project="t", exclusive_locks=["gpu"])["state"], "granted")
+        self.assertIn("error", self.ask(12, project="t", headroom=1))  # more than the machine
+    def timing_run_start(self, names: bool) -> float:
+        """When a timing run waiting behind a 6-core holder starts, with or
+        without other projects (or one agent with many --project names)
+        re-asking for 2 cores every 20 s meanwhile (review 2, finding 2)."""
+        self.c.state["leases"].clear()
+        self.c.state["queue"].clear()
+        self.c.state["locks"].clear()
+        self.cores = 12.0
+        start = self.now
+        holder = self.ask(6, project="h", expect=600)
+        timed = self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)
+        self.assertEqual(timed["state"], "waiting")
+        for round_ in range(6):
+            if names and self.state_of(timed) == "waiting":
+                asks = [self.ask(2, project=f"me-{round_}-{i}", agent="me", expect=60)
+                        for i in range(4)]
+                self.assertEqual({self.state_of(r) for r in asks}, {"waiting"})
+                for r in asks:
+                    self.c.handle({"op": "release", "id": r["id"]})
+            self.advance(20)
+            if round_ == 2:
+                self.c.handle({"op": "release", "id": holder["id"]})
+        started = [e["time"] for e in self.history()
+                   if e["id"] == timed["id"] and e["event"] == "started"]
+        if started:
+            return started[-1] - start
+        while self.state_of(timed) != "granted":
+            self.advance(ac.TICK)
+            self.assertLess(self.now - start, 3600)
+        return self.now - start
+
+    def test_many_project_names_do_not_delay_a_waiting_timing_run(self):
+        plain = self.timing_run_start(names=False)
+        self.assertEqual(self.timing_run_start(names=True), plain)
+
+    def test_many_project_names_do_not_delay_a_large_fixed_head(self):
+        self.cores = 12.0
+        holder = self.ask(6, project="h", expect=600)
+        head = self.ask(10, project="big")
+        later = [self.ask(2, project=f"n{i}", expect=7200) for i in range(4)]
+        # Exactly what plain EASY backfill allows (as on main): one fits
+        # beside the head's projected start, the rest would delay it.
+        self.assertEqual([self.state_of(r) for r in later], ["granted"] + ["waiting"] * 3)
+        self.assertIn("would delay", self.reason(later[1]))
+        self.c.handle({"op": "release", "id": holder["id"]})
+        self.assertEqual(self.state_of(head), "granted")
+
+    def test_no_reservation_for_projects_with_nothing_waiting(self):
+        self.cores = 12.0
+        self.ask(1, project="x")
+        self.ask(1, project="y", io=True)
+        self.assertEqual(self.ask(10, project="a")["state"], "granted")
+
+    # -- sizing and preemption
+
+    def test_admitted_at_min_granted_up_to_max(self):
+        self.assertEqual(self.lease(self.ask(2, 64))["cores"], 8)  # MAX clamped to the machine
+        self.c.state["leases"].clear()
+        self.ask(5, project="p")
+        self.assertEqual(self.lease(self.ask(2, 8, project="q"))["cores"], 3)
+        self.assertEqual(self.ask(1, 4, project="r")["state"], "waiting")  # q is just starting
+
+    def test_starts_at_its_fair_size_not_max_when_others_wait(self):
+        self.cores = 12.0
+        hog = self.ask(12, project="h", exclusive=True)
+        e = self.ask(2, 12, project="p")
+        w = self.ask(4, project="q")
+        self.c.handle({"op": "release", "id": hog["id"]})
+        self.assertEqual((self.state_of(e), self.state_of(w)), ("granted", "granted"))
+        self.assertEqual(self.lease(e)["cores"], 6)  # its share beside q, leaving q's 4
+        self.assertFalse([x for x in self.history() if x["event"] == "resized"])
+
+    def test_service_resizes_the_scope_before_counting_the_cores(self):
+        a = self.ask(2, 8, agent="elastic")
+        self.later()
+        b = self.ask(4, project="q", agent="fixed")
+        self.assertEqual(b["state"], "granted")  # at once: the service capped a's scope
+        self.assertEqual(self.resized, [(self.lease(a)["scope"], 4.0)])
+        self.assertEqual(self.lease(a)["cores"], 4)
+        resized, = [e for e in self.history() if e["event"] == "resized"]
+        self.assertEqual((resized["from"], resized["cores"], resized["kind"]), (8, 4, "preempted"))
+        note, = self.c.handle({"op": "inbox", "agent": "elastic"})["messages"]
+        self.assertIn("was shrunk to 4 cores", note["text"])
+
+    def test_only_scopes_it_named_are_resized(self):
+        a = self.ask(2, 8)
+        self.later()
+        self.lease(a)["scope"] = "other-" + self.lease(a)["scope"]  # not the service's prefix
+        self.assertEqual(self.ask(4, project="q")["state"], "waiting")
+        self.assertEqual(self.resized, [])
+        self.assertNotIn("elastic", self.lease(a))
+
+    def test_large_fixed_request_gets_no_more_than_its_share(self):
+        # Review 2, finding 3 (the supervisor's example), 12 cores.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(64)
+        fixed = self.ask(10, project="b")
+        self.assertEqual(fixed["state"], "waiting")
+        self.assertEqual(self.lease(a)["cores"], 12)  # not shrunk for a request it cannot start
+        self.assertIn("fair share (6 of 12 cores)", self.reason(fixed))
+        self.assertIn("MIN:MAX", self.reason(fixed))
+        self.c.handle({"op": "release", "id": fixed["id"]})
+        elastic = self.ask(2, 10, project="b")
+        self.assertEqual(self.state_of(elastic), "granted")
+        self.assertEqual(self.sizes(a, elastic), (6, 6))
+        self.c.handle({"op": "release", "id": elastic["id"]})
+        self.advance(64)
+        self.assertEqual(self.ask(6, project="b")["state"], "granted")  # a fixed 6 fits its share
+        self.assertEqual(self.lease(a)["cores"], 6)
+
+    def test_requests_behind_a_lock_or_memory_wait_also_preempt(self):
+        # Review 2, finding 5.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a", mem=4 * GIB)
+        self.advance(64)
+        self.c.handle({"op": "lock", "agent": "owner", "name": "gpu", "reason": "x"})
+        gpu = self.ask(1, project="g", locks=["gpu"])
+        b = self.ask(4, project="b")
+        self.assertEqual((self.state_of(gpu), self.state_of(b)), ("waiting", "granted"))
+        self.assertEqual(self.lease(a)["cores"], 7)  # b's 4, and room for the GPU job's 1
+        big = self.ask(1, project="m", mem=63 * GIB)  # waits for memory at the line's end
+        c = self.ask(2, project="c")
+        self.assertEqual((self.state_of(big), self.state_of(c)), ("waiting", "granted"))
+
+    def test_shrinks_to_min_on_contention_and_no_further(self):
+        a = self.ask(2, 8, agent="elastic")
+        self.later()
+        b = self.ask(4, project="q", agent="fixed")
+        self.assertEqual(b["state"], "granted")
+        self.assertEqual(self.lease(a)["cores"], 4)
+        c = self.ask(3, project="r", agent="third")  # a would have to go below MIN
+        self.assertEqual(c["state"], "waiting")
+        self.assertEqual(self.lease(a)["cores"], 4)
+        fourth = self.ask(2, project="s", agent="fourth")
+        self.assertEqual(fourth["state"], "waiting")  # in line behind c
+        self.c.handle({"op": "release", "id": c["id"]})
+        self.assertEqual(self.state_of(fourth), "granted")
+        self.assertEqual(self.lease(a)["cores"], 2)
+
+    def test_fixed_exclusive_and_headroom_leases_are_never_shrunk(self):
+        fixed = self.ask(3)
+        timed = self.ask(2, exclusive_locks=["gpu"], headroom=1)
+        elastic = self.ask(1, 4)
+        self.assertEqual(self.lease(elastic)["cores"], 2)  # 8 - 3 - 2 - 1 headroom
+        self.later()
+        waiting = self.ask(2)
+        self.assertEqual(waiting["state"], "waiting")
+        self.assertEqual(self.sizes(fixed, timed, elastic), (3, 2, 2))
+        self.c.handle({"op": "release", "id": waiting["id"]})
+        self.assertEqual(self.ask(1)["state"], "granted")  # the elastic one gave a core
+        self.assertEqual(self.sizes(fixed, timed, elastic), (3, 2, 1))
+
+    def test_grows_back_with_hysteresis(self):
+        a = self.ask(2, 8)
+        self.later()
+        b = self.ask(4)
+        self.c.handle({"op": "release", "id": b["id"]})
+        self.advance(30)
+        self.assertEqual(self.lease(a)["cores"], 4)  # within resize_interval
+        self.advance(100)
+        self.assertEqual(self.lease(a)["cores"], 7)  # 8 free less the 1-core margin
+        self.assertEqual([e for e in self.history() if e["event"] == "resized"][-1]["kind"], "grew")
+        self.advance(120)
+        self.assertEqual(self.lease(a)["cores"], 7)
+
+    def test_no_growth_while_a_request_waits_for_cores(self):
+        a = self.ask(2, 8)
+        self.later()
+        self.ask(4)
+        self.advance(ac.WARMUP + 5)
+        self.assertEqual(self.ask(3)["state"], "waiting")  # a would need to go below MIN
+        self.advance(120)
+        self.assertEqual(self.lease(a)["cores"], 4)
+        self.assertFalse([e for e in self.history() if e.get("kind") == "grew"])
+
+    def test_idle_shrink_and_regrow(self):
+        a = self.ask(2, 8)
+        self.advance(ac.WARMUP + 4)
+        self.advance(100, usage={a["id"]: 1.0})
+        self.assertEqual(self.lease(a)["cores"], 8)
+        self.advance(40, usage={a["id"]: 1.0})
+        self.assertEqual(self.lease(a)["cores"], 2)  # max(MIN, ceil(1.0 / 0.7))
+        self.assertEqual([e for e in self.history() if e["event"] == "resized"][-1]["kind"], "idle")
+        self.assertTrue(self.c.handle({"op": "status"})["leases"][0]["shrunk"])
+        self.advance(128, usage={a["id"]: 2.0})  # busy at its new size: grows on demand
+        self.assertEqual(self.lease(a)["cores"], 7)
+
+    def test_without_scopes_a_range_is_granted_at_min_and_fixed(self):
+        # Review 4, finding 5: it could never be shrunk, so it gets MIN only.
+        a = self.ask(2, 8, resizable=False)
+        self.assertEqual(self.lease(a)["cores"], 2)
+        self.assertNotIn("elastic", self.lease(a))
+        self.c.state["leases"].clear()
+        e = self.ask(2, 12, project="e")
+        self.later()
+        f = self.ask(2, 12, project="f", resizable=False)
+        # e gave only f's MIN, not f's fair share: f could never give it back.
+        self.assertEqual((self.lease(f)["cores"], self.lease(e)["cores"]), (2, 6))
+
+    def test_backfilled_range_shrinks_others_only_for_its_min(self):
+        # Review 4, finding 6: behind a GPU-lock head, a backfilled 2:8
+        # starts at MIN, so only 2 cores are taken from the elastic lease.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(64)
+        self.c.handle({"op": "lock", "agent": "owner", "name": "gpu", "reason": "x"})
+        self.ask(1, project="g", locks=["gpu"])
+        b = self.ask(2, 8, project="b")
+        self.assertEqual(self.state_of(b), "granted")
+        self.assertEqual((self.lease(a)["cores"], self.lease(b)["cores"]), (9, 2))
+
+    def test_current_client_without_repo_is_not_a_free_project_name(self):
+        x = self.lease(self.ask(1, project="invented", repo=None))
+        self.assertEqual(self.c._project(x), "default")
+        old = self.lease(self.ask(1, project="named", repo=None, client=None))
+        old.pop("client", None)
+        self.assertEqual(self.c._project(old), "named")  # older clients keep their name
+
+    def test_a_newer_resize_of_the_same_lease_is_not_lost(self):
+        # Review 5, finding 2, with the real worker thread: while the first
+        # shrink of A completes, a second waiting request asks A to shrink
+        # again; that second resize must stay pending and run.
+        self.c.resize_async = True
+        first_called, release = threading.Event(), threading.Event()
+        calls = []
+
+        def resize(scope, cores):
+            calls.append(cores)
+            if len(calls) == 1:
+                first_called.set()
+                release.wait(10)
+            return True
+
+        self.c.resize = resize
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(64)
+        self.c.ensure_worker(start=True)
+        b = self.ask(4, project="b")
+        self.assertTrue(first_called.wait(10))
+        c = self.ask(4, project="c")  # waits: A's first shrink is under way
+        self.assertEqual(self.c._jobs.qsize(), 0)  # at most one job for A at a time
+        release.set()
+        for _ in range(500):
+            if self.state_of(c) == "granted":
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.state_of(b), self.state_of(c)), ("granted", "granted"))
+        self.assertEqual(calls, [8.0, 4.0])
+        for _ in range(100):
+            if not self.c._pending:
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.lease(a)["cores"], self.c._pending), (4, {}))
+
+    def test_tolerance_only_with_elastic_leases(self):
+        self.ask(4, project="t", exclusive_locks=["gpu"])
+        self.assertEqual(self.c._eps(), 0.0)  # timing runs alone: decisions as on #11
+        self.ask(2, 4, project="e")
+        self.assertEqual(self.c._eps(), ac.CPU_EPS)
+
+    def test_resize_worker_survives_failures_and_is_restarted(self):
+        # Review 4, finding 3: an exception in a job (a full disk in _save, a
+        # resize call that raises) must not end resizing for good.
+        self.c.resize_async = True
+        calls = []
+
+        def resize(scope, cores):
+            calls.append(cores)
+            if len(calls) == 1:
+                raise OSError("bus gone")
+            return True
+
+        self.c.resize = resize
+        a = self.ask(2, 8, project="p")
+        self.later()
+        b = self.ask(4, project="q")
+        self.assertEqual(self.c._jobs.qsize(), 1)
+        save, failed = self.c._save, []
+
+        def failing_save():
+            if not failed:
+                failed.append(1)
+                raise OSError(28, "No space left on device")
+            save()
+
+        self.c._save = failing_save
+        with patch("sys.stderr", io.StringIO()):
+            self.assertFalse(self.c.ensure_worker())  # nothing to restart yet
+            self.assertTrue(self.c.ensure_worker(start=True))
+            for _ in range(200):
+                if not self.c._jobs.qsize() and not self.c._pending:
+                    break
+                time.sleep(0.01)
+            time.sleep(0.05)
+            self.assertTrue(self.c._worker.is_alive())  # survived the failing call and save
+            self.assertEqual(self.c._pending, {})
+            self.assertEqual(self.lease(a)["resize_failures"], 1)  # counted, retried later
+            self.now += ac.RESIZE_BACKOFF + 1
+            with self.c.lock:
+                self.c._admit()
+            for _ in range(200):
+                if self.state_of(b) == "granted":
+                    break
+                time.sleep(0.01)
+            self.assertEqual((self.state_of(b), self.lease(a)["cores"]), ("granted", 4))
+            dead = threading.Thread(target=lambda: None)
+            dead.start()
+            dead.join()
+            self.c._worker = dead  # as if it had died
+            self.c.tick()
+            self.assertTrue(self.c._worker.is_alive())  # the tick's watchdog restarted it
+    def test_two_projects_converge_to_half_each(self):
+        a = self.ask(2, 8, project="p")
+        self.later()
+        b = self.ask(2, 8, project="q")
+        self.assertEqual(self.sizes(a, b), (4, 4))  # its share at once
+        self.advance(240)
+        self.assertEqual(self.sizes(a, b), (4, 4))
+
+    def test_third_project_gets_its_share_at_once(self):
+        self.cores = 12.0
+        a = self.ask(2, 12, project="p")
+        self.later()
+        b = self.ask(2, 12, project="q")
+        self.advance(64)
+        self.assertEqual(self.sizes(a, b), (6, 6))
+        c = self.ask(2, 12, project="r")
+        self.assertEqual(self.state_of(c), "granted")
+        self.assertEqual(sorted(self.sizes(a, b, c)), [4, 4, 4])
+
+    def test_idle_projects_share_is_used_and_handed_back(self):
+        a = self.ask(2, 8, project="p")
+        self.advance(64)
+        self.assertEqual(self.lease(a)["cores"], 8)  # q idle: p may take everything
+        b = self.ask(2, 8, project="q")
+        self.assertEqual(self.sizes(a, b), (4, 4))
+        self.c.handle({"op": "release", "id": b["id"]})
+        self.advance(128)
+        self.assertEqual(self.lease(a)["cores"], 7)  # q idle again: p grows back
+
+    def test_unequal_weights(self):
+        config = Path(self.tmp.name, "config.toml")
+        config.write_text("[projects.q]\nweight = 3\n")
+        self.c.config_file = config
+        self.c.tick()
+        self.assertEqual(self.c._weight("q"), 3)
+        a = self.ask(1, 8, project="p")
+        self.later()
+        b = self.ask(1, 8, project="q")
+        self.assertEqual(self.sizes(a, b), (2, 6))
+        rows = {r["name"]: r for r in self.c.handle({"op": "status"})["projects"]}
+        self.assertEqual((rows["p"]["share"], rows["q"]["share"]), (2, 6))
+
+    def test_line_stays_first_come_first_served_across_projects(self):
+        self.cores = 12.0
+        holder = self.ask(6, project="h", expect=600)
+        head = self.ask(8, project="big")
+        later = [self.ask(2, project="small", expect=72000) for _ in range(3)]
+        self.assertEqual([self.state_of(r) for r in later], ["granted", "granted", "waiting"])
+        self.assertIn("leaves capacity", self.lease(later[1])["backfill_reason"])
+        self.assertIn("would delay", self.reason(later[2]))
+        self.c.handle({"op": "release", "id": holder["id"]})
+        self.assertEqual(self.state_of(head), "granted")
+
+    def test_nothing_passes_a_waiting_exclusive_after_its_window(self):
+        self.ask(4, project="h")
+        first = self.ask(6, project="p")
+        whole = self.ask(1, project="p", exclusive=True)
+        self.now += ac.EXCLUSIVE_PASS_WINDOW + 1
+        self.busy = self.c.busy = 4.0  # the holder is busy
+        late = self.ask(2, project="q", mem=8 * GIB)
+        self.assertEqual(late["state"], "waiting")
+        self.assertEqual([x["id"] for x in self.c.state["queue"]], [first["id"], whole["id"], late["id"]])
+
+    def test_whole_machine_exclusive_keeps_its_rules(self):
+        self.ask(1, project="q")
+        whole = self.ask(2, project="p", exclusive=True)
+        self.assertEqual(whole["state"], "waiting")
+        self.assertIn("must end first", whole["reason"])
+        self.assertEqual(self.ask(2, project="r")["state"], "granted")  # small, within the window
+        self.now += ac.EXCLUSIVE_PASS_WINDOW + 1
+        self.assertEqual(self.ask(1, project="s")["state"], "waiting")
+        for x in list(self.c.state["leases"]):
+            self.c.handle({"op": "release", "id": x["id"]})
+        self.assertEqual(self.state_of(whole), "granted")
+
+    # -- the reviews' scenarios, 12 cores
+
+    def test_scenario_a_fixed_request_beside_a_full_elastic_lease(self):
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(64)
+        b = self.ask(4, project="b")
+        self.assertEqual(self.state_of(b), "granted")
+        self.assertEqual(self.lease(a)["cores"], 8)
+        self.c.handle({"op": "release", "id": b["id"]})
+        self.advance(128)
+        self.assertEqual(self.lease(a)["cores"], 11)
+
+    def test_scenario_b_many_elastic_leases_and_a_newcomer(self):
+        self.cores = 12.0
+        mine = [self.ask(2, 4, project="a") for _ in range(3)]
+        self.assertEqual(self.sizes(*mine), (4, 4, 4))
+        self.later()
+        b = self.ask(2, 8, project="b")
+        self.assertEqual(self.lease(b)["cores"], 6)
+        self.assertEqual(sum(self.sizes(*mine)), 6)
+        self.advance(120)
+        self.assertEqual((sum(self.sizes(*mine)), self.lease(b)["cores"]), (6, 6))
+
+    def test_scenario_d_three_busy_projects_then_one_leaves(self):
+        self.cores = 12.0
+        leases = []
+        for p in "abc":
+            leases.append(self.ask(2, 12, project=p))
+            self.advance(8)
+        self.advance(300)  # the invariant is checked after every tick
+        self.assertEqual(sorted(self.sizes(*leases)), [4, 4, 4])
+        self.c.handle({"op": "release", "id": leases[2]["id"]})
+        self.advance(300)
+        self.assertEqual(self.sizes(*leases[:2]), (6, 6))
+
+    def test_even_out_never_grants_more_than_the_machine(self):
+        # Review 2, finding 7: a 2:12 and a fixed 6 in one project, a 2:12 in another.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(8)
+        self.ask(6, project="a")
+        self.advance(8)
+        b = self.ask(2, 12, project="b")
+        self.advance(300)
+        self.assertEqual(self.sizes(a, b), (2, 4))
+
+    def test_scenario_f_memory_waits_never_preempt(self):
+        a = self.ask(2, 4, project="a", mem=10 * GIB)
+        self.later()
+        b = self.ask(1, project="b", mem=60 * GIB)
+        self.assertEqual(b["state"], "waiting")
+        self.assertEqual(self.c._why(self.lease(b))[0], "mem")
+        self.assertEqual(self.lease(a)["cores"], 4)
+        self.assertEqual(self.resized, [])
+
+    def test_a_ramping_lease_is_not_over_subtracted(self):
+        # Review 2, finding 8: smoothing starts from 0, like the busy figure.
+        self.cores = 12.0
+        big = self.ask(8, project="big")
+        self.advance(120)
+        self.check_grants = False
+        big2 = self.ask(4, project="big")
+        small = self.ask(2, project="small")
+        self.assertEqual(small["state"], "waiting")
+        self.advance(2 * ac.TICK, usage={big2["id"]: 4.0})
+        self.assertEqual(self.state_of(small), "waiting")
+        self.assertLessEqual(self.c._own_cores[big2["id"]], 1.0)
+        self.assertTrue(big)
+
+    def test_nested_and_smoothed_lease_measurements(self):
+        self.cores = 12.0
+        outer = self.ask(4, project="t", exclusive_locks=["gpu"])
+        inner = self.ask(2, project="t", exclusive_locks=["nas"])
+        pid_outer, pid_inner = self.lease(outer)["pid"], self.lease(inner)["pid"]
+        self.c.tree_pids = lambda pid: {pid_outer, pid_inner} if pid == pid_outer else {pid}
+        self.now += ac.WARMUP + 1
+        self.check_grants = False
+        self.advance(200, usage={outer["id"]: 4.0, inner["id"]: 2.0})  # outer's 4 includes inner's 2
+        self.outside = 3.0
+        self.busy = self.c.busy = 7.0
+        self.assertAlmostEqual(self.c.handle({"op": "status"})["free"]["cores"], 3.0, places=1)
+
+    # -- review 3
+
+    def test_fixed_only_project_alone_runs_as_on_main(self):
+        # Review 3, finding 2: three fixed 4-core gates and a 2-core job, each
+        # using less than it holds, 90 s apart: all four run, as on main.
+        self.cores = 12.0
+        self.outside = 0.5
+        usage = {}
+        jobs = []
+        for size, use in ((4, 2.5), (4, 2.5), (4, 2.5), (2, 1.5)):
+            jobs.append(self.ask(size, project="gates", expect=3600))
+            usage[jobs[-1]["id"]] = use
+            self.check_grants = False  # fixed sizes admitted on measured use, as on main
+            self.advance(90, usage=usage)
+        self.assertEqual([self.state_of(r) for r in jobs], ["granted"] * 4)
+
+    def test_invented_project_names_share_their_repositorys_entitlement(self):
+        # Review 3, finding 4: five --project names from one repository.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.later()
+        names = [self.ask(2, 12, project=f"B{i}", repo="b") for i in range(5)]
+        self.advance(120)
+        self.assertEqual(self.lease(a)["cores"], 6)  # repository b's share, not five shares
+        self.assertEqual(sum(self.lease(r)["cores"] for r in names
+                             if self.state_of(r) == "granted"), 6)
+        self.assertEqual(self.c._project(self.lease(names[0])), "b")
+
+    def test_configured_project_names_count_on_their_own(self):
+        config = Path(self.tmp.name, "config.toml")
+        config.write_text("[projects.sub]\nweight = 1\n")
+        self.c.config_file = config
+        self.c.tick()
+        x = self.lease(self.ask(1, project="sub", repo="b"))
+        self.assertEqual(self.c._project(x), "sub")
+
+    def test_timing_run_takes_other_projects_elastic_cores_down_to_min(self):
+        # Review 5, finding 1: whatever its fair share, a timing run at the
+        # head shrinks other projects' elastic leases as far as it needs.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(64)
+        self.assertEqual(self.lease(a)["cores"], 12)
+        timed = self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)
+        self.assertEqual(self.state_of(timed), "granted")  # within one resize
+        self.assertEqual(self.lease(a)["cores"], 3)  # 12 - 8 - 1 headroom
+        self.assertEqual(len(self.resized), 1)
+
+    def test_timing_run_shrinks_a_small_elastic_lease_within_its_share(self):
+        self.cores = 12.0
+        b = self.ask(2, 4, project="b")
+        self.later()
+        self.assertEqual(self.lease(b)["cores"], 4)
+        timed = self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)
+        self.assertEqual((self.state_of(timed), self.lease(b)["cores"]), ("granted", 3))
+
+    def test_waiting_timing_run_is_not_told_to_use_min_max(self):
+        self.cores = 12.0
+        self.ask(2, 12, project="a")
+        self.later()
+        self.ask(6, project="f")  # fixed: never shrunk
+        timed = self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)
+        self.assertEqual(self.state_of(timed), "waiting")  # 6 + MIN 2 + 8 + 1 > 12
+        self.assertNotIn("MIN:MAX", self.reason(timed))
+
+    def test_elastic_holder_beside_a_timing_run_gives_back_and_is_named(self):
+        # Review 3, finding 5 (scenario g).
+        self.cores = 12.0
+        self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)
+        b = self.ask(2, 4, project="b")
+        self.assertEqual(self.lease(b)["cores"], 3)
+        self.later()
+        c = self.ask(1, 4, project="c")
+        self.assertEqual(self.state_of(c), "granted")  # reclaimed from b, down to b's MIN
+        self.assertEqual((self.lease(b)["cores"], self.lease(c)["cores"]), (2, 1))
+        d = self.ask(2, 4, project="d")
+        self.assertEqual(d["state"], "waiting")
+        reason = self.reason(d)
+        self.assertIn(f"{self.lease(b)['id']} (project b, elastic, at its MIN 2)", reason)
+        self.assertIn("(project t, timing run 8, never shrunk)", reason)
+
+    def test_fixed_lease_keeping_a_project_below_its_share_is_named(self):
+        # (c2): a held (already running) fixed 11 cannot be shrunk.
+        self.cores = 12.0
+        hog = self.ask(11, project="a", agent="hog", running=True)
+        self.busy = self.c.busy = 11.0
+        b = self.ask(2, 4, project="b")
+        self.assertEqual(b["state"], "waiting")
+        self.assertIn(f"held by {hog['id']} (project a, fixed 11, never shrunk)", self.reason(b))
+        status = self.c.handle({"op": "status"})
+        lease, = [x for x in status["leases"] if x["id"] == hog["id"]]
+        self.assertEqual(lease["holding_back"], ["b"])
+        hint, = self.c.handle({"op": "inbox", "agent": "hog"})["messages"]
+        self.assertIn("--cores MIN:MAX", hint["text"])
+
+    def test_timing_runs_are_not_told_to_use_min_max(self):
+        self.cores = 12.0
+        self.ask(8, project="a", agent="timer", exclusive_locks=["gpu"], headroom=1)
+        self.ask(2, project="a", agent="other")
+        self.assertEqual(self.ask(4, 6, project="b")["state"], "waiting")
+        self.assertTrue([e for e in self.history() if e["event"] == "unfair"])
+        self.assertFalse(self.c.handle({"op": "inbox", "agent": "timer"})["messages"])
+        self.assertIn("MIN:MAX", self.c.handle({"op": "inbox", "agent": "other"})["messages"][0]["text"])
+
+    def test_resize_failures_are_retried_before_a_lease_is_fixed(self):
+        # Review 3, finding 3.
+        for recovers in (True, False):
+            with self.subTest(recovers=recovers):
+                self.c.state["leases"].clear()
+                self.c.state["queue"].clear()
+                self.busy = self.c.busy = 0.0
+                a = self.ask(2, 8, project="p")
+                self.later()
+                scope = self.lease(a)["scope"]
+                self.failing.add(scope)
+                b = self.ask(2, project="q")
+                self.assertEqual(b["state"], "waiting")
+                self.assertTrue(self.lease(a)["elastic"])  # one failure: kept, retried later
+                self.assertFalse(self.c._donor(self.lease(a)))
+                if recovers:
+                    self.failing.discard(scope)
+                self.busy = self.c.busy = 8.0  # a is busy
+                self.c._own_cores = {a["id"]: 8.0}
+                self.c._size_avg = {a["id"]: 8.0}  # as measured while it ran at 8
+                for attempt in range(1, ac.RESIZE_ATTEMPTS):
+                    self.now += ac.RESIZE_BACKOFF * 2 ** (attempt - 1) + 1
+                    self.c._admit()
+                if recovers:
+                    self.assertEqual((self.state_of(b), self.lease(a)["cores"]), ("granted", 6))
+                    self.assertNotIn("resize_failures", self.lease(a))
+                else:
+                    self.assertNotIn("elastic", self.lease(a))  # fixed after the last attempt
+                    self.assertEqual(self.lease(a)["resize_kind"], "fixed")
+                    self.assertTrue([m for m in self.c.handle({"op": "inbox", "agent": "p"})["messages"]
+                                     if "can no longer be resized" in m["text"]])
+                    self.assertEqual(self.state_of(b), "waiting")
+        with patch.object(ac.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 5)):
+            self.assertFalse(ac.resize_scope("agent-coord-L1-1.scope", 2))
+        with patch.object(ac.subprocess, "run", side_effect=OSError("no systemctl")):
+            self.assertFalse(ac.resize_scope("agent-coord-L1-1.scope", 2))
+    def test_never_resized_before_its_client_reports_the_scope(self):
+        a = self.ask(2, 8, project="p")
+        self.now += 30  # granted, but its client has not reported its scope
+        self.assertEqual(self.ask(4, project="q")["state"], "waiting")
+        self.assertEqual(self.resized, [])
+        self.now += ac.SCOPE_READY_AFTER  # no report at all: tried after the window
+        self.c._admit()
+        self.assertEqual(self.lease(a)["cores"], 4)
+
+    def test_resizes_run_outside_the_lock_and_count_when_done(self):
+        # Review 3, finding 6, and the service's own order: a shrink counts
+        # only after systemctl succeeded, and the call never holds the lock.
+        self.c.resize_async = True
+        seen = []
+
+        def resize(scope, cores):
+            seen.append(self.c.lock.locked())
+            return True
+
+        self.c.resize = resize
+        a = self.ask(2, 8, project="p")
+        self.later()
+        b = self.ask(4, project="q")
+        self.assertEqual(b["state"], "waiting")  # the shrink is under way
+        self.assertEqual(self.lease(a)["cores"], 8)
+        self.assertEqual(self.c._jobs.qsize(), 1)
+        self.assertEqual(self.ask(1, project="r")["state"], "waiting")  # not planned twice
+        self.assertEqual(self.c._jobs.qsize(), 1)
+        self.c.resize_job(self.c._jobs.get())
+        self.assertEqual(seen, [False])
+        self.assertEqual((self.lease(a)["cores"], self.state_of(b)), (4, "granted"))
+
+    def test_settles_over_900_ticks_with_resizable_leases(self):
+        # Review 3's oscillation probe: A busy, B at 80%, C busy and idle in
+        # turn every 5 minutes; sizes in force never exceed the machine and
+        # leases are not resized back and forth.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(8)
+        b = self.ask(2, 12, project="b")
+        self.advance(8)
+        c = self.ask(2, 8, project="c")
+        changes = []
+        for tick in range(900):
+            busy_c = (tick * ac.TICK // 300) % 2 == 0
+            usage = {a["id"]: self.lease(a)["cores"], b["id"]: 0.8 * self.lease(b)["cores"],
+                     c["id"]: self.lease(c)["cores"] if busy_c else 0.2}
+            before = len(self.history())
+            self.advance(ac.TICK, usage=usage)
+            changes.append(len([e for e in self.history()[before:] if e["event"] == "resized"]))
+        windows = [sum(changes[i:i + 150]) for i in range(0, 900, 150)]
+        self.assertLessEqual(max(windows), 8, windows)
+        self.assertEqual(sum(self.sizes(a, b, c)) <= 12, True)
+
+    # -- configuration
+
+    def test_config_defaults_and_every_bad_value(self):
+        self.assertEqual(ac.load_config(None)["resize_interval"], 60)
+        cases = {
+            "default_weight = 0\n": "default_weight", "idle_target_use = 0\n": "idle_target_use",
+            "projects = 3\n": "projects must be a table", "idle_fraction = 2\n": "idle_fraction",
+            "resize_interval = 1e9\n": "resize_interval", 'grow_demand = "x"\n': "grow_demand",
+            "reserve_cores = 2\n": "unknown setting",
+            "[projects.x]\nweight = 0\n": "projects.x", "[projects]\nx = 3\n": "projects.x",
+            "nonsense = 1\n": "unknown setting", "this is not toml": "using defaults",
+            "floor_cores = 2\n": "unknown setting",
+        }
+        path = Path(self.tmp.name, "bad.toml")
+        for text, error in cases.items():
+            with self.subTest(text=text), patch("sys.stderr", io.StringIO()):
+                path.write_text(text)
+                config = ac.load_config(path)
+                self.assertTrue(any(error in e for e in config["errors"]), config["errors"])
+                for key, default in ac.DEFAULT_CONFIG.items():
+                    self.assertEqual(config[key], default)
+                self.assertEqual(config["projects"], {})
+        path.write_text("resize_interval = 30\n[projects.x]\nweight = 2\n")
+        config = ac.load_config(path)
+        self.assertEqual((config["resize_interval"], config["projects"]), (30, {"x": {"weight": 2}}))
+
+    def test_bad_config_never_stops_admission_or_ticks(self):
+        path = Path(self.tmp.name, "config.toml")
+        self.c.config_file = path
+        self.check_grants = False  # idle leases: MINs admitted on measured use
+        a = self.ask(2, 8, project="p")
+        for text in ("default_weight = 0\n", "idle_target_use = 0\n", "projects = 3\n", "\x00"):
+            with self.subTest(text=text), patch("sys.stderr", io.StringIO()):
+                path.write_text(text)
+                self.now += 1
+                os.utime(path, (self.now, self.now))
+                self.advance(200, usage={a["id"]: 0.5})
+                self.assertIn("state", self.ask(2, 4, project=f"q{len(text)}"))
+                self.assertTrue(self.c.handle({"op": "status"})["config_errors"])
+        out = io.StringIO()
+        with patch.object(ac, "call", side_effect=lambda req, **_: self.c.handle(req)), \
+                patch("sys.stdout", out):
+            ac.cmd_status(ac.argparse.Namespace(json=False))
+        self.assertIn("config: ", out.getvalue())
+
+    # -- visibility
+
+    def test_status_and_history_text(self):
+        a = self.ask(2, 8, project="p")
+        self.later()
+        self.ask(4, project="q")
+        out = io.StringIO()
+        with patch.object(ac, "call", side_effect=lambda req, **_: self.c.handle(req)), \
+                patch("sys.stdout", out):
+            ac.cmd_status(ac.argparse.Namespace(json=False))
+        text = out.getvalue()
+        self.assertIn("4 of 2:8 cores", text)
+        self.assertIn("SHRUNK (preempted by", text)
+        self.assertIn("[project p]", text)
+        self.assertRegex(text, r"q +weight 1 +share 4.0 +holds 4 +waiting 0")
+        out = io.StringIO()
+        with patch.object(ac, "HISTORY_FILE", Path(self.tmp.name, "history.jsonl")), \
+                patch("sys.stdout", out):
+            ac.cmd_history(ac.argparse.Namespace(since=3600.0, json=False))
+        self.assertRegex(out.getvalue(), rf"resized +{a['id']} .*2:8 \[project p\] \[8->4 cores\]")
+
+
+class LeaseFileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name, "leases", "L1-1")
+
+    def test_content_and_atomic_replacement(self):
+        info = {"lease": "L1", "min": 2, "max": 8, "granted": 6.0, "reason": "granted", "time": 1}
+        ac.write_lease_file(self.path, info)
+        first = self.path.stat().st_ino
+        line, data = self.path.read_text().splitlines()
+        self.assertEqual(line, "6")
+        self.assertEqual(json.loads(data), info)
+        with patch.object(Path, "write_text", autospec=True,
+                          side_effect=Path.write_text) as write:
+            ac.write_lease_file(self.path, {**info, "granted": 2.5})
+        self.assertNotEqual(write.call_args.args[0], self.path)  # written aside, then renamed
+        self.assertNotEqual(self.path.stat().st_ino, first)
+        self.assertEqual(self.path.read_text().splitlines()[0], "2")
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["L1-1"])
+
+    def follow(self, notify, grants, handler=True, stderr=None):
+        """Run follow_grant against a real child that records SIGUSR1.
+        grants: poll replies in turn (an exception instance is raised)."""
+        out = Path(self.tmp.name, "signals")
+        code = ("import signal, sys, time\n"
+                "def got(*_):\n"
+                "    open(sys.argv[1], 'a').write('usr1\\n')\n"
+                + ("signal.signal(signal.SIGUSR1, got)\n" if handler else "")
+                + "print('ready', flush=True)\n"
+                "sys.stdin.readline()\n")
+        child = subprocess.Popen([sys.executable, "-c", code, str(out)], text=True,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        polls = []
+
+        def poll(request):
+            polls.append(request)
+            if len(polls) > len(grants):
+                stop.set()
+                return {"state": "granted", "cores": None}
+            reply = grants[len(polls) - 1]
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        info = {"lease": "L1", "min": 2, "max": 8, "granted": 8.0, "reason": "granted", "time": 0}
+        stop = threading.Event()
         try:
-            base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=here,
-                                  capture_output=True, text=True, check=True, timeout=10).stdout.strip()
-            top = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=here,
-                                 capture_output=True, text=True, check=True, timeout=10).stdout.strip()
-            source = subprocess.run(["git", "show", f"{base}:{top}agent_coord.py"], cwd=here,
-                                    capture_output=True, text=True, check=True, timeout=10).stdout
-        except (OSError, subprocess.SubprocessError) as e:
-            raise unittest.SkipTest(f"main's agent_coord.py is not available: {e}")
-        cls.tmp = tempfile.TemporaryDirectory()
-        path = Path(cls.tmp.name, "main_agent_coord.py")
-        path.write_text(source)
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("main_agent_coord", path)
-        cls.main = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.main)
+            with patch("sys.stderr", stderr or io.StringIO()):
+                ac.follow_grant("L1", child, self.path, info, notify, stop, poll=poll, interval=0.01)
+            time.sleep(0.2)
+            alive = child.poll() is None
+            child.communicate("\n", timeout=10)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        signals = out.read_text().split() if out.exists() else []
+        return signals, polls, info, alive
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.tmp.cleanup()
+    def test_grant_change_rewrites_and_signals_only_the_child(self):
+        signals, polls, info, _ = self.follow(True, [
+            {"state": "granted", "cores": 8.0}, {"state": "granted", "cores": 4.0, "reason": "preempted"},
+            {"state": "granted", "cores": 4.0}])
+        self.assertEqual(signals, ["usr1"])
+        self.assertEqual(self.path.read_text().splitlines()[0], "4")
+        self.assertEqual(info["reason"], "preempted")
+        self.assertTrue(all(set(p) == {"op", "id"} for p in polls))  # it only reads
 
-    def test_random_workloads_decide_as_on_main(self):
+    def test_signal_is_opt_in(self):
+        # No handler: SIGUSR1 would kill this child, so it surviving proves none was sent.
+        signals, _, _, alive = self.follow(False, [{"state": "granted", "cores": 4.0}], handler=False)
+        self.assertTrue(alive)
+        self.assertEqual(signals, [])
+        self.assertEqual(self.path.read_text().splitlines()[0], "4")
+
+    def test_follower_survives_errors(self):
+        class Closed(io.StringIO):
+            def write(self, _text):
+                raise BrokenPipeError("stderr closed")
+
+        signals, polls, _, _ = self.follow(True, [
+            OSError("service restarting"), SystemExit("unreachable"),
+            {"state": "granted", "cores": 4.0}, {"state": "granted", "cores": 3.0}],
+            stderr=Closed())
+        self.assertEqual(len(polls), 5)  # kept polling through every error
+        self.assertEqual(signals, ["usr1", "usr1"])
+        self.assertEqual(self.path.read_text().splitlines()[0], "3")
+
+    def test_stale_lease_files_are_swept(self):
+        folder = Path(self.tmp.name, "leases")
+        folder.mkdir()
+        dead, live = dead_pid(), os.getpid()
+        for name in (f"L1-{dead}", f".L2-{dead}.tmp", f"L3-{live}", "unrelated"):
+            Path(folder, name).write_text("1\n")
+        self.assertEqual(ac.sweep_lease_files(folder), 2)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), [f"L3-{live}", "unrelated"])
+        self.assertEqual(ac.sweep_lease_files(Path(self.tmp.name, "missing")), 0)
+
+    def test_resize_and_scope_commands(self):
+        self.assertEqual(ac.resize_command("agent-coord-L3-9.scope", 2.5),
+                         ["systemctl", "--user", "set-property", "--runtime",
+                          "agent-coord-L3-9.scope", "CPUQuota=250%"])
+        with patch.dict(os.environ, {"AGENT_COORD_SCOPE_PREFIX": "agent-coord-test"}):
+            self.assertEqual(ac.scope_name("L12"), f"agent-coord-test-L12-{os.getpid()}.scope")
+        with patch.dict(os.environ, {"AGENT_COORD_SCOPE_PREFIX": "../x"}), \
+                self.assertRaises(SystemExit):
+            ac.scope_name("L1")
+        with patch.object(ac, "has_scopes", return_value=True):
+            cmd = ac.limited(["true"], 3, GIB, "agent-coord-test-L1-1.scope")
+        self.assertEqual(cmd[cmd.index("--unit") + 1], "agent-coord-test-L1-1.scope")
+
+    def test_default_project_is_the_main_checkout(self):
+        repo = Path(self.tmp.name, "repo")
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q", str(repo)], check=True)
+        subprocess.run([*git, "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        worktree = Path(self.tmp.name, "wt-feature")
+        subprocess.run([*git, "-C", str(repo), "worktree", "add", "-q", str(worktree)], check=True)
+        here = os.getcwd()
+        try:
+            for where in (repo, worktree):
+                os.chdir(where)
+                self.assertEqual(ac.default_project("agent"), "repo")
+            os.chdir(self.tmp.name)
+            self.assertEqual(ac.default_project("agent"), "agent")
+        finally:
+            os.chdir(here)
+
+
+@unittest.skipUnless(REAL_SCOPES,
+                     "real systemd scope test; set AGENT_COORD_SYSTEMD_TESTS=1")
+class RealScopeTest(unittest.TestCase):
+    """Resize a real transient scope of our own (unique test name), then stop it."""
+
+    def test_set_property_resizes_a_running_scope(self):
+        scope = f"agent-coord-test-{os.getpid()}-{int(time.time())}.scope"
+        child = subprocess.Popen(ac.limited(["sleep", "60"], 1, 64 * 1024**2, scope))
+        try:
+            def quota():
+                return subprocess.run(["systemctl", "--user", "show", "-p", "CPUQuotaPerSecUSec",
+                                       "--value", scope], capture_output=True, text=True).stdout.strip()
+            for _ in range(100):
+                if quota() == "1s":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(quota(), "1s")
+            self.assertTrue(ac.resize_scope(scope, 2.5))
+            self.assertEqual(quota(), "2.500000s")
+        finally:
+            child.kill()
+            child.wait()
+            subprocess.run(["systemctl", "--user", "stop", scope], capture_output=True)
+
+
+class OrdinaryWorkloadInvariantTest(unittest.TestCase):
+    """Workloads without MIN:MAX (fixed, IO, held and timing leases, several
+    projects, current and old clients) are admitted as
+    before this change: on random sequences, every term it adds is zero at
+    every step. Replaces comparing with main's code through git, which
+    stops meaning anything once merged."""
+
+    def test_new_terms_are_zero_for_fixed_only_workloads(self):
         import random
         pids = [os.getpid(), os.getppid()]
         for seed in range(60):
             rng = random.Random(seed)
             env = {"busy": 0.0, "now": 100000.0, "mono": 1000.0, "cpu": {pid: 0.0 for pid in pids}}
+            resized = []
             with tempfile.TemporaryDirectory() as tmp, \
                     patch("time.time", side_effect=lambda: env["now"]), \
                     patch("time.monotonic", side_effect=lambda: env["mono"]):
-                coordinators = [
-                    module.Coordinator(
-                        Path(tmp, name, "state.json"),
-                        measure=lambda: {"vms": [], "busy": env["busy"], "available": 64 * GIB},
-                        cap=lambda: (12.0, 58 * GIB), footprint=lambda pid: 0,
-                        cpu_seconds=lambda pid: env["cpu"].get(pid))
-                    for module, name in ((self.main, "main"), (ac, "branch"))]
+                c = ac.Coordinator(
+                    Path(tmp, "state.json"),
+                    measure=lambda: {"vms": [], "busy": env["busy"], "available": 64 * GIB},
+                    cap=lambda: (12.0, 58 * GIB), footprint=lambda pid: 0,
+                    cpu_seconds=lambda pid: env["cpu"].get(pid),
+                    resize=lambda scope, cores: resized.append(scope) or True)
                 for step in range(40):
                     op = rng.random()
                     if op < 0.45:
-                        request = {"op": "acquire", "agent": f"a{rng.randrange(3)}",
-                                   "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6]),
-                                   "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
-                                   "expect": rng.choice([60, 600, 3600]),
-                                   "headroom": rng.choice([0, 0, 0, 1, 2]),
-                                   "locks": rng.choice([[], [], ["nas"]]),
-                                   "io": rng.random() < 0.1}
-                        replies = [c.handle(dict(request)) for c in coordinators]
+                        project = rng.choice(["p", "q", "r"])
+                        req = {"op": "acquire", "agent": f"a{rng.randrange(3)}",
+                               "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6, 11, 12]),
+                               "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
+                               "expect": rng.choice([60, 600, 3600]),
+                               "headroom": rng.choice([0, 0, 0, 1, 2]),
+                               "locks": rng.choice([[], [], ["nas"]]),
+                               "exclusive_locks": rng.choice([[], [], [], ["gpu"]]),
+                               "io": rng.random() < 0.1, "running": rng.random() < 0.1}
+                        if rng.random() < 0.7:  # a current client, else an old one
+                            req.update(project=project, repo=project, client=ac.CLIENT_VERSION)
+                        reply = c.handle(dict(req))
+                        # The reply main gives: refused only when bigger than
+                        # the machine, else granted at its size or waiting with
+                        # main's reasons.
+                        claim = 1 if req["io"] else req["cores"]
+                        too_big = max(req["cores"], claim + req["headroom"]) > 12
+                        self.assertEqual("error" in reply, too_big and not req["running"],
+                                         (seed, step, reply))
+                        if "error" not in reply:
+                            self.assertIn(reply["state"], ("granted", "waiting"))
+                            if reply["state"] == "granted":
+                                self.assertEqual(reply["cores"], req["cores"])
+                            else:
+                                for new in ("fair share", "never shrunk", "reserve", "elastic"):
+                                    self.assertNotIn(new, reply["reason"], (seed, step))
                     elif op < 0.65:
-                        ids = [x["id"] for x in coordinators[0].state["leases"]
-                               + coordinators[0].state["queue"]]
+                        ids = [x["id"] for x in c.state["leases"] + c.state["queue"]]
                         if ids:
-                            victim = rng.choice(ids)
-                            replies = [c.handle({"op": "release", "id": victim}) for c in coordinators]
+                            c.handle({"op": "release", "id": rng.choice(ids)})
                     else:
                         dt = rng.choice([2, 4, 15, 40])
                         env["now"] += dt
                         env["mono"] += dt
                         for pid in pids:
-                            env["cpu"][pid] += rng.uniform(0, 6) * dt
+                            env["cpu"][pid] += rng.uniform(0, 8) * dt
                         env["busy"] = rng.uniform(0, 12)
-                        for c in coordinators:
-                            c.tick()
-                    states = [([x["id"] for x in c.state["leases"]], [x["id"] for x in c.state["queue"]])
-                              for c in coordinators]
-                    self.assertEqual(states[0], states[1], f"seed {seed} step {step}")
+                        c.tick()
+                    where = f"seed {seed} step {step}"
+                    once = c._counted_once()
+                    self.assertTrue(all(x.get("exclusive_locks") for x in c.state["leases"]
+                                        if x["id"] in once), where)
+                    if not once:
+                        self.assertEqual(c._net_busy(), max(0.0, c.busy), where)
+                    claims = sum(c._cpu_claim(x) for x in c.state["leases"])
+                    self.assertEqual(c._unleased(), max(0.0, c.busy - claims), where)  # PR 11's
+                    self.assertEqual(c._eps(), 0.0, where)  # no elastic lease: as on #11
+                    self.assertEqual(resized, [], where)
+                    self.assertFalse([e for e in ac.read_history(0, Path(tmp, "history.jsonl"))
+                                      if e["event"] in ("resized", "unfair")], where)
 
 
 class FootprintTest(unittest.TestCase):
@@ -1410,15 +2494,23 @@ class ServiceTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.sock = Path(self.tmp.name, "sock")
-        self.server = subprocess.Popen(
-            [sys.executable, "-c",
-             ("import agent_coord as ac, pathlib, sys; "
-             "ac.serve(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), "
-             "measure=lambda: {'vms': [], 'busy': 0.0, 'available': 64 * 1024**3}, "
-             "cap=lambda: (8.0, 16 * 1024**3))"),
-             str(self.sock), str(Path(self.tmp.name, "state.json"))],
-            cwd=Path(__file__).parent, stdout=subprocess.DEVNULL,
-        )  # fmt: skip
+        # A private service: its own socket, state and scope names. Scope
+        # resizes are logged, not sent to systemd, unless real scopes are
+        # opted in.
+        self.server_log = Path(self.tmp.name, "server.log")
+        resize = "" if REAL_SCOPES else (
+            ", resize=lambda scope, cores: print('resize', scope, cores, flush=True) or True")
+        with self.server_log.open("w") as log:
+            self.server = subprocess.Popen(
+                [sys.executable, "-c",
+                 ("import agent_coord as ac, pathlib, sys; "
+                 "ac.serve(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), "
+                 "measure=lambda: {'vms': [], 'busy': 0.0, 'available': 64 * 1024**3}, "
+                 f"cap=lambda: (8.0, 16 * 1024**3), config_file=None{resize})"),
+                 str(self.sock), str(Path(self.tmp.name, "state.json"))],
+                cwd=Path(__file__).parent, stdout=log,
+                env=dict(os.environ, AGENT_COORD_SCOPE_PREFIX="agent-coord-test"),
+            )  # fmt: skip
         for _ in range(100):
             if self.sock.exists():
                 break
@@ -1429,13 +2521,26 @@ class ServiceTest(unittest.TestCase):
         self.server.wait(10)
         self.tmp.cleanup()
 
-    def cli(self, *args):
+    def cli_args(self, *args):
+        # A private instance only: its own socket, state, lease files and
+        # scope names (the private service records resizes; see setUp).
         code = (f"import agent_coord as ac, pathlib, sys; "
                 f"ac.SOCKET = pathlib.Path({str(self.sock)!r}); "
                 f"ac.HISTORY_FILE = pathlib.Path({str(Path(self.tmp.name, 'history.jsonl'))!r}); "
-                f"sys.exit(ac.main(sys.argv[1:]))")  # fmt: skip
-        return subprocess.run([sys.executable, "-c", code, *args],
-                              cwd=Path(__file__).parent,
+                + ("" if REAL_SCOPES else
+                   # Seam: no real systemd scope unless opted in; the client
+                   # behaves as if it had one.
+                   "ac.has_scopes = lambda: True; ac.scope_exists = lambda pid, scope: True; "
+                   "ac.limited = lambda cmd, cores, mem, scope=None: ['nice', '-n', '19', *cmd]; ")
+                + f"sys.exit(ac.main(sys.argv[1:]))")  # fmt: skip
+        env = dict(os.environ, AGENT_COORD_RUNTIME_DIR=str(Path(self.tmp.name, "run")),
+                   AGENT_COORD_STATE_DIR=self.tmp.name, AGENT_COORD_SCOPE_PREFIX="agent-coord-test",
+                   AGENT_COORD_CONFIG=str(Path(self.tmp.name, "none.toml")))  # fmt: skip
+        return [sys.executable, "-c", code, *args], env
+
+    def cli(self, *args):
+        argv, env = self.cli_args(*args)
+        return subprocess.run(argv, cwd=Path(__file__).parent, env=env,
                               capture_output=True, text=True, timeout=60, check=False)  # fmt: skip
 
     def test_run_executes_capped_and_releases(self):
@@ -1494,6 +2599,68 @@ class ServiceTest(unittest.TestCase):
         both = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "x",
                         "--exclusive", "--exclusive-lock", "gpu", "--", "true")  # fmt: skip
         self.assertNotEqual(both.returncode, 0)
+
+    def test_elastic_run_is_shrunk_for_a_waiting_request_and_told(self):
+        """A MIN:MAX run starts at MAX on an empty machine, is shrunk when a
+        fixed request needs the cores, sees the new count in its lease file,
+        and (with --notify-signal) gets SIGUSR1: the command itself, recorded
+        by a real child process."""
+        out = Path(self.tmp.name, "child.out")
+        stop = Path(self.tmp.name, "stop")
+        child = (
+            "import os, signal, sys, time, pathlib\n"
+            "out = pathlib.Path(sys.argv[1]); stop = pathlib.Path(sys.argv[2])\n"
+            "def note(text):\n"
+            "    with out.open('a') as f: f.write(text + '\\n')\n"
+            "lease = pathlib.Path(os.environ['COMPUTE_LEASE_FILE'])\n"
+            "signal.signal(signal.SIGUSR1, lambda *_: note('usr1 ' + lease.read_text().split()[0]))\n"
+            "note('start %s %s %s %s' % (os.getpid(), os.environ['COMPUTE_LEASE_CORES'],\n"
+            "     os.environ['COMPUTE_LEASE_MIN'], os.environ['COMPUTE_LEASE_MAX']))\n"
+            "deadline = time.time() + 40\n"
+            "while not stop.exists() and time.time() < deadline: time.sleep(0.1)\n"
+            "note('end ' + lease.read_text().replace('\\n', ' '))\n")
+        argv, env = self.cli_args("--as", "big", "run", "--cores", "2:8", "--mem", "64M",
+                                  "--notify-signal", "--label", "elastic", "--",
+                                  sys.executable, "-c", child, str(out), str(stop))  # fmt: skip
+        with subprocess.Popen(argv, cwd=Path(__file__).parent, env=env, text=True,
+                              stderr=subprocess.PIPE) as elastic:
+            try:
+                for _ in range(200):
+                    if out.exists():
+                        break
+                    time.sleep(0.05)
+                start = out.read_text().split()
+                self.assertEqual(start[0], "start")
+                self.assertEqual(start[2:], ["8", "2", "8"])
+                small = self.cli("--as", "small", "run", "--cores", "4", "--mem", "64M",
+                                 "--label", "fixed", "--", "true")
+                self.assertEqual(small.returncode, 0, small.stderr)
+                for _ in range(300):
+                    if "usr1" in out.read_text():
+                        break
+                    time.sleep(0.05)
+                stop.touch()
+                _, err = elastic.communicate(timeout=30)
+            finally:
+                if elastic.poll() is None:
+                    elastic.kill()
+        self.assertEqual(elastic.returncode, 0, err)
+        lines = out.read_text().splitlines()
+        self.assertIn("usr1 4", lines)
+        end = lines[-1].split(" ", 2)
+        self.assertEqual(end[:2], ["end", "4"])
+        info = json.loads(end[2])
+        self.assertEqual((info["min"], info["max"], info["granted"]), (2, 8, 4))
+        self.assertIn("preempted by", info["reason"])
+        if not REAL_SCOPES:  # the seam's record; with real scopes, the event below says it worked
+            self.assertRegex(self.server_log.read_text(), r"resize agent-coord-test-L1-\d+\.scope 4")
+        self.assertFalse(list(Path(self.tmp.name, "run", "leases").iterdir()))
+        events = [json.loads(line) for line in self.cli("history", "--json").stdout.splitlines()]
+        resized, = [e for e in events if e["event"] == "resized"]
+        self.assertEqual((resized["from"], resized["cores"], resized["kind"]), (8, 4, "preempted"))
+        self.assertIn("2:8", self.cli("history").stdout)
+        inbox = self.cli("--as", "big", "inbox").stdout
+        self.assertIn("was shrunk to 4 cores", inbox)
 
     def test_messages_round_trip(self):
         self.assertEqual(self.cli("--as", "a", "send", "--to", "b", "hello").returncode, 0)

@@ -8,7 +8,9 @@ of piling up, and it carries messages between agents.
 """
 
 import argparse
+import contextlib
 import json
+import queue
 import math
 import os
 import re
@@ -23,8 +25,8 @@ import time
 from pathlib import Path
 
 # Tests and throwaway trials only: AGENT_COORD_RUNTIME_DIR and
-# AGENT_COORD_STATE_DIR point an instance at its own socket, state and history.
-# Set for the shared service, it would start from an empty state.
+# AGENT_COORD_STATE_DIR point an instance at its own socket, lease files, state
+# and history. Set for the shared service, it would start from an empty state.
 RUNTIME = Path(
     os.environ.get("AGENT_COORD_RUNTIME_DIR")
     or Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
@@ -45,6 +47,12 @@ HISTORY_KEEP = 4  # rotated files kept: history.jsonl.1 .. .4
 RESERVE_MEM = 4 * 1024**3
 TICK = 2.0
 BUSY_SMOOTHING = 0.2  # per tick, for host-wide and per-lease CPU use
+# Measured (smoothed) figures settle slightly off whole cores; a step this
+# close to the next whole core counts as reaching it.
+STEP_SLACK = 0.05
+# Smoothed measurements leave hundredths of a core of noise: CPU capacity
+# checks allow this much over.
+CPU_EPS = 0.01
 POLL = 3.0
 # Holders hear about a request that has waited this long (once per request).
 NUDGE_AFTER = 60
@@ -73,18 +81,87 @@ STUCK_AFTER = 120
 DISK_MARGIN = 20 * 1024**3
 MAX_MESSAGES = 1000
 
+# Elastic leases (--cores MIN:MAX) and projects. Every number here can be
+# changed in CONFIG_FILE (TOML, flat keys; [projects.NAME] weight = N); none
+# is needed. See DEFAULT_CONFIG.
+CONFIG_FILE = Path(
+    os.environ.get("AGENT_COORD_CONFIG")
+    or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    / "agent-coord" / "config.toml"
+)
+DEFAULT_CONFIG = {
+    # Weight of a project not named under [projects.NAME].
+    "default_weight": 1.0,
+    # Least time between two changes of one lease's size (preemption excepted).
+    "resize_interval": 60.0,
+    # An elastic lease using under idle_fraction of its grant for idle_after
+    # seconds is offered down to max(MIN, ceil(peak use / idle_target_use)).
+    "idle_fraction": 0.5,
+    "idle_after": 120.0,
+    "idle_target_use": 0.7,
+    # It grows (toward MAX) while using at least grow_demand of its grant,
+    # nothing waits for cores, and grow_margin cores stay free beyond the step.
+    "grow_demand": 0.75,
+    "grow_margin": 1.0,
+}
+# Fields a lease size change is logged and announced with.
+CPU_WAIT_KINDS = ("cores", "headroom")
+# Scopes are named by the service: PREFIX-LEASE-CLIENTPID.scope; the service
+# resizes only scopes it named. AGENT_COORD_SCOPE_PREFIX keeps a private
+# instance's names apart.
+SCOPE_PREFIX = os.environ.get("AGENT_COORD_SCOPE_PREFIX") or "agent-coord"
+if not re.fullmatch(r"[A-Za-z0-9_-]+", SCOPE_PREFIX):
+    SCOPE_PREFIX = "agent-coord"
+# The service resizes only names with its own prefix; a client accepts any
+# well-formed name the service gives it.
+SCOPE_RE = re.compile(re.escape(SCOPE_PREFIX) + r"-L\d+-\d+\.scope")
+ANY_SCOPE_RE = re.compile(r"[A-Za-z0-9_-]+-L\d+-\d+\.scope")
+RESIZE_TIMEOUT = 5.0  # seconds for one systemctl set-property
+# A failed resize is retried after RESIZE_BACKOFF s, doubling; after
+# RESIZE_ATTEMPTS failures in a row the lease is fixed at its size.
+RESIZE_BACKOFF, RESIZE_ATTEMPTS = 30.0, 3
+# A lease is resized only once its client reported its scope exists, or this
+# long after its grant if the client never does.
+SCOPE_READY_AFTER = 60.0
+# The client protocol version new clients send (they also send the project
+# they derived, "repo"); requests without it come from older clients.
+CLIENT_VERSION = 2
+
 HELP = """\
 agent-coord - share this computer's CPU and RAM between agents, and message them
 
 QUOTA
-  agent-coord check [--io] [--cores N] [--mem SIZE] [--exclusive | --exclusive-lock NAME]
+  agent-coord check [--io] [--cores N|MIN:MAX] [--mem SIZE] [--exclusive | --exclusive-lock NAME]
       Exit 0 if a lease that size would start now, else 1 with the reason.
-  agent-coord run [--io] [--cores N] [--mem SIZE] --label TEXT [--exclusive | --exclusive-lock NAME]
-                  [--headroom N] [--expect D] [--max-wait D] -- CMD ...
-      Wait in line until N cores and SIZE of RAM are free, then run CMD capped
+  agent-coord run [--io] [--cores N|MIN:MAX] [--mem SIZE] --label TEXT [--exclusive | --exclusive-lock NAME]
+                  [--headroom N] [--expect D] [--max-wait D] [--notify-signal] -- CMD ...
+      Wait in line until the cores and SIZE of RAM are free, then run CMD capped
       at them (systemd scope: CPUQuota, MemoryMax; exceeding MemoryMax kills
       CMD) at nice 19 and idle IO priority. CMD sees COMPUTE_LEASE_CORES=N:
       give its tools that many threads. The lease ends when CMD exits.
+  --cores MIN:MAX  Elastic lease (prefer it for builds and test suites): starts
+                as soon as MIN cores are free, with as many up to MAX as are free
+                then. While it runs its cap may shrink toward MIN (when others
+                wait, or when it uses under half for 2 min) and grow back
+                toward MAX; it is never shrunk below MIN or killed for this.
+                COMPUTE_LEASE_FILE names a file rewritten atomically on each
+                change: line 1 the cores to use now, line 2 JSON (lease, min,
+                max, granted, reason, time); poll it (the default way to
+                follow changes). Also COMPUTE_LEASE_MIN/_MAX. A tool with a
+                fixed thread count is only throttled when shrunk.
+                A single N is a fixed lease, never resized: keep fixed and
+                exclusive leases for timing runs.
+  --notify-signal  Also send SIGUSR1 to CMD (only the process run starts) when
+                its elastic grant changes. It TERMINATES a command that has not
+                yet installed a SIGUSR1 handler, or that is a shell, make or
+                another wrapper that does not handle it: prefer polling the
+                lease file, and use this only for programs that handle SIGUSR1
+                from their first moment.
+  --project NAME   Fair-share group: counts on its own only if NAME is listed
+                under [projects.NAME] in the config; otherwise the project is
+                the git repository CMD runs in (named after its main checkout,
+                worktrees included; for hold, the held process's; else the
+                agent name).
   agent-coord hold [--io] [--cores N] [--mem SIZE] --label TEXT --pid PID [--exclusive]
       Register a job that is already running (no waiting: it is running),
       until PID exits. Prints the lease ID. Holding a VM's qemu PID replaces
@@ -131,10 +208,25 @@ MESSAGES
   agent-coord inbox [--wait D] [--all]     Unread messages (then marked read).
   agent-coord agents                       Agents seen, newest first.
 
-  agent-coord status [--json]              Leases, line, VMs, free capacity.
+  agent-coord status [--json]              Leases, line, VMs, free capacity,
+                                           active projects and their shares.
   agent-coord history [--since D] [--json] Lease events (requested, waiting,
-                                           started, ended, cancelled) with
-                                           wait/run times; default last 24h.
+                                           started, resized, ended, cancelled)
+                                           with wait/run times; default last 24h.
+
+PROJECTS
+  Use MIN:MAX for everything except timing runs. Fairness between projects
+  applies to elastic (MIN:MAX) leases: a waiting request shrinks other
+  projects' elastic leases (never below MIN) as far as its project's fair
+  share (cores x weight / active projects' weights, weight 1 by default), and
+  elastic leases even out toward those shares; a timing run may take them down
+  to their MIN, whatever its share. A project is the git
+  repository (a --project name counts separately only if configured); the
+  client says which, nothing enforces it (cooperating agents). Fixed and
+  timing leases are never shrunk, so a project that holds the machine with
+  fixed jobs keeps it until they end. The line stays first come, first
+  served. Optional ~/.config/agent-coord/config.toml: resize timings,
+  [projects.NAME] weight = 2 (bad values are ignored and shown in status).
 
 Lease anything using more than 2 cores or 2 GB for more than a few minutes.
 Running QEMU guests and other unleased load are measured and counted. --as NAME sets who you are
@@ -158,6 +250,19 @@ def parse_duration(text: str) -> float:
     if not match:
         raise argparse.ArgumentTypeError(f"not a duration: {text} (e.g. 30m, 2h)")
     return float(match[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[match[2]]
+
+
+def parse_cores(text: str) -> tuple[float, float | None]:
+    """N (fixed) or MIN:MAX (elastic)."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(?::(\d+(?:\.\d+)?))?", text.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(f"not cores: {text} (e.g. 4, or 2:8 for MIN:MAX)")
+    low, high = float(match[1]), float(match[2]) if match[2] else None
+    if low <= 0:
+        raise argparse.ArgumentTypeError("cores must be positive")
+    if high is not None and high < low:
+        raise argparse.ArgumentTypeError(f"MAX below MIN in {text}")
+    return low, (None if high == low else high)
 
 
 def parse_expect(text: str) -> float:
@@ -314,6 +419,89 @@ def measure_vms(sample: float = 1.0) -> list[dict]:
     return list(guests.values())
 
 
+# Allowed range (low, high, low exclusive?) of each setting.
+CONFIG_RANGES = {
+    "default_weight": (0.0, 1000.0, True),
+    "resize_interval": (0.0, 3600.0, False),
+    "idle_fraction": (0.0, 1.0, False),
+    "idle_after": (0.0, 86400.0, False),
+    "idle_target_use": (0.0, 1.0, True),
+    "grow_demand": (0.0, 1.0, True),
+    "grow_margin": (0.0, 64.0, False),
+}
+
+
+def _config_number(value: object, low: float, high: float, open_low: bool) -> float | None:
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return None
+    if value > high or value < low or (open_low and value <= low):
+        return None
+    return float(value)
+
+
+def load_config(path: Path | None) -> dict:
+    """DEFAULT_CONFIG overlaid with the TOML file at path, if any. Every
+    value is checked; a bad one keeps its default and is listed in
+    config["errors"] (shown by status, logged once per load). Never raises."""
+    config = {**DEFAULT_CONFIG, "projects": {}, "errors": []}
+    try:
+        if path is None or not path.exists():
+            return config
+        import tomllib
+
+        data = tomllib.loads(path.read_text())
+    except Exception as e:  # noqa: BLE001 - a bad file must never stop the service
+        config["errors"].append(f"{path}: {e}; using defaults")
+    else:
+        for key, value in data.items():
+            if key == "projects":
+                continue
+            if key not in CONFIG_RANGES:
+                config["errors"].append(f"{path}: unknown setting {key}")
+                continue
+            low, high, open_low = CONFIG_RANGES[key]
+            number = _config_number(value, low, high, open_low)
+            if number is None:
+                bound = f"{'above' if open_low else 'at least'} {low:g} and at most {high:g}"
+                config["errors"].append(f"{path}: {key} = {value!r} is not a number {bound}; "
+                                        f"using {DEFAULT_CONFIG[key]:g}")
+            else:
+                config[key] = number
+        projects = data.get("projects", {})
+        if not isinstance(projects, dict):
+            config["errors"].append(f"{path}: projects must be a table ([projects.NAME]); ignored")
+            projects = {}
+        for name, entry in projects.items():
+            weight = entry.get("weight") if isinstance(entry, dict) else None
+            weight = _config_number(weight, 0.0, 1000.0, True)
+            if weight is None:
+                config["errors"].append(f"{path}: projects.{name} needs weight = a number above 0 "
+                                        "and at most 1000; ignored")
+            else:
+                config["projects"][str(name)] = {"weight": weight}
+    for error in config["errors"]:
+        print(f"agent-coord: config {error}", file=sys.stderr, flush=True)
+    return config
+
+
+def default_project(agent: str, cwd: str | None = None) -> str:
+    """The repository the command runs in (cwd, default the current
+    directory), named after its main checkout's folder (worktrees of one
+    repository are one project), else the agent."""
+    try:
+        common = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=True, timeout=5, cwd=cwd,
+        ).stdout.strip()  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return agent
+    if not common:
+        return agent
+    path = Path(common)
+    name = path.parent.name if path.name == ".git" else path.name.removesuffix(".git")
+    return name or agent
+
+
 def default_agent() -> str:
     try:
         top = subprocess.run(
@@ -335,7 +523,13 @@ class Coordinator:
 
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
                  history_file: Path | None = None, footprint=tree_footprint,
-                 cpu_seconds=tree_cpu_seconds, tree_pids=tree_pids):
+                 cpu_seconds=tree_cpu_seconds, config_file: Path | None = None,
+                 tree_pids=None, resize=None, resize_async=False):
+        self.config_file = config_file
+        self._config_mtime: float | None = None
+        self.config = load_config(config_file)
+        # Elastic leases using little of their grant: id -> (since, peak use).
+        self._idle: dict[str, tuple[float, float]] = {}
         self._saved = None
         self._samples = None
         self._footprints = None
@@ -344,13 +538,23 @@ class Coordinator:
         self.cpu_seconds = cpu_seconds
         self._cpu_sample: tuple[float, dict[str, float]] | None = None
         self._measured_cores: dict[str, float] = {}
-        # A lease's own CPU use, smoothed like self.busy (from zero, as the
-        # host-wide figure is for a new lease's load), to take it out of the
-        # host-wide measurement when the lease is counted at its full size;
-        # and each measured lease's process tree, to count nested ones once.
+        # Uncapped per-lease use over the last sample (for idle and growth
+        # decisions), and smoothed like self.busy (to take a lease's own use
+        # out of the host-wide measurement when it is counted another way).
+        self._raw_cores: dict[str, float] = {}
         self._own_cores: dict[str, float] = {}
+        self._size_avg: dict[str, float] = {}
         self._trees: dict[str, set[int]] = {}
         self.tree_pids = tree_pids
+        # Changes a running scope's CPU cap: (unit name, cores) -> success.
+        # None (in-process use and tests): no scope can be resized. With
+        # resize_async (the service), calls run on a worker thread, never
+        # under self.lock; the result is applied when it is back.
+        self.resize = resize or (lambda scope, cores: False)
+        self.resize_async = resize_async
+        self._pending: dict[str, tuple[float, str, str]] = {}  # id -> (cores, kind, note)
+        self._jobs: "queue.Queue[tuple[str, str, float]]" = queue.Queue()
+        self._worker: threading.Thread | None = None
         self._low_since: dict[tuple[str, str], float] = {}
         self.state_file = state_file
         self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
@@ -389,10 +593,12 @@ class Coordinator:
         entry = {"time": round(time.time(), 1), "event": event, "id": x["id"],
                  "agent": x["agent"], "label": x["label"], "cores": x["cores"],
                  "mem": x["mem"], "locks": x.get("locks", []),
-                 "exclusive": exclusive_mode(x), "io": bool(x.get("io"))}  # fmt: skip
+                 "exclusive": exclusive_mode(x), "io": bool(x.get("io")),
+                 "project": self._project(x)}  # fmt: skip
         if x.get("exclusive_locks"):
             entry["exclusive_locks"] = x["exclusive_locks"]
-        for key in ("headroom", "disk", "expect", "expect_source", "backfill_reason", "backfill_head"):
+        for key in ("headroom", "disk", "expect", "expect_source", "backfill_reason", "backfill_head",
+                    "min_cores", "max_cores", "elastic"):
             if x.get(key):
                 entry[key] = x[key]
         entry.update(extra)
@@ -474,13 +680,34 @@ class Coordinator:
         return [g for g in self.vms if g["pid"] not in held]
 
     def _unleased(self) -> float:
-        """Cores busy with work nobody leased (agents not using agent-coord)."""
-        leased = sum(self._cpu_claim(x) for x in self.state["leases"])
+        """Cores busy with work nobody leased (agents not using agent-coord).
+        A lease counted once (see _counted_once) counts here as in
+        _net_busy: a just-shrunk elastic lease's use still in the smoothed
+        busy figure is its own, not someone else's. For every other lease,
+        and a timing run, this is its claim, as on main."""
+        once, outer_of = self._counted_once(), self._nesting()
+        leased = 0.0
+        for x in self.state["leases"]:
+            claim = self._cpu_claim(x)
+            own = self._own_cores.get(x["id"])
+            if own is not None and x["id"] in once and x["id"] not in outer_of:
+                claim = max(claim, min(own, self._size_avg.get(x["id"], 0.0)))
+            leased += claim
         return max(0.0, self.busy - sum(g["cores"] for g in self._vms()) - leased)
+
+    def _eps(self) -> float:
+        """Tolerance for CPU checks: smoothed measurements of elastic leases
+        leave hundredths of a core of noise; none without one (as on #11)."""
+        return CPU_EPS if any(x.get("elastic") for x in self.state["leases"]) else 0.0
+
+    def _size(self, lease: dict) -> float:
+        """Cores a lease may use now: its size (for an elastic lease, the
+        grant its scope is capped at: the service caps it before counting)."""
+        return lease["cores"]
 
     def _cpu_claim(self, lease: dict) -> float:
         """Full size for a CPU lease; observed use for IO (zero before sampling)."""
-        return self._measured_cores.get(lease.get("id"), 0.0) if lease.get("io") else lease["cores"]
+        return self._measured_cores.get(lease.get("id"), 0.0) if lease.get("io") else self._size(lease)
 
     def _mem_claim(self, lease: dict) -> int:
         if lease.get("io") and "granted" in lease:
@@ -497,48 +724,77 @@ class Coordinator:
             remaining[pid] -= footprints[x["id"]]
         return footprints
 
-    def _reserved_cpu(self, leases: list[dict]) -> float:
+    def _full_ids(self) -> set[str]:
+        """Leases counted at their full size rather than measured use: those
+        warming up, those exclusive on a lock (timing runs), and elastic ones
+        (at their grant, which idle shrink keeps near their use), unless IO."""
         warming = {x["id"] for x in self._warming()}
-        return sum(x["cores"] for x in leases
-                   if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")))
+        return {x["id"] for x in self.state["leases"]
+                if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")
+                                        or x.get("elastic"))}
 
-    def _covered(self) -> set[str]:
-        """Measured leases whose process is inside another measured lease's
-        tree (a lease started from within a lease, or two leases on one
-        pid): their use is already in the outer one's measurement."""
+    def _reserved_cpu(self, leases: list[dict]) -> float:
+        full = self._full_ids()
+        return sum(self._size(x) for x in leases if x["id"] in full)
+
+    def _nesting(self) -> dict[str, str]:
+        """For each measured lease whose process is inside another measured
+        lease's tree (a lease started from within a lease, or two leases on
+        one pid), the outermost such lease: its measurement includes the
+        inner one's use."""
         measured = [x for x in self.state["leases"] if x["id"] in self._own_cores]
-        covered = set()
+        outer_of = {}
         for i, x in enumerate(measured):
             for j, outer in enumerate(measured):
                 if outer is x:
                     continue
                 tree = self._trees.get(outer["id"], {outer["pid"]})
                 if x["pid"] in tree and (x["pid"] != outer["pid"] or j < i):
-                    covered.add(x["id"])
+                    outer_of[x["id"]] = outer["id"]
                     break
-        return covered
+        for inner in list(outer_of):
+            root, seen = outer_of[inner], {inner}
+            while root in outer_of and root not in seen:
+                seen.add(root)
+                root = outer_of[root]
+            outer_of[inner] = root
+        return outer_of
+
+    def _once_cap(self, x: dict) -> float:
+        """How much of a counted-once lease's measured use is its own: its
+        size, or the size it had over the smoothing window (a shrink is not
+        yet out of the busy figure either)."""
+        return max(self._size(x), self._size_avg.get(x["id"], 0.0))
 
     def _counted_once(self) -> set[str]:
-        """Leases exclusive on a lock (timing runs), unless IO: reserved at
-        their full size all along, so their own measured use comes out of the
-        measured load. (Warming leases keep main's conservative double count.)"""
+        """Leases reserved at their full size all along, whose own measured
+        use therefore comes out of the measured load: exclusive-lock leases
+        (timing runs) and elastic leases (at their grant), unless IO. Warming
+        leases keep main's conservative double count."""
         return {x["id"] for x in self.state["leases"]
-                if not x.get("io") and x.get("exclusive_locks")}
+                if not x.get("io") and (x.get("exclusive_locks") or x.get("elastic"))}
 
     def _net_busy(self) -> float:
-        """Measured busy cores, less the own use of exclusive-lock leases, so
-        a timing run counts once, at its size, not at its size plus its
-        measured use. Only use up to its size comes off: use above it (a job
-        in its process tree but in a scope of its own, an uncapped hold,
-        noise) stays counted as load. Lease use is smoothed like the busy
-        figure, and counted once per process tree."""
+        """Measured busy cores, less the own use of leases counted at full
+        size (see _counted_once), so each counts once, at its size. Only use
+        up to its size comes off: use above it (a job in its process tree but
+        in a scope of its own, an uncapped hold, noise) stays counted as load.
+        Lease use is smoothed like the busy figure, and counted once per
+        process tree."""
         once = self._counted_once()
-        covered = self._covered()
+        outer_of = self._nesting()
+        caps = {x["id"]: self._once_cap(x) for x in self.state["leases"] if x["id"] in once}
+        inside: dict[str, float] = {}  # counted-once leases nested in each outermost tree
+        for inner, root in outer_of.items():
+            if inner in caps:
+                inside[root] = inside.get(root, 0.0) + caps[inner]
         net = self.busy
         for x in self.state["leases"]:
             own = self._own_cores.get(x["id"])
-            if own is not None and x["id"] in once and x["id"] not in covered:
-                net -= min(own, x["cores"])
+            if own is not None and x["id"] in once and x["id"] not in outer_of:
+                # Per outermost tree: its use, up to the sizes of the
+                # counted-once leases in it.
+                net -= min(own, caps[x["id"]] + inside.get(x["id"], 0.0))
         return max(0.0, net)
 
     def _warming(self) -> list[dict]:
@@ -599,8 +855,9 @@ class Coordinator:
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
         req_cores = self._cpu_claim(req)
-        if used_cores + req_cores > cores:
-            return "cores", f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
+        if used_cores + req_cores > cores + self._eps():
+            return "cores", (f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
+                             + self._fixed_hint(req))
         if used_mem + req["mem"] > mem:
             return "mem", f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
         if self.available is not None:
@@ -615,12 +872,552 @@ class Coordinator:
         keeper = max([req, *leases], key=lambda x: x.get("headroom", 0))
         if need := keeper.get("headroom", 0):
             claimed = self._claimed()
-            if claimed + req_cores + need > cores:
+            if claimed + req_cores + need > cores + self._eps():
                 whose = "this request" if keeper is req else (
                     f"{keeper['agent']}'s lease {keeper['id']} ({keeper['label']})")
                 return "headroom", (f"{max(cores - claimed, 0):.1f} cores unclaimed; "
-                                    f"{need:g} are kept free for {whose}")  # fmt: skip
+                                    f"{need:g} are kept free for {whose}"
+                                    + self._fixed_hint(req))  # fmt: skip
         return None
+
+    # -- projects and fair shares
+
+    def _project(self, x: dict) -> str:
+        """The project x counts under: the repository its client derived
+        (repo), or a --project name only if it is that name or one listed
+        under [projects.NAME] in the config; old clients' requests carry no
+        repo and count under the name they give, else "default"."""
+        name = x.get("project") or "default"
+        repo = x.get("repo")
+        if not repo and x.get("client", 0) >= CLIENT_VERSION:
+            repo = "default"  # a current client that did not say: not a free name
+        if repo and name != repo and name not in self.config["projects"]:
+            return repo
+        return name
+
+    def _weight(self, project: str) -> float:
+        entry = self.config["projects"].get(project)
+        return entry["weight"] if entry else self.config["default_weight"]
+
+    def _projects(self) -> dict[str, dict]:
+        """Active projects (a running or waiting lease): what each holds
+        (CPU claims: grants, fixed sizes, measured use for IO) and its waiting
+        requests."""
+        projects: dict[str, dict] = {}
+        for x in self.state["leases"]:
+            entry = projects.setdefault(self._project(x), {"held": 0.0, "waiting": []})
+            entry["held"] += self._cpu_claim(x)
+        for x in self.state["queue"]:
+            projects.setdefault(self._project(x), {"held": 0.0, "waiting": []})[
+                "waiting"].append(x)
+        return projects
+
+    def _shares(self, projects: dict[str, dict]) -> dict[str, float]:
+        """Each active project's fair share of the cores: weight / sum of the
+        active projects' weights. Idle projects claim nothing."""
+        cores, _ = self.capacity()
+        total = sum(self._weight(p) for p in projects) or 1.0
+        return {p: cores * self._weight(p) / total for p in projects}
+
+    def _timing(self, x: dict) -> bool:
+        return bool(x.get("exclusive_locks") or x.get("headroom") or x.get("exclusive"))
+
+    def _elastic_involved(self, req: dict | None = None) -> bool:
+        """Whether any MIN:MAX lease or request is around: fairness between
+        projects (hints, unfair notes, preemption) is about elastic leases;
+        without any, every decision and reply is as before this change."""
+        return bool((req and req.get("max_cores"))
+                    or any(x.get("max_cores") for x in self.state["leases"] + self.state["queue"]))
+
+    def _fixed_hint(self, req: dict) -> str:
+        """For a CPU wait of a project below its fair share: what holds the
+        cores (other projects' leases, fixed ones never shrunk, elastic ones
+        with what they could still give), or that a fixed request is bigger
+        than what elastic leases are shrunk to give it."""
+        if not self._elastic_involved(req):
+            return ""
+        projects = self._projects()
+        mine = self._project(req)
+        shares = self._shares(projects)
+        held = projects.get(mine, {"held": 0.0})["held"]
+        if held >= shares.get(mine, 0.0) - 1e-9:
+            return ""
+        entitled = self._entitled(req, projects)
+        if (not req.get("max_cores") and not self._timing(req)
+                and held + req["cores"] > entitled + 1e-9
+                and any(x.get("elastic") and self._project(x) != mine
+                        for x in self.state["leases"])):
+            return (f"; other projects' elastic leases are shrunk only to give project "
+                    f"{mine} its fair share ({entitled:g} of {self.capacity()[0]:g} cores); a "
+                    f"fixed {req['cores']:g} waits for the rest, --cores MIN:MAX would "
+                    "start now")
+        holders = sorted((x for x in self.state["leases"]
+                          if self._project(x) != mine and not x.get("io")),
+                         key=lambda x: -x["cores"])[:4]
+        if not holders:
+            return ""
+
+        def name(x):
+            if x.get("elastic"):
+                spare = x["cores"] - x["min_cores"]
+                what = (f"elastic, {x['cores']:g} cores, {spare:g} above its MIN" if spare > 1e-9
+                        else f"elastic, at its MIN {x['min_cores']:g}")
+            else:
+                what = (f"{'timing run' if self._timing(x) else 'fixed'} {x['cores']:g}, never "
+                        "shrunk")
+            return f"{x['id']} (project {self._project(x)}, {what})"
+
+        return (f"; project {mine} is below its fair share; the cores are held by "
+                + ", ".join(name(x) for x in holders))
+
+    def _holding_back(self, mine: str, projects: dict, shares: dict) -> list[dict]:
+        """Fixed (non-elastic, non-IO) leases of other projects over their
+        fair share: what keeps project mine from its share."""
+        return [x for x in self.state["leases"]
+                if not x.get("elastic") and not x.get("io") and self._project(x) != mine
+                and projects[self._project(x)]["held"] > shares[self._project(x)] + 1e-9]
+
+    # -- elastic leases
+
+    def _resize(self, x: dict, cores: float, kind: str, note: str) -> bool | None:
+        """Set elastic lease x to cores, capping its scope (by the unit name
+        the service generated) before a smaller size counts. Returns True
+        when done, False when it failed (x keeps its size), None when the
+        call runs on the worker (resize_async): a shrink then counts once it
+        is done; a growth counts at once and is undone if it fails."""
+        scope = x.get("scope")
+        if not scope or not SCOPE_RE.fullmatch(scope):
+            self._fix(x, "its scope name is not one the service made")
+            return False
+        if not self.resize_async:
+            return self._resized(x, cores, kind, note, self.resize(scope, cores))
+        entry = (float(cores), kind, note)
+        if cores > x["cores"]:  # count a growth at once (conservative)
+            entry = (x["cores"], "undo", "")
+            self._apply(x, cores, kind, note)
+        self._pending[x["id"]] = entry
+        # The job carries its own entry: only that entry is ever cleared by it.
+        self._jobs.put((x["id"], scope, float(cores), entry))
+        return None
+
+    def _apply(self, x: dict, cores: float, kind: str, note: str) -> None:
+        old = x["cores"]
+        x["cores"] = float(cores)
+        x["resized_at"] = time.time()
+        x["resize_kind"] = kind
+        x["resize_note"] = note
+        self._idle.pop(x["id"], None)
+        self._log("resized", x, kind=kind, reason=note, **{"from": old})
+
+    def _resized(self, x: dict, cores: float, kind: str, note: str, ok: bool) -> bool:
+        """The result of a resize call: count the new size, or note the
+        failure: retried after RESIZE_BACKOFF (doubling) and fixed only
+        after RESIZE_ATTEMPTS failures in a row."""
+        if ok:
+            x.pop("resize_failures", None)
+            x.pop("resize_retry_at", None)
+            if kind != "undo":
+                self._apply(x, cores, kind, note)
+            return True
+        failures = x.get("resize_failures", 0) + 1
+        x["resize_failures"] = failures
+        if failures >= RESIZE_ATTEMPTS:
+            self._fix(x, f"its scope could not be resized ({failures} attempts)")
+        else:
+            x["resize_retry_at"] = time.time() + RESIZE_BACKOFF * 2 ** (failures - 1)
+            self._log("resized", x, kind="retry", reason=(
+                f"resize to {cores:g} cores failed; retried after "
+                f"{RESIZE_BACKOFF * 2 ** (failures - 1):g} s"), **{"from": x["cores"]})
+        return False
+
+    def _fix(self, x: dict, why: str) -> None:
+        x.pop("elastic", None)
+        x["resize_kind"] = "fixed"
+        x["resize_note"] = f"{why}; fixed at {x['cores']:g} cores"
+        self._idle.pop(x["id"], None)
+        self._log("resized", x, kind="fixed", reason=x["resize_note"], **{"from": x["cores"]})
+        self._post("agent-coord", x["agent"],
+                   f"lease {x['id']} ({x['label']}) can no longer be resized ({why}); it keeps "
+                   f"{x['cores']:g} cores until it ends.")
+
+    def resize_worker(self) -> None:
+        """Run queued resize calls outside the lock, one at a time, and
+        apply each result under it. Survives any failure of one job: logs
+        it, and drops that job's pending entry, so the lease is free to be
+        resized (or fixed) again."""
+        while True:
+            job = self._jobs.get()
+            try:
+                self.resize_job(job)
+            except Exception as e:  # noqa: BLE001 - keep resizing the others
+                print(f"agent-coord: resize job {job[0]} failed: {e!r}", file=sys.stderr, flush=True)
+                with self.lock:  # clear this job's own entry, not a newer one
+                    if self._pending.get(job[0]) is job[3]:
+                        del self._pending[job[0]]
+
+    def ensure_worker(self, start: bool = False) -> bool:
+        """Start the resize worker (start=True, from serve), or restart it if
+        it was started and has stopped (a watchdog, from every tick; an
+        in-process user that runs resize_job itself never gets one).
+        Returns whether a thread was started."""
+        if not self.resize_async or (self._worker is not None and self._worker.is_alive()):
+            return False
+        if self._worker is None and not start:
+            return False
+        if self._worker is not None:
+            print("agent-coord: resize worker had stopped; restarted", file=sys.stderr, flush=True)
+        self._worker = threading.Thread(target=self.resize_worker, daemon=True)
+        self._worker.start()
+        return True
+
+    def resize_job(self, job: tuple) -> None:
+        """One queued resize: the systemctl call without the lock, then its
+        result applied (and the line re-admitted) with it. Only the pending
+        entry this job was queued with is taken; a newer one stays."""
+        lease_id, scope, cores, entry = job
+        try:
+            ok = self.resize(scope, cores)
+        except Exception:  # noqa: BLE001 - a failure like any other
+            ok = False
+        with self.lock:
+            pending = None
+            if self._pending.get(lease_id) is entry:
+                pending = self._pending.pop(lease_id)
+            try:
+                x = next((y for y in self.state["leases"] if y["id"] == lease_id), None)
+                if x is not None and pending is not None and x.get("scope") == scope:
+                    target, kind, note = pending
+                    if kind == "undo" and not ok:  # a growth, counted already: take it back
+                        self._apply(x, target, "retry", "growth could not be applied")
+                    self._resized(x, target, kind, note, ok)
+                self._prune()
+                self._admit()
+            finally:
+                self._save()
+
+    def _settled(self, x: dict, now: float) -> bool:
+        return now - x.get("resized_at", x.get("granted", now)) >= self.config["resize_interval"]
+
+    def _resizable(self, x: dict) -> bool:
+        """Whether elastic lease x may be resized now: its client reported its
+        scope exists (or SCOPE_READY_AFTER passed), no resize of it is under
+        way, and no failed one is waiting for its retry."""
+        now = time.time()
+        return (bool(x.get("elastic")) and x["id"] not in self._pending
+                and (x.get("scope_ready") or now - x.get("granted", now) >= SCOPE_READY_AFTER)
+                and now >= x.get("resize_retry_at", 0))
+
+    def _donor(self, x: dict) -> bool:
+        return self._resizable(x)
+
+    def _granted_room(self) -> float:
+        """Cores not granted to anyone: capacity less every lease's claim
+        (grants, fixed sizes, measured IO), load outside leases, and the
+        largest headroom a lease keeps. Elastic sizes above MIN come only out
+        of this, so they never make grants add up to more than the machine."""
+        cores, _ = self.capacity()
+        leases = self.state["leases"]
+        granted = sum(self._cpu_claim(x) for x in leases)
+        outside = self._unleased() + sum(g["cores"] for g in self._vms())
+        need = max([0.0, *(x.get("headroom", 0) for x in leases)])
+        return cores - granted - outside - need
+
+    def _entitled(self, req: dict, projects: dict[str, dict]) -> float:
+        """What req's project may reach by shrinking other projects' elastic
+        leases: its fair share."""
+        mine = self._project(req)
+        projects.setdefault(mine, {"held": 0.0, "waiting": [req]})
+        return self._shares(projects)[mine]
+
+    def _target(self, req: dict) -> float:
+        """The size a request aims for: a fixed size; a MIN:MAX request as
+        much as its project's entitlement leaves (at least MIN, at most MAX);
+        MIN when it starts by backfill (at MIN) or cannot be resized."""
+        low, high = req["cores"], req.get("max_cores")
+        if not high or high <= low or not req.get("elastic") or req.get("_at_min"):
+            return low
+        projects = self._projects()
+        room = self._entitled(req, projects) - projects[self._project(req)]["held"]
+        return float(max(low, min(high, math.floor(room + STEP_SLACK))))
+
+    def _grant_size(self, req: dict) -> float:
+        """The cores a MIN:MAX request starts with: as many up to its target
+        (MAX within its project's entitlement) as are neither granted nor
+        needed by requests waiting for CPU behind it; at least MIN."""
+        low, high = req["cores"], req.get("max_cores")
+        if not high or high <= low or not req.get("elastic"):
+            return low  # without a scope it could never be shrunk: MIN, fixed
+        waiting = 0.0
+        for x in self.state["queue"]:
+            why = None if x is req else self._why(x)
+            if x is not req and (why is None or why[0] in CPU_WAIT_KINDS):
+                waiting += self._cpu_claim(x)
+        limit = min(self._target(req), self._granted_room() - waiting)
+        for size in range(math.floor(limit + STEP_SLACK), math.floor(low), -1):
+            if size > low and not self._why({**req, "cores": float(size)}):
+                return float(size)
+        return low
+
+    def _preempt(self, req: dict, allowed=None) -> bool:
+        """Shrink running elastic leases so req (allowed to start at its
+        place in line, short only of CPU) can start, at its target size if
+        possible and at least at its MIN or fixed size. Returns whether it
+        fits now.
+
+        - Other projects' elastic leases give only while req's project would
+          stay within its entitlement (its fair share); a timing run
+          (--exclusive-lock or --headroom) may take them down to their MIN
+          whatever its share, as far as it needs to start with its headroom:
+          asking for a big fixed size never gets a project more than asking
+          MIN:MAX. The project furthest over its share gives first, then the
+          lease with the largest surplus over its MIN, a core at a time.
+        - Leases of req's own project give (toward MIN) only as far as req
+          needs to reach its MIN or fixed size.
+        - Never below MIN; fixed, IO and timing leases never shrink; a lease
+          granted in the last few seconds is left alone. Nothing changes
+          unless req then fits. Each shrink is applied to the donor's scope
+          before it counts; a donor whose scope cannot be resized becomes
+          fixed and the plan is made again without it."""
+        if self._pending:
+            # Shrinks already under way: if they will make room, wait for them.
+            with self._pending_applied():
+                if not self._why(req) and (allowed is None or allowed()):
+                    return False
+        for _ in range(4):
+            with self._pending_applied():
+                plan = self._plan(req, allowed)
+            if plan is None:
+                return False
+            failed = False
+            for x, new in plan:
+                done = self._resize(x, new, "preempted", (
+                    f"preempted by {req['id']} ({req['agent']}: {req['label']}, "
+                    f"project {self._project(req)})"))
+                if done is False:
+                    failed = True
+                    continue
+                if x.get("shrink_told") != req["id"]:
+                    x["shrink_told"] = req["id"]
+                    self._post(
+                        "agent-coord", x["agent"],
+                        f"FYI: lease {x['id']} ({x['label']}) was shrunk to {new:g} cores so "
+                        f"{req['id']} ({req['agent']}: {req['label']}) can start; it grows back "
+                        "toward its MAX when cores free up. Nothing to do: the command reads the "
+                        "current count from $COMPUTE_LEASE_FILE.",
+                    )  # fmt: skip
+            if not failed:
+                return not self._why(req)
+        return not self._why(req)
+
+    @contextlib.contextmanager
+    def _pending_applied(self):
+        """For planning: leases with a shrink under way count at its size."""
+        saved = {}
+        for x in self.state["leases"]:
+            pending = self._pending.get(x["id"])
+            if pending and pending[1] != "undo" and pending[0] < x["cores"]:
+                saved[x["id"]] = x["cores"]
+                x["cores"] = pending[0]
+        try:
+            yield
+        finally:
+            for x in self.state["leases"]:
+                if x["id"] in saved:
+                    x["cores"] = saved[x["id"]]
+
+    def _plan(self, req: dict, allowed=None) -> list[tuple[dict, float]] | None:
+        """The shrinks _preempt applies (lease, new size), or None if they
+        would not let req start even at its MIN or fixed size, or if allowed()
+        (its place in line, judged with the shrinks in place) says no."""
+        mine = self._project(req)
+        projects = self._projects()
+        shares = self._shares(projects)
+        entitled = self._entitled(req, projects)
+        held = {p: e["held"] for p, e in projects.items()}
+        low = req["cores"]
+        target = self._target(req)
+        elastic = [x for x in self.state["leases"] if self._donor(x)]
+        before = {x["id"]: x["cores"] for x in elastic}
+        timing = self._timing(req)
+
+        def fits(size):
+            # Start at size, and (for a request behind the head) be allowed
+            # to at its place in line, with the shrinks so far in place.
+            return not self._why({**req, "cores": size}) and (allowed is None or allowed())
+
+        def surplus(x):
+            return x["cores"] - x["min_cores"]
+
+        try:
+            while not fits(target):
+                others = [x for x in elastic if self._project(x) != mine and surplus(x) > 1e-9]
+                own = [x for x in elastic if self._project(x) == mine and surplus(x) > 1e-9]
+                # A timing run may take other projects' elastic cores down
+                # to their MIN, whatever its share; others only up to theirs.
+                if others and (timing or held[mine] + target <= entitled + 1e-9):
+                    x = max(others, key=lambda x: (held[self._project(x)] - shares[self._project(x)],
+                                                   surplus(x)))
+                elif own and not fits(low):
+                    x = max(own, key=surplus)
+                elif target > low:
+                    target = max(low, target - 1)
+                    continue
+                else:
+                    break
+                step = min(1.0, surplus(x))
+                x["cores"] -= step
+                held[self._project(x)] -= step
+            if not fits(low):
+                self._warned_unfair(req, projects, shares)
+                return None
+            return [(x, x["cores"]) for x in elastic if x["cores"] != before[x["id"]]]
+        finally:
+            for x in elastic:
+                x["cores"] = before[x["id"]]
+
+    def _warned_unfair(self, req: dict, projects: dict, shares: dict) -> bool:
+        """Once per waiting request: record which fixed leases keep its
+        project below its fair share; tell the holders of ordinary fixed
+        leases (not timing runs, which must be fixed) to ask for MIN:MAX."""
+        mine = self._project(req)
+        if not self._elastic_involved(req) or req.get("unfair_told") or mine not in projects or (
+                projects[mine]["held"] >= shares[mine] - 1e-9):
+            return False
+        fixed = self._holding_back(mine, projects, shares)
+        if not fixed:
+            return False
+        req["unfair_told"] = True
+        reason = (f"project {mine} is below its fair share ({projects[mine]['held']:g} of "
+                  f"{shares[mine]:.1f} cores) while fixed leases "
+                  f"{', '.join(x['id'] for x in fixed)} hold more than theirs")
+        self._log("unfair", req, reason=reason, holders=[x["id"] for x in fixed])
+        plain = [x for x in fixed if not (x.get("exclusive_locks") or x.get("headroom")
+                                          or x.get("exclusive"))]
+        for agent in sorted({x["agent"] for x in plain}):
+            self._post("agent-coord", agent,
+                       f"{reason}. Fixed leases cannot be shrunk for other projects: unless it is "
+                       "a timing run, ask for --cores MIN:MAX next time so the scheduler can "
+                       "share them.")
+        return True
+
+    def _cpu_waiters(self) -> bool:
+        """Whether a request waits for CPU (cores or headroom), or fits but
+        waits its turn behind one."""
+        for x in self.state["queue"]:
+            why = self._why(x)
+            if why is None or why[0] in CPU_WAIT_KINDS:
+                return True
+        return False
+
+    def _even_out(self, elastic: list[dict], warming: set[str], now: float) -> bool:
+        """Move cores toward fair shares between running elastic leases: a
+        busy lease of a project under its share takes, a core at a time, from
+        elastic leases of projects over theirs (furthest over first), never
+        below their share or MIN. The donors' scopes are capped first; the
+        taker grows only by what they gave, so grants never add up to more.
+        Leases resized within resize_interval are left alone."""
+        projects = self._projects()
+        if len(projects) < 2:
+            return False
+        shares = self._shares(projects)
+        held = {p: e["held"] for p, e in projects.items()}
+        changed = False
+        for x in sorted(elastic, key=lambda x: held[self._project(x)] / self._weight(self._project(x))):
+            mine = self._project(x)
+            own = self._raw_cores.get(x["id"])
+            if (not self._resizable(x) or x["id"] in warming or own is None
+                    or own < self.config["grow_demand"] * x["cores"]
+                    or x["cores"] >= x["max_cores"] or not self._settled(x, now)):
+                continue
+            want = math.floor(min(x["max_cores"] - x["cores"], shares[mine] - held[mine]) + 1e-9)
+            taken: dict[str, float] = {}
+            while sum(taken.values()) < want:
+                donors = [y for y in elastic if self._project(y) != mine and self._donor(y)
+                          and y["cores"] - taken.get(y["id"], 0) - y["min_cores"] >= 1 - 1e-9
+                          and held[self._project(y)] - shares[self._project(y)] >= 1 - 1e-9
+                          and self._settled(y, now)]
+                if not donors:
+                    break
+                y = max(donors, key=lambda y: (held[self._project(y)] - shares[self._project(y)],
+                                               y["cores"] - taken.get(y["id"], 0) - y["min_cores"]))
+                taken[y["id"]] = taken.get(y["id"], 0) + 1
+                held[self._project(y)] -= 1
+            gain = 0.0
+            for y in elastic:
+                if y["id"] in taken:
+                    done = self._resize(y, y["cores"] - taken[y["id"]], "preempted", (
+                        f"rebalanced: fair share for project {mine} (lease {x['id']})"))
+                    if done:
+                        gain += taken[y["id"]]
+                    elif done is False:
+                        held[self._project(y)] += taken[y["id"]]
+                    changed = True
+            # A shrink still under way (worker) frees its cores later; the
+            # taker then gets them through growth, up to its share.
+            if gain:
+                if self._resize(x, x["cores"] + gain, "grew", f"grew: fair share for project {mine}"):
+                    held[mine] += gain
+                changed = True
+        return changed
+
+    def _rebalance(self) -> bool:
+        """Offer idle elastic leases down, even out fair shares, and grow
+        busy ones toward MAX when nothing waits for cores."""
+        cfg = self.config
+        now = time.time()
+        elastic = [x for x in self.state["leases"] if x.get("elastic")]
+        ids = {x["id"] for x in elastic}
+        self._idle = {k: v for k, v in self._idle.items() if k in ids}
+        if not elastic:
+            return False
+        changed = False
+        warming = {x["id"] for x in self._warming()}
+        for x in elastic:
+            own = self._raw_cores.get(x["id"])
+            if (x["id"] in warming or own is None or own >= cfg["idle_fraction"] * x["cores"]
+                    or not self._resizable(x)):
+                self._idle.pop(x["id"], None)
+                continue
+            since, peak = self._idle.get(x["id"], (now, own))
+            peak = max(peak, own)
+            self._idle[x["id"]] = (since, peak)
+            target = max(x["min_cores"], float(math.ceil(peak / cfg["idle_target_use"])))
+            if now - since >= cfg["idle_after"] and self._settled(x, now) and target < x["cores"]:
+                self._resize(x, target, "idle", (
+                    f"idle shrink: used at most {peak:.1f} of {x['cores']:g} cores for "
+                    f"{(now - since) / 60:.0f} min"))  # fmt: skip
+                changed = True
+        changed |= self._even_out(elastic, warming, now)
+        if self._cpu_waiters():
+            return changed
+        cores, _ = self.capacity()
+        used, _ = self._usage()
+        # Both what is measured free and what is not granted to anyone, so
+        # grants never add up to more than the machine.
+        spare = min(cores - used, self._granted_room())
+        need = max([0.0, *(x.get("headroom", 0) for x in self.state["leases"])])
+        if need:
+            spare = min(spare, cores - self._claimed() - need)
+        projects = self._projects()
+        shares = self._shares(projects)
+        for x in sorted(elastic, key=lambda x: x["cores"] - x["min_cores"]):
+            own = self._raw_cores.get(x["id"])
+            if (not self._resizable(x) or x["id"] in warming or own is None
+                    or own < cfg["grow_demand"] * x["cores"]
+                    or x["cores"] >= x["max_cores"] or not self._settled(x, now)):
+                continue
+            mine = self._project(x)
+            # Up to its project's share, every free core; beyond it, keep
+            # grow_margin free (so a newcomer starts without preempting).
+            below = max(0.0, shares[mine] - projects[mine]["held"]) if len(projects) > 1 else 0.0
+            room = max(min(spare, below), spare - cfg["grow_margin"])
+            step = math.floor(min(x["max_cores"] - x["cores"], room) + STEP_SLACK)
+            if step >= 1 and self._resize(x, x["cores"] + step, "grew", (
+                    f"grew: using {own:.1f} of {x['cores']:g} cores and cores are free")) is not False:
+                spare -= step
+                projects[mine]["held"] += step
+                changed = True
+        return changed
 
     def _stuck(self, req: dict) -> bool:
         """Whether req has waited STUCK_AFTER for memory that no lease's end
@@ -666,6 +1463,11 @@ class Coordinator:
                 head["head_since"] = time.time()
                 changed = True
             why = self._why(head)
+            if why and why[0] in CPU_WAIT_KINDS and self._preempt(head):
+                why = self._why(head)
+                changed = True
+            if not why:
+                changed |= self._top_up(head)
             if why:
                 kind, reason = why
                 if head.get("reason_kind") != kind:
@@ -679,6 +1481,8 @@ class Coordinator:
                     for holder in self.state["leases"]:
                         if holder.get("io") and self._cpu_claim(holder) < holder["cores"] / 2:
                             continue
+                        if holder.get("elastic"):
+                            continue  # told when it is shrunk instead
                         self._post(
                             "agent-coord", holder["agent"],
                             f"{head['agent']} has waited "
@@ -702,18 +1506,34 @@ class Coordinator:
                 changed |= before != head.get("projected_start")
                 return self._backfill(head) or changed
             self.state["queue"].pop(0)
-            self._grant(head)
+            self._grant(head, self._grant_size(head))
             changed = True
         return changed
 
-    def _grant(self, req: dict) -> None:
+    def _top_up(self, req: dict) -> bool:
+        """Before a MIN:MAX request starts: if it would start below its target
+        (its fair share, up to MAX), shrink other projects' elastic leases
+        for it as a waiting request would. So asking MIN:MAX never gets a
+        project less than asking a fixed size."""
+        if (not req.get("max_cores") or not req.get("elastic")
+                or self._grant_size(req) >= self._target(req)):
+            return False
+        before = {x["id"]: x["cores"] for x in self.state["leases"]}
+        self._preempt(req)
+        return any(x["cores"] != before.get(x["id"]) for x in self.state["leases"])
+
+    def _grant(self, req: dict, cores: float | None = None) -> None:
+        """Start req; a MIN:MAX request with cores (else at its MIN, as when
+        it passes a waiting head, whose projection counted it at MIN)."""
+        if cores is not None:
+            req["cores"] = float(cores)
         req["granted"] = time.time()
         if not req.get("backfill_reason", "").startswith("backfilled:"):
             req.pop("backfill_reason", None)
             req.pop("backfill_head", None)
         req.pop("reason", None)
         req.pop("reason_kind", None)
-        for key in ("head_since", "projected_start", "projected_ending"):
+        for key in ("head_since", "projected_start", "projected_ending", "unfair_told"):
             req.pop(key, None)
         self.state["leases"].append(req)
         self._log("started", req, wait=round(req["granted"] - req["asked"], 1))
@@ -733,12 +1553,12 @@ class Coordinator:
         freed_cores = sum(self._cpu_claim(x) for x in ending)
         freed_mem = sum(self._mem_claim(x) for x in ending)
         need_cores = self._cpu_claim(req) + self._cpu_claim(head)
-        if used_cores - freed_cores + need_cores > cores:
+        if used_cores - freed_cores + need_cores > cores + self._eps():
             return False
         if used_mem - freed_mem + req["mem"] + head["mem"] > mem:
             return False
         if head.get("headroom") and (self._claimed() - freed_cores + need_cores
-                                     + head["headroom"] > cores):  # fmt: skip
+                                     + head["headroom"] > cores + self._eps()):  # fmt: skip
             return False
         if self.available is None:
             return True
@@ -809,10 +1629,10 @@ class Coordinator:
                                      if x["id"] not in once),
                                  max(0, net - outside))
         used = max(outside + io_used, used) + self._reserved_cpu(remaining)
-        if used + self._cpu_claim(head) + (self._cpu_claim(req) if req else 0) > cores:
+        if used + self._cpu_claim(head) + (self._cpu_claim(req) if req else 0) > cores + self._eps():
             return False
         headroom = max(x.get("headroom", 0) for x in jobs)
-        if headroom and sum(self._cpu_claim(x) for x in jobs) + outside + headroom > cores:
+        if headroom and sum(self._cpu_claim(x) for x in jobs) + outside + headroom > cores + self._eps():
             return False
         if self.available is not None:
             footprints = self._measured_mem(self.state["leases"])
@@ -880,6 +1700,14 @@ class Coordinator:
             req.pop("backfill_reason", None)
             req.pop("backfill_head", None)
             why = self._why(req)
+            # A backfilled request starts at its MIN: shrink others only for that.
+            req["_at_min"] = True
+            try:
+                if why and why[0] in CPU_WAIT_KINDS and self._preempt(
+                        req, allowed=lambda req=req: self._may_pass(req)):
+                    why = None  # elastic leases were shrunk for it (not only for the head)
+            finally:
+                req.pop("_at_min", None)
             if not why and self._may_pass(req):
                 self.state["queue"].remove(req)
                 self._grant(req)
@@ -969,27 +1797,37 @@ class Coordinator:
         previous = self._cpu_sample
         self._cpu_sample = now, samples
         self._measured_cores = {}
+        self._raw_cores = {}
         if previous is None or now <= previous[0]:
             self._own_cores = {}
             return
-        own = {}
+        own, sizes = {}, {}
         for x in self.state["leases"]:
             lease_id = x["id"]
             if lease_id in samples and lease_id in previous[1]:
                 delta = samples[lease_id] - previous[1][lease_id]
                 raw = max(0, delta) / (now - previous[0])
-                self._measured_cores[lease_id] = min(x["cores"], raw)
-                # Smoothed like self.busy, starting from 0 as the host-wide
-                # figure effectively does: never subtract more than it holds.
+                self._raw_cores[lease_id] = raw
+                self._measured_cores[lease_id] = min(self._size(x), raw)
+                # Smoothed with the same factor as self.busy (see tick).
+                # Starts from 0, as the host-wide figure effectively does for
+                # a new lease's load: never subtract more than busy holds.
                 before = self._own_cores.get(lease_id, 0.0)
                 own[lease_id] = before + BUSY_SMOOTHING * (raw - before)
+                # Its size, smoothed the same way: after a shrink, the busy
+                # figure still holds its earlier use for a while.
+                size = self._size(x)
+                was = self._size_avg.get(lease_id, size)
+                sizes[lease_id] = was + BUSY_SMOOTHING * (size - was)
         self._own_cores = own
+        self._size_avg = sizes
 
     def _hint_io(self, now: float) -> bool:
         low_since = {}
         changed = False
         for x in self.state["leases"]:
-            if x.get("io") or x.get("io_hint") or time.time() - x["granted"] < WARMUP:
+            if (x.get("io") or x.get("io_hint") or x.get("elastic")
+                    or time.time() - x["granted"] < WARMUP):
                 continue
             lease_id = x["id"]
             cpu = self._measured_cores.get(lease_id)
@@ -1021,13 +1859,16 @@ class Coordinator:
         sample = self.measure()
         with self.lock:
             targets = [(x["id"], x["pid"]) for x in self.state["leases"]
-                       if x.get("io") or x.get("exclusive_locks")
+                       if x.get("io") or x.get("exclusive_locks") or x.get("min_cores")
                        or (x["cores"] >= 2 and not x.get("io_hint"))]
+            walk = any(x.get("exclusive_locks") or x.get("elastic") for x in self.state["leases"])
         now = time.monotonic()
         by_pid = {pid: self.cpu_seconds(pid) for pid in {pid for _, pid in targets}}
+        # Process trees matter only for leases counted once: walk them only
+        # when one exists (and more than one lease is measured).
+        trees = {pid: (self.tree_pids or tree_pids)(pid) for pid in by_pid
+                 if by_pid[pid] is not None} if len(targets) > 1 and walk else {}  # fmt: skip
         samples = {lease_id: by_pid[pid] for lease_id, pid in targets if by_pid[pid] is not None}
-        trees = ({pid: self.tree_pids(pid) for pid in by_pid if by_pid[pid] is not None}
-                 if len(targets) > 1 else {})  # fmt: skip
         with self.lock:
             self._trees = {lease_id: trees[pid] for lease_id, pid in targets if pid in trees}
             self._sample_lease_cpu(now, samples)
@@ -1035,11 +1876,28 @@ class Coordinator:
             self.available = sample["available"]
             # Smoothed over ~10 s: a moment's burst shouldn't hold the line.
             self.busy += BUSY_SMOOTHING * (sample["busy"] - self.busy)
+            self._reload_config()
+            self.ensure_worker()
             changed = self._prune()
             changed |= self._hint_io(now)
             changed |= self._admit()
+            changed |= self._rebalance()
             if changed:
                 self._save()
+
+    def _reload_config(self) -> None:
+        if self.config_file is None:
+            return
+        try:
+            mtime = self.config_file.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime != self._config_mtime:
+            self._config_mtime = mtime
+            try:
+                self.config = load_config(self.config_file)
+            except Exception as e:  # noqa: BLE001 - keep the previous settings
+                print(f"agent-coord: config reload failed: {e!r}", file=sys.stderr, flush=True)
 
     # -- requests
 
@@ -1066,6 +1924,16 @@ class Coordinator:
                 return {"error": f"missing {key}"}
         if req["cores"] <= 0 or req["mem"] < 0:
             return {"error": "cores must be positive and mem not negative"}
+        high = req.get("max_cores")
+        if high is not None:
+            if type(high) not in (int, float) or not math.isfinite(high) or high < req["cores"]:
+                return {"error": "max cores must be a number no smaller than min cores"}
+            if (req.get("exclusive") or req.get("exclusive_locks") or req.get("headroom")
+                    or req.get("io") or req.get("running")):
+                return {"error": "MIN:MAX cores are for ordinary run leases; timing runs "
+                                 "(--exclusive, --exclusive-lock, --headroom), --io and hold "
+                                 "take a fixed --cores"}  # fmt: skip
+            high = min(float(high), self.capacity()[0])
         scoped = [str(n) for n in req.get("exclusive_locks") or []]
         headroom = float(req.get("headroom") or 0)
         if scoped and req.get("exclusive"):
@@ -1078,6 +1946,7 @@ class Coordinator:
         estimate, source = ((expect, "explicit") if expect is not None
                             else self._estimate(agent, str(req["label"])))
         locks = list(dict.fromkeys([*(str(n) for n in req.get("locks") or []), *scoped]))
+        project = str(req.get("project") or "") or None
         lease = {
             "id": f"L{self.state['next']}", "agent": agent, "pid": int(req["pid"]),
             "cores": float(req["cores"]), "mem": int(req["mem"]),
@@ -1093,6 +1962,22 @@ class Coordinator:
             lease["io"] = True
         if headroom:
             lease["headroom"] = headroom
+        if project:
+            lease["project"] = project
+        if req.get("repo"):
+            lease["repo"] = str(req["repo"])
+        if type(req.get("client")) is int:
+            lease["client"] = req["client"]
+        if req.get("resizable") and not req.get("running"):
+            # The client runs the command in a scope of this name; the service
+            # resizes only scopes it named, by that exact name.
+            lease["scope"] = f"{SCOPE_PREFIX}-{lease['id']}-{lease['pid']}.scope"
+        if high is not None and high > lease["cores"]:
+            # Queued at MIN; granted up to MAX. Resized while running only if
+            # it runs in a scope (else fixed at the size it starts with).
+            lease["min_cores"], lease["max_cores"] = lease["cores"], high
+            if lease.get("scope"):
+                lease["elastic"] = True
         self.state["next"] += 1
         too_big = self._too_big(lease)
         if too_big and not req.get("running"):
@@ -1112,8 +1997,13 @@ class Coordinator:
         return {"id": lease["id"], **self._ticket(lease["id"])}
 
     def _ticket(self, lease_id: str) -> dict:
-        if any(x["id"] == lease_id for x in self.state["leases"]):
-            return {"state": "granted"}
+        for x in self.state["leases"]:
+            if x["id"] == lease_id:
+                return {"state": "granted", "cores": x["cores"],
+                        "min_cores": x.get("min_cores", x["cores"]),
+                        "max_cores": x.get("max_cores", x["cores"]),
+                        "elastic": bool(x.get("elastic")), "scope": x.get("scope"),
+                        "reason": x.get("resize_note", "granted")}  # fmt: skip
         for position, x in enumerate(self.state["queue"]):
             if x["id"] == lease_id:
                 reason = self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"
@@ -1123,7 +2013,14 @@ class Coordinator:
         return {"state": "gone"}
 
     def op_poll(self, req: dict, _agent: str) -> dict:
-        return self._ticket(str(req.get("id")))
+        """A client's poll; a running MIN:MAX client also reports, once, that
+        its scope exists (only the lease's own client, by its pid)."""
+        lease_id = str(req.get("id"))
+        if req.get("scope_ready"):
+            for x in self.state["leases"]:
+                if x["id"] == lease_id and req.get("pid") == x["pid"]:
+                    x["scope_ready"] = True
+        return self._ticket(lease_id)
 
     def op_release(self, req: dict, _agent: str) -> dict:
         lease_id = str(req.get("id"))
@@ -1150,10 +2047,20 @@ class Coordinator:
                  "locks": list(dict.fromkeys([*req.get("locks", []), *scoped])),
                  "exclusive_locks": scoped, "headroom": float(req.get("headroom") or 0),
                  "disk": req.get("disk", {}), "expect": expect}  # fmt: skip
+        if req.get("project"):
+            probe["project"] = str(req["project"])
+        if req.get("repo"):
+            probe["repo"] = str(req["repo"])
+        if req.get("max_cores"):
+            probe["max_cores"] = min(float(req["max_cores"]), self.capacity()[0])
+            probe["min_cores"] = probe["cores"]
         reason = self._blocked(probe)
         if not reason and self.state["queue"] and not self._may_pass(probe):
             reason = probe.get("backfill_reason") or f"{len(self.state['queue'])} request(s) already waiting"
-        return {"ok": reason is None, "reason": reason}
+        reply = {"ok": reason is None, "reason": reason}
+        if reason is None:
+            reply["cores"] = self._grant_size(probe)
+        return reply
 
     def op_lock(self, req: dict, agent: str) -> dict:
         name = str(req.get("name", "")).strip()
@@ -1209,13 +2116,48 @@ class Coordinator:
     def op_status(self, _req: dict, _agent: str) -> dict:
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
+        projects = self._projects()
+        shares = self._shares(projects)
+        project_rows = []
+        holding_back: dict[str, list[str]] = {}
+        for name, entry in sorted(projects.items()):
+            row = {"name": name, "weight": self._weight(name), "share": round(shares[name], 2),
+                   "held": round(entry["held"], 2),
+                   "waiting": len(entry["waiting"]),
+                   "waiting_cores": sum(x["cores"] for x in entry["waiting"])}
+            cpu_wait = [x for x in entry["waiting"]
+                        if (why := self._why(x)) is not None and why[0] in CPU_WAIT_KINDS]
+            if cpu_wait and entry["held"] < shares[name] - 1e-9 and self._elastic_involved():
+                fixed = self._holding_back(name, projects, shares)
+                if fixed:
+                    row["warning"] = (f"below its fair share while fixed leases "
+                                      f"{', '.join(x['id'] for x in fixed)} hold more than "
+                                      "their share (fixed leases are never shrunk)")
+                    for x in fixed:
+                        holding_back.setdefault(x["id"], []).append(name)
+            project_rows.append(row)
+
+        def lease_row(x):
+            row = {**x, "project": self._project(x)}
+            if x["id"] in holding_back:
+                row["holding_back"] = holding_back[x["id"]]
+            if x.get("io"):
+                row.update(measured_cores=round(self._cpu_claim(x), 2),
+                           claimed_mem=self._mem_claim(x))
+            elif x["id"] in self._raw_cores:
+                row["measured_cores"] = round(self._raw_cores[x["id"]], 2)
+            if x.get("max_cores") and x["cores"] < x["max_cores"] and x.get(
+                    "resize_kind") in ("preempted", "idle"):
+                row["shrunk"] = True
+            return row
+
         return {
             "capacity": {"cores": cores, "mem": mem, "reserve": RESERVE_MEM},
             "free": {"cores": cores - used_cores, "mem": mem - used_mem},
-            "leases": [{**x, "measured_cores": round(self._cpu_claim(x), 2),
-                        "claimed_mem": self._mem_claim(x)} if x.get("io") else x
-                       for x in self.state["leases"]],
-            "queue": [{**x, "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
+            "leases": [lease_row(x) for x in self.state["leases"]],
+            "projects": project_rows,
+            "queue": [{**x, "project": self._project(x),
+                       "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
                       for x in self.state["queue"]],
             "vms": self._vms(), "load": os.getloadavg(),
             "locks": self.state["locks"],
@@ -1225,6 +2167,7 @@ class Coordinator:
             "unleased_cores": round(self._unleased(), 1),
             "busy_cores": round(self.busy, 1),
             "available": self.available,
+            "config_errors": self.config.get("errors", []),
         }
 
 
@@ -1232,7 +2175,12 @@ def serve(
     socket_path: Path | None = None, state_file: Path | None = None, **coordinator_args
 ) -> None:
     socket_path, state_file = socket_path or SOCKET, state_file or STATE_FILE
+    coordinator_args.setdefault("config_file", CONFIG_FILE)
+    coordinator_args.setdefault("resize", resize_scope)
+    coordinator_args.setdefault("resize_async", True)
     coordinator = Coordinator(state_file, **coordinator_args)
+    coordinator.ensure_worker(start=True)
+    sweep_lease_files(socket_path.parent / "leases")
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     socket_path.unlink(missing_ok=True)
 
@@ -1243,6 +2191,9 @@ def serve(
                 reply = coordinator.handle(json.loads(line))
             except (ValueError, TypeError, KeyError) as e:
                 reply = {"error": f"bad request: {e}"}
+            except Exception as e:  # noqa: BLE001 - one bad request must not end the service
+                print(f"agent-coord: request failed: {e!r}", file=sys.stderr, flush=True)
+                reply = {"error": f"internal error: {e!r}"}
             self.wfile.write(json.dumps(reply).encode() + b"\n")
 
     class Server(socketserver.ThreadingUnixStreamServer):
@@ -1318,7 +2269,7 @@ class _ServiceError(SystemExit):
     """The service answered with an error (not worth retrying)."""
 
 
-def _wait_for(lease_id: str, reply: dict, max_wait: float | None) -> None:
+def _wait_for(lease_id: str, reply: dict, max_wait: float | None) -> dict:
     deadline = None if max_wait is None else time.monotonic() + max_wait
     said, said_at = None, 0.0
     while reply["state"] == "waiting":
@@ -1335,6 +2286,7 @@ def _wait_for(lease_id: str, reply: dict, max_wait: float | None) -> None:
         reply = call({"op": "poll", "id": lease_id}, retry=120)
     if reply["state"] != "granted":
         raise SystemExit(f"agent-coord: lease {lease_id} vanished")
+    return reply
 
 
 def mount_of(path: str) -> str:
@@ -1399,19 +2351,133 @@ def archive_writes(cmd: list[str], cwd: str, mounts: list[str]) -> list[str]:
     return found
 
 
-def limited(cmd: list[str], cores: float, mem: int) -> list[str]:
+def has_scopes() -> bool:
+    """Whether commands can run in systemd user scopes (and be resized)."""
+    bus = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "bus")
+    return bool(shutil.which("systemd-run")) and bus.exists()
+
+
+def scope_name(lease_id: str) -> str:
+    """This client's scope for lease_id: unique per client process, and the
+    prefix (AGENT_COORD_SCOPE_PREFIX) keeps private instances' scopes apart."""
+    prefix = os.environ.get("AGENT_COORD_SCOPE_PREFIX") or "agent-coord"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", prefix) or not re.fullmatch(r"L\d+", lease_id):
+        raise SystemExit(f"agent-coord: bad scope name {prefix}-{lease_id}")
+    return f"{prefix}-{lease_id}-{os.getpid()}.scope"
+
+
+def cpu_quota(cores: float) -> str:
+    return f"CPUQuota={max(int(cores * 100), 1)}%"
+
+
+def limited(cmd: list[str], cores: float, mem: int, scope: str | None = None) -> list[str]:
     """cmd in a systemd user scope capped at cores and mem, at low priority."""
     low = ["nice", "-n", "19", "ionice", "-c", "3", *cmd]
-    bus = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "bus")
-    if not shutil.which("systemd-run") or not bus.exists():
+    if not has_scopes():
         print("agent-coord: no systemd user session; running uncapped at low "
               "priority", file=sys.stderr)  # fmt: skip
         return low
     return [
         "systemd-run", "--user", "--scope", "--quiet", "--collect",
-        "-p", f"CPUQuota={max(int(cores * 100), 1)}%", "-p", f"MemoryMax={mem}",
+        *(["--unit", scope] if scope else []),
+        "-p", cpu_quota(cores), "-p", f"MemoryMax={mem}",
         "-p", "MemorySwapMax=0", "--", *low,
     ]  # fmt: skip
+
+
+def resize_command(scope: str, cores: float) -> list[str]:
+    """The command that changes a running scope's CPU cap (runtime only)."""
+    return ["systemctl", "--user", "set-property", "--runtime", scope, cpu_quota(cores)]
+
+
+def resize_scope(scope: str, cores: float) -> bool:
+    try:
+        return subprocess.run(resize_command(scope, cores), capture_output=True,
+                              timeout=RESIZE_TIMEOUT, check=False).returncode == 0  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def lease_text(info: dict) -> str:
+    """COMPUTE_LEASE_FILE: line 1 the whole cores to use now (at least 1),
+    line 2 the same as JSON with the lease id, min, max, exact grant, reason
+    and time."""
+    return f"{max(int(info['granted']), 1)}\n{json.dumps(info, sort_keys=True)}\n"
+
+
+def write_lease_file(path: Path, info: dict) -> None:
+    """Replace path atomically: readers see the old or the new file, whole."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(lease_text(info))
+    tmp.replace(path)
+
+
+def scope_exists(pid: int, scope: str) -> bool:
+    """Whether process pid already runs in systemd unit scope (its cgroup)."""
+    try:
+        return f"/{scope}" in Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return False
+
+
+def report_scope_ready(lease_id: str, child: subprocess.Popen, scope: str,
+                       stop: threading.Event, poll=None) -> None:
+    """Tell the service, once, that the command's scope exists (so it may
+    resize it); waits up to SCOPE_READY_AFTER for systemd-run to set it up."""
+    poll = poll or (lambda request: call(request, retry=120))
+    deadline = time.monotonic() + SCOPE_READY_AFTER
+    while not stop.is_set() and time.monotonic() < deadline:
+        if scope_exists(child.pid, scope):
+            try:
+                poll({"op": "poll", "id": lease_id, "pid": os.getpid(), "scope_ready": True})
+            except (SystemExit, Exception):  # noqa: BLE001 - the service falls back on a timeout
+                pass
+            return
+        stop.wait(0.2)
+
+
+def follow_grant(lease_id: str, child: subprocess.Popen, path: Path, info: dict,
+                 notify: bool, stop: threading.Event, poll=None,
+                 interval: float | None = None) -> None:
+    """While child runs, learn grant changes on the normal poll (the service
+    has already capped the scope), rewrite the lease file, then (if notify)
+    send SIGUSR1 to child, the process this client started, and nothing else.
+    Informational only: no failure here affects the lease or its accounting,
+    and errors (a closed stderr pipe, a full disk) never end the loop."""
+    poll = poll or (lambda request: call(request, retry=120))
+    interval = POLL if interval is None else interval
+    while not stop.wait(interval):
+        try:
+            reply = poll({"op": "poll", "id": lease_id})
+            cores = reply.get("cores")
+            if reply.get("state") != "granted" or not cores or cores == info["granted"]:
+                continue
+            info.update(granted=cores, reason=reply.get("reason", ""), time=round(time.time(), 1))
+            if stop.is_set():
+                return  # the command has ended: its lease file is being removed
+            write_lease_file(path, info)
+            if notify and child.pid > 1 and child.poll() is None:
+                child.send_signal(signal.SIGUSR1)
+            print(f"agent-coord: {lease_id} now {cores:g} cores ({info['reason']})",
+                  file=sys.stderr, flush=True)  # fmt: skip
+        except (SystemExit, Exception):  # noqa: BLE001 - keep following; nothing depends on it
+            continue
+
+
+def sweep_lease_files(directory: Path) -> int:
+    """Remove lease files whose client (the pid in the name) has exited."""
+    removed = 0
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        match = re.fullmatch(r"\.?(L\d+)-(\d+)(?:\.tmp)?", entry.name)
+        if match and not alive(int(match[2])):
+            entry.unlink(missing_ok=True)
+            removed += 1
+    return removed
 
 
 def parse_disk(text: str) -> tuple[str, int]:
@@ -1423,7 +2489,9 @@ def parse_disk(text: str) -> tuple[str, int]:
 
 def _lease_request(args: argparse.Namespace, pid: int) -> dict:
     return {"op": "acquire", "agent": args.agent, "cwd": os.getcwd(), "pid": pid,
-            "cores": args.cores, "mem": args.mem, "label": args.label, "io": args.io,
+            "cores": args.cores, "max_cores": args.max_cores, "project": args.project,
+            "repo": args.repo, "client": CLIENT_VERSION,
+            "resizable": has_scopes(), "mem": args.mem, "label": args.label, "io": args.io,
             "exclusive": args.exclusive, "locks": args.lock or [],
             "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
             "expect": args.expect, "disk": dict(args.disk or [])}  # fmt: skip
@@ -1445,6 +2513,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     lease_id = reply["id"]
     child = None
     end: dict = {}
+    stop = threading.Event()
+    follower = None
+    path = RUNTIME / "leases" / f"{lease_id}-{os.getpid()}"
 
     def forward(signum: int, _frame: object) -> None:
         if child is not None and child.poll() is None:
@@ -1455,16 +2526,42 @@ def cmd_run(args: argparse.Namespace) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
     try:
-        _wait_for(lease_id, reply, args.max_wait)
-        print(f"agent-coord: {lease_id} started ({args.cores:g} cores, "
-              f"{human(args.mem)})", file=sys.stderr, flush=True)  # fmt: skip
-        env = dict(os.environ, COMPUTE_LEASE_CORES=str(max(int(args.cores), 1)))
+        reply = _wait_for(lease_id, reply, args.max_wait)
+        granted = float(reply.get("cores") or args.cores)
+        low, high = args.cores, args.max_cores or args.cores
+        print(f"agent-coord: {lease_id} started ({granted:g} cores"
+              + (f" of {low:g}:{high:g}" if args.max_cores else "")
+              + f", {human(args.mem)})", file=sys.stderr, flush=True)  # fmt: skip
+        info = {"lease": lease_id, "min": low, "max": high, "granted": granted,
+                "reason": "granted", "time": round(time.time(), 1)}
+        write_lease_file(path, info)
+        env = dict(os.environ, COMPUTE_LEASE_CORES=str(max(int(granted), 1)),
+                   COMPUTE_LEASE_MIN=f"{low:g}", COMPUTE_LEASE_MAX=f"{high:g}",
+                   COMPUTE_LEASE_FILE=str(path))  # fmt: skip
         # JVMs size their heap from the host's RAM, not the scope's limit, and
         # get killed at it: tell them the lease's memory (heap up to 60% of it).
         java = f"-XX:MaxRAM={args.mem} -XX:MaxRAMPercentage=60"
         env["JAVA_TOOL_OPTIONS"] = f"{env.get('JAVA_TOOL_OPTIONS', '')} {java}".strip()
-        child = subprocess.Popen(limited(command, args.cores, args.mem), env=env)
+        elastic = bool(reply.get("elastic"))
+        scope = None
+        if has_scopes():
+            # The service names the scope (and resizes it by that name).
+            scope = reply.get("scope") or scope_name(lease_id)
+            if not ANY_SCOPE_RE.fullmatch(scope):
+                raise SystemExit(f"agent-coord: bad scope name {scope!r}")
+        if args.max_cores and not elastic:
+            print(f"agent-coord: {lease_id} cannot be resized (no systemd scope); it keeps "
+                  f"{granted:g} cores", file=sys.stderr, flush=True)  # fmt: skip
+        child = subprocess.Popen(limited(command, granted, args.mem, scope), env=env)
+        if elastic:
+            if scope:
+                threading.Thread(target=report_scope_ready, daemon=True,
+                                 args=(lease_id, child, scope, stop)).start()
+            follower = threading.Thread(target=follow_grant, daemon=True, args=(
+                lease_id, child, path, info, args.notify_signal, stop))
+            follower.start()
         code = child.wait()
+        stop.set()
         if code == -signal.SIGKILL:
             print(f"agent-coord: {lease_id} was killed; if it used more than "
                   f"--mem {human(args.mem)}, lease more", file=sys.stderr)  # fmt: skip
@@ -1474,6 +2571,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         end.update(code=130, why="interrupted")
         return 130
     finally:
+        stop.set()
+        if follower is not None:
+            follower.join(20)  # at most one resize (15 s timeout) in flight
+        path.unlink(missing_ok=True)
+        path.with_name(f".{path.name}.tmp").unlink(missing_ok=True)
         try:
             call({"op": "release", "id": lease_id, **end}, retry=120)
         except SystemExit:
@@ -1489,12 +2591,16 @@ def cmd_hold(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    reply = call({"op": "check", "cores": args.cores, "mem": args.mem, "io": args.io,
+    reply = call({"op": "check", "cores": args.cores, "max_cores": args.max_cores,
+                  "project": args.project, "repo": args.repo, "mem": args.mem, "io": args.io,
                   "exclusive": args.exclusive, "locks": args.lock or [],
                   "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
                   "agent": args.agent or default_agent(), "label": args.label,
                   "expect": args.expect, "disk": {mount_of(p): n for p, n in args.disk or []}})  # fmt: skip
-    print("ok" if reply["ok"] else f"no: {reply['reason']}")
+    if reply["ok"]:
+        print(f"ok ({reply['cores']:g} cores)" if args.max_cores and reply.get("cores") else "ok")
+    else:
+        print(f"no: {reply['reason']}")
     return 0 if reply["ok"] else 1
 
 
@@ -1526,14 +2632,37 @@ def cmd_status(args: argparse.Namespace) -> int:
         detail = x.get("reason") if state == "waiting" else x.get("overrun_reason") or x.get("backfill_reason")
         why = f" -- {detail}" if detail else ""
         cpu = f"{x['cores']:>4g} cores"
+        if x.get("max_cores"):
+            cpu = f"{x['cores']:>4g} of {x['min_cores']:g}:{x['max_cores']:g} cores"
+            if state == "held" and not x.get("elastic"):
+                flag += (" fixed: scope not resizable" if x.get("resize_kind") == "fixed"
+                         else " fixed at its start size (no systemd scope)")
+            if x.get("shrunk"):
+                flag += f" SHRUNK ({x.get('resize_note', '')})"
+            elif x.get("resize_note") and state == "held":
+                flag += f" ({x['resize_note']})"
+        if x.get("holding_back"):
+            flag += f" HOLDS BACK project {', '.join(x['holding_back'])} (fixed: never shrunk)"
         mem = x.get("claimed_mem", x["mem"])
         if x.get("io"):
             flag += " io"
             cpu = f"{x['cores']:g}-core cap"
             if state == "held":
                 cpu += f", {x['measured_cores']:g} used"
+        if x.get("project"):
+            flag += f" [project {x['project']}]"
         print(f"  {x['id']:<6} {state:<7} {cpu} {human(mem):>6} "
               f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){why}")
+    if len(s.get("projects", [])) > 1 or any(p.get("warning") for p in s.get("projects", [])):
+        print("projects (active; fair share = cores x weight / active weights; "
+              "applies to elastic leases):")
+        for p in s["projects"]:
+            print(f"  {p['name']:<24} weight {p['weight']:g}  share {p['share']:.1f}  "
+                  f"holds {p['held']:g}  waiting {p['waiting']}"
+                  + (f" ({p['waiting_cores']:g} cores)" if p["waiting"] else "")
+                  + (f"  WARNING: {p['warning']}" if p.get("warning") else ""))
+    for error in s.get("config_errors", []):
+        print(f"config: {error}")
     if "busy_cores" in s:
         print(f"cores busy now (measured): {s['busy_cores']:g} of {cap['cores']:g}; "
               "CPU admission uses this; memory admission reserves at least lease sizes")
@@ -1599,6 +2728,12 @@ def cmd_history(args: argparse.Namespace) -> int:
                 times.append(f"{'wait' if key == 'waited' else key} {_minutes(e[key])}")
         if "code" in e:
             times.append(f"exit {e['code']}")
+        if e.get("max_cores"):
+            flag += f" {e['min_cores']:g}:{e['max_cores']:g}"
+        if e.get("project"):
+            flag += f" [project {e['project']}]"
+        if e["event"] == "resized":
+            times.append(f"{e.get('from', 0):g}->{e['cores']:g} cores")
         detail = e.get("reason") or e.get("why") or e.get("backfill_reason") or ""
         print(f"{stamp} {e['event']:<9} {e['id']:<6} {e['cores']:>4g}c {human(e['mem']):>6} "
               f"{e['agent']}: {e['label']}{flag}"
@@ -1665,7 +2800,8 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("run", "hold", "check"):
         sub = subs.add_parser(name)
         sub.add_argument("--io", action="store_true", help="IO-bound job (defaults: 1 core, 512M)")
-        sub.add_argument("--cores", type=float)
+        sub.add_argument("--cores", type=parse_cores)
+        sub.add_argument("--project")
         sub.add_argument("--mem", type=parse_size)
         sub.add_argument("--exclusive", action="store_true")
         sub.add_argument("--exclusive-lock", action="append")
@@ -1682,6 +2818,7 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--pid", type=int, required=True)
         else:
             sub.add_argument("--allow-archive", action="store_true")
+            sub.add_argument("--notify-signal", action="store_true")
             sub.add_argument("command", nargs=argparse.REMAINDER)
     subs.add_parser("status").add_argument("--json", action="store_true")
     history = subs.add_parser("history")
@@ -1708,11 +2845,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.action in ("run", "hold", "check"):
         if not args.io and (args.cores is None or args.mem is None):
             parser.error("--cores and --mem are required without --io")
-        if args.cores is None:
-            args.cores = 1.0
+        args.cores, args.max_cores = args.cores or (1.0, None)
         if args.mem is None:
             args.mem = IO_DEFAULT_MEM
+        if args.max_cores and (args.action == "hold" or args.io or args.exclusive
+                               or args.exclusive_lock or args.headroom):
+            parser.error("--cores MIN:MAX is for ordinary run leases; timing runs (--exclusive, "
+                         "--exclusive-lock, --headroom), --io and hold take a fixed --cores")
     args.agent = args.agent or default_agent()
+    if args.action in ("run", "hold", "check"):
+        cwd = None
+        if args.action == "hold":
+            try:  # the held process's working directory, where readable
+                cwd = os.readlink(f"/proc/{args.pid}/cwd")
+            except OSError:
+                pass
+        # The repository is what fair shares go by; --project names count as
+        # their own project only when listed in the service's config.
+        args.repo = default_project(args.agent, cwd)
+        args.project = args.project or args.repo
     if getattr(args, "exclusive", False) and getattr(args, "exclusive_lock", None):
         parser.error("--exclusive already excludes everything; drop --exclusive-lock")
     if args.action == "serve":
