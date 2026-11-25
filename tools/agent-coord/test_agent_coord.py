@@ -47,9 +47,6 @@ class CoordinatorTest(unittest.TestCase):
             # No real CPU readings: tests that need lease use inject it.
             cpu_seconds=lambda pid: None,
         )
-        # These tests predate the reserve (ElasticTest covers it) and use one
-        # project; without it their full-machine requests keep their meaning.
-        coordinator.config["reserve_cores"] = 0
         return coordinator
 
     def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=(),
@@ -1300,7 +1297,7 @@ class CoordinatorTest(unittest.TestCase):
 
 
 class ElasticTest(unittest.TestCase):
-    """MIN:MAX leases, the reserve, preemption and fair shares (in-process
+    """MIN:MAX leases, preemption and fair shares (in-process
     coordinator with injected clocks, measurements and scope resizing;
     nothing reaches systemd and nothing is signalled)."""
 
@@ -1462,18 +1459,18 @@ class ElasticTest(unittest.TestCase):
         self.assertNotIn("scope", self.lease(fixed))
         self.assertFalse(self.c._ticket(fixed["id"])["elastic"])
 
-    # -- the reserve
+    # -- large timing runs, and the elastic pool beside a timing run
 
-    def test_timing_run_beyond_the_reserve_is_refused_with_how_to_override(self):
+    def test_timing_runs_of_any_size_are_accepted_as_on_main(self):
+        # Review 4, finding 4: no reserve, so a large timing run is admitted
+        # (or waits) exactly as before.
         self.cores = 12.0
-        self.assertEqual(self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)["state"],
-                         "granted")  # 8 + 1 leaves 3
+        self.assertEqual(self.ask(11, project="t", exclusive_locks=["gpu"], headroom=1)["state"],
+                         "granted")
         self.c.state["leases"].clear()
-        refused = self.ask(10, project="t", exclusive_locks=["gpu"], headroom=1)
-        self.assertIn("reserve_cores = 2", refused["error"])
-        self.assertIn("--exclusive", refused["error"])
-        self.assertEqual(self.ask(12, project="t", exclusive=True)["state"], "granted")
-
+        self.c.state["locks"].clear()
+        self.assertEqual(self.ask(12, project="t", exclusive_locks=["gpu"])["state"], "granted")
+        self.assertIn("error", self.ask(12, project="t", headroom=1))  # more than the machine
     def timing_run_start(self, names: bool) -> float:
         """When a timing run waiting behind a 6-core holder starts, with or
         without other projects (or one agent with many --project names)
@@ -1615,7 +1612,6 @@ class ElasticTest(unittest.TestCase):
         self.assertEqual(self.lease(a)["cores"], 2)
 
     def test_fixed_exclusive_and_headroom_leases_are_never_shrunk(self):
-        self.c.config["reserve_cores"] = 0
         fixed = self.ask(3)
         timed = self.ask(2, exclusive_locks=["gpu"], headroom=1)
         elastic = self.ask(1, 4)
@@ -1663,23 +1659,88 @@ class ElasticTest(unittest.TestCase):
         self.advance(128, usage={a["id"]: 2.0})  # busy at its new size: grows on demand
         self.assertEqual(self.lease(a)["cores"], 7)
 
-    def test_without_a_scope_a_range_stays_within_the_reserve(self):
-        self.cores = 12.0
-        a = self.ask(2, 12, project="p", resizable=False)
-        self.assertEqual(self.lease(a)["cores"], 10)  # all of it is fixed: at most 12 - 2
-        self.assertEqual(self.ask(2, project="q")["state"], "granted")
-
-    def test_without_scopes_a_range_is_sized_once_then_fixed(self):
+    def test_without_scopes_a_range_is_granted_at_min_and_fixed(self):
+        # Review 4, finding 5: it could never be shrunk, so it gets MIN only.
         a = self.ask(2, 8, resizable=False)
-        self.assertEqual(self.lease(a)["cores"], 6)  # within the reserve
+        self.assertEqual(self.lease(a)["cores"], 2)
         self.assertNotIn("elastic", self.lease(a))
+        self.c.state["leases"].clear()
+        e = self.ask(2, 12, project="e")
         self.later()
-        self.assertEqual(self.ask(2, project="q")["state"], "granted")
-        self.assertEqual(self.ask(1, project="r")["state"], "waiting")  # a is not shrunk
-        self.assertEqual(self.lease(a)["cores"], 6)
+        f = self.ask(2, 12, project="f", resizable=False)
+        # e gave only f's MIN, not f's fair share: f could never give it back.
+        self.assertEqual((self.lease(f)["cores"], self.lease(e)["cores"]), (2, 6))
 
-    # -- projects
+    def test_backfilled_range_shrinks_others_only_for_its_min(self):
+        # Review 4, finding 6: behind a GPU-lock head, a backfilled 2:8
+        # starts at MIN, so only 2 cores are taken from the elastic lease.
+        self.cores = 12.0
+        a = self.ask(2, 12, project="a")
+        self.advance(64)
+        self.c.handle({"op": "lock", "agent": "owner", "name": "gpu", "reason": "x"})
+        self.ask(1, project="g", locks=["gpu"])
+        b = self.ask(2, 8, project="b")
+        self.assertEqual(self.state_of(b), "granted")
+        self.assertEqual((self.lease(a)["cores"], self.lease(b)["cores"]), (9, 2))
 
+    def test_current_client_without_repo_is_not_a_free_project_name(self):
+        x = self.lease(self.ask(1, project="invented", repo=None))
+        self.assertEqual(self.c._project(x), "default")
+        old = self.lease(self.ask(1, project="named", repo=None, client=None))
+        old.pop("client", None)
+        self.assertEqual(self.c._project(old), "named")  # older clients keep their name
+
+    def test_resize_worker_survives_failures_and_is_restarted(self):
+        # Review 4, finding 3: an exception in a job (a full disk in _save, a
+        # resize call that raises) must not end resizing for good.
+        self.c.resize_async = True
+        calls = []
+
+        def resize(scope, cores):
+            calls.append(cores)
+            if len(calls) == 1:
+                raise OSError("bus gone")
+            return True
+
+        self.c.resize = resize
+        a = self.ask(2, 8, project="p")
+        self.later()
+        b = self.ask(4, project="q")
+        self.assertEqual(self.c._jobs.qsize(), 1)
+        save, failed = self.c._save, []
+
+        def failing_save():
+            if not failed:
+                failed.append(1)
+                raise OSError(28, "No space left on device")
+            save()
+
+        self.c._save = failing_save
+        with patch("sys.stderr", io.StringIO()):
+            self.assertFalse(self.c.ensure_worker())  # nothing to restart yet
+            self.assertTrue(self.c.ensure_worker(start=True))
+            for _ in range(200):
+                if not self.c._jobs.qsize() and not self.c._pending:
+                    break
+                time.sleep(0.01)
+            time.sleep(0.05)
+            self.assertTrue(self.c._worker.is_alive())  # survived the failing call and save
+            self.assertEqual(self.c._pending, {})
+            self.assertEqual(self.lease(a)["resize_failures"], 1)  # counted, retried later
+            self.now += ac.RESIZE_BACKOFF + 1
+            with self.c.lock:
+                self.c._admit()
+            for _ in range(200):
+                if self.state_of(b) == "granted":
+                    break
+                time.sleep(0.01)
+            self.assertEqual((self.state_of(b), self.lease(a)["cores"]), ("granted", 4))
+            dead = threading.Thread(target=lambda: None)
+            dead.start()
+            dead.join()
+            self.c._worker = dead  # as if it had died
+            self.c.tick()
+            self.assertTrue(self.c._worker.is_alive())  # the tick's watchdog restarted it
     def test_two_projects_converge_to_half_each(self):
         a = self.ask(2, 8, project="p")
         self.later()
@@ -1711,7 +1772,7 @@ class ElasticTest(unittest.TestCase):
 
     def test_unequal_weights(self):
         config = Path(self.tmp.name, "config.toml")
-        config.write_text("reserve_cores = 1\n[projects.q]\nweight = 3\n")
+        config.write_text("[projects.q]\nweight = 3\n")
         self.c.config_file = config
         self.c.tick()
         self.assertEqual(self.c._weight("q"), 3)
@@ -1814,7 +1875,6 @@ class ElasticTest(unittest.TestCase):
     def test_a_ramping_lease_is_not_over_subtracted(self):
         # Review 2, finding 8: smoothing starts from 0, like the busy figure.
         self.cores = 12.0
-        self.c.config["reserve_cores"] = 0
         big = self.ask(8, project="big")
         self.advance(120)
         self.check_grants = False
@@ -1828,7 +1888,6 @@ class ElasticTest(unittest.TestCase):
 
     def test_nested_and_smoothed_lease_measurements(self):
         self.cores = 12.0
-        self.c.config["reserve_cores"] = 0
         outer = self.ask(4, project="t", exclusive_locks=["gpu"])
         inner = self.ask(2, project="t", exclusive_locks=["nas"])
         pid_outer, pid_inner = self.lease(outer)["pid"], self.lease(inner)["pid"]
@@ -1841,21 +1900,6 @@ class ElasticTest(unittest.TestCase):
         self.assertAlmostEqual(self.c.handle({"op": "status"})["free"]["cores"], 3.0, places=1)
 
     # -- review 3
-
-    def test_reserve_applies_only_while_another_project_is_active(self):
-        self.cores = 12.0
-        b = self.ask(1, project="b")  # another project is active
-        a = self.ask(10, project="a")
-        self.assertEqual(a["state"], "granted")  # 10 is the cap
-        more = self.ask(1, project="a")
-        self.assertEqual(more["state"], "waiting")
-        self.assertIn("at most 10 cores (reserve_cores = 2)", self.reason(more))
-        self.assertIn("other projects' requests may start meanwhile", self.reason(more))
-        self.assertEqual(self.ask(1, project="b")["state"], "granted")  # passes it
-        self.c.handle({"op": "release", "id": b["id"]})
-        for x in [x for x in self.c.state["leases"] if self.c._project(x) == "b"]:
-            self.c.handle({"op": "release", "id": x["id"]})
-        self.assertEqual(self.state_of(more), "granted")  # alone again: every core
 
     def test_fixed_only_project_alone_runs_as_on_main(self):
         # Review 3, finding 2: three fixed 4-core gates and a 2-core job, each
@@ -1870,61 +1914,6 @@ class ElasticTest(unittest.TestCase):
             self.check_grants = False  # fixed sizes admitted on measured use, as on main
             self.advance(90, usage=usage)
         self.assertEqual([self.state_of(r) for r in jobs], ["granted"] * 4)
-
-    def test_capped_project_over_its_cap_when_another_arrives(self):
-        self.cores = 12.0
-        self.check_grants = False
-        alone = [self.ask(4, project="a", expect=3600) for _ in range(3)]
-        self.advance(90, usage={r["id"]: 3.4 for r in alone})
-        self.assertEqual([self.state_of(r) for r in alone], ["granted"] * 3)
-        b = self.ask(1, 4, project="b")  # 12 - 10.2 used: its MIN fits on measured use
-        self.assertEqual(self.state_of(b), "granted")
-        more = self.ask(1, project="a")  # a's 10.2 measured + 1 > 10
-        self.assertEqual(more["state"], "waiting")  # no new fixed lease of a above the cap
-        self.assertEqual(self.c._why(self.lease(more))[0], "reserve")
-        status = self.c.handle({"op": "status"})
-        self.assertTrue(all(x.get("over_cap") == 10 for x in status["leases"]
-                            if self.c._project(x) == "a"))
-        self.assertEqual([self.state_of(r) for r in alone], ["granted"] * 3)  # nothing shrunk
-
-    def test_a_request_held_by_its_own_project_does_not_block_others(self):
-        # Review 3, finding 1, fixed head.
-        self.cores = 12.0
-        self.ask(1, project="b0")
-        self.ask(9, project="a", expect=3600)
-        own = self.ask(2, project="a")
-        self.assertEqual(own["state"], "waiting")
-        for second in ((2, None), (2, 8)):
-            b = self.ask(*second, project="b")
-            self.assertEqual(self.state_of(b), "granted")
-            self.c.handle({"op": "release", "id": b["id"]})
-
-    def test_a_request_held_by_its_own_project_does_not_block_others_beside_a_timing_run(self):
-        # Review 3, finding 1, timing head: a regression against main otherwise.
-        self.cores = 12.0
-        self.ask(8, project="a", exclusive_locks=["gpu"], headroom=1)
-        self.ask(1, project="c")
-        own = self.ask(2, project="a")
-        self.assertEqual(own["state"], "waiting")  # a's cap: 8 + 1 + 2 > 10
-        b = self.ask(2, project="b")
-        self.assertEqual(b["state"], "granted")  # 8 + 1 + 2 + 1 headroom fits, as on main
-    def test_queued_request_that_became_too_big_is_refused_or_passed(self):
-        # Review 3, finding 1, "too big" variant: reserve_cores changes under
-        # a waiting timing run (new client: refused; old client: passed).
-        self.cores = 12.0
-        self.c.config["reserve_cores"] = 0
-        full = self.ask(12, project="h", exclusive=True)
-        new = self.ask(10, project="t", exclusive_locks=["gpu"], headroom=1)
-        old = self.ask(10, project="u", exclusive_locks=["nas"], headroom=1, client=None)
-        self.c.state["queue"][-1].pop("client", None)
-        b, c = self.ask(2, project="b"), self.ask(4, project="c")
-        self.c.config["reserve_cores"] = 2
-        self.c.handle({"op": "release", "id": full["id"]})
-        refused = self.c.handle({"op": "poll", "id": new["id"]})
-        self.assertIn("reserve_cores = 2", refused["error"])
-        self.assertEqual(self.state_of(old), "waiting")  # an old client is never refused
-        self.assertEqual((self.state_of(b), self.state_of(c)), ("granted", "granted"))
-        self.assertIn("refused", [e.get("why", "")[:7] for e in self.history()])
 
     def test_invented_project_names_share_their_repositorys_entitlement(self):
         # Review 3, finding 4: five --project names from one repository.
@@ -1946,7 +1935,7 @@ class ElasticTest(unittest.TestCase):
         x = self.lease(self.ask(1, project="sub", repo="b"))
         self.assertEqual(self.c._project(x), "sub")
 
-    def test_reserve_holder_beside_a_timing_run_gives_back_and_is_named(self):
+    def test_elastic_holder_beside_a_timing_run_gives_back_and_is_named(self):
         # Review 3, finding 5 (scenario g).
         self.cores = 12.0
         self.ask(8, project="t", exclusive_locks=["gpu"], headroom=1)
@@ -1973,7 +1962,6 @@ class ElasticTest(unittest.TestCase):
         status = self.c.handle({"op": "status"})
         lease, = [x for x in status["leases"] if x["id"] == hog["id"]]
         self.assertEqual(lease["holding_back"], ["b"])
-        self.assertEqual(lease["over_cap"], 10)
         hint, = self.c.handle({"op": "inbox", "agent": "hog"})["messages"]
         self.assertIn("--cores MIN:MAX", hint["text"])
 
@@ -1981,19 +1969,10 @@ class ElasticTest(unittest.TestCase):
         self.cores = 12.0
         self.ask(8, project="a", agent="timer", exclusive_locks=["gpu"], headroom=1)
         self.ask(2, project="a", agent="other")
-        self.assertEqual(self.ask(4, project="b")["state"], "waiting")
+        self.assertEqual(self.ask(4, 6, project="b")["state"], "waiting")
         self.assertTrue([e for e in self.history() if e["event"] == "unfair"])
         self.assertFalse(self.c.handle({"op": "inbox", "agent": "timer"})["messages"])
         self.assertIn("MIN:MAX", self.c.handle({"op": "inbox", "agent": "other"})["messages"][0]["text"])
-
-    def test_timing_run_beyond_the_reserve_is_refused_plain_fixed_is_not(self):
-        self.cores = 12.0
-        refused = self.ask(10, project="t", exclusive_locks=["gpu"], headroom=1)
-        self.assertIn("reserve_cores = 2", refused["error"])
-        self.assertIn("--exclusive", refused["error"])
-        self.assertEqual(self.ask(11, project="t")["state"], "granted")  # alone: as on main
-        self.c.state["leases"].clear()
-        self.assertEqual(self.ask(12, project="t", exclusive=True)["state"], "granted")
 
     def test_resize_failures_are_retried_before_a_lease_is_fixed(self):
         # Review 3, finding 3.
@@ -2088,11 +2067,12 @@ class ElasticTest(unittest.TestCase):
     # -- configuration
 
     def test_config_defaults_and_every_bad_value(self):
-        self.assertEqual(ac.load_config(None)["reserve_cores"], 2)
+        self.assertEqual(ac.load_config(None)["resize_interval"], 60)
         cases = {
             "default_weight = 0\n": "default_weight", "idle_target_use = 0\n": "idle_target_use",
             "projects = 3\n": "projects must be a table", "idle_fraction = 2\n": "idle_fraction",
-            "reserve_cores = 100\n": "reserve_cores", 'grow_demand = "x"\n': "grow_demand",
+            "resize_interval = 1e9\n": "resize_interval", 'grow_demand = "x"\n': "grow_demand",
+            "reserve_cores = 2\n": "unknown setting",
             "[projects.x]\nweight = 0\n": "projects.x", "[projects]\nx = 3\n": "projects.x",
             "nonsense = 1\n": "unknown setting", "this is not toml": "using defaults",
             "floor_cores = 2\n": "unknown setting",
@@ -2143,7 +2123,7 @@ class ElasticTest(unittest.TestCase):
         self.assertIn("4 of 2:8 cores", text)
         self.assertIn("SHRUNK (preempted by", text)
         self.assertIn("[project p]", text)
-        self.assertRegex(text, r"q +weight 1 +share 4.0 +holds 4 \(4 fixed\)")
+        self.assertRegex(text, r"q +weight 1 +share 4.0 +holds 4 +waiting 0")
         out = io.StringIO()
         with patch.object(ac, "HISTORY_FILE", Path(self.tmp.name, "history.jsonl")), \
                 patch("sys.stdout", out):
@@ -2309,7 +2289,7 @@ class RealScopeTest(unittest.TestCase):
 
 class OrdinaryWorkloadInvariantTest(unittest.TestCase):
     """Fixed-only workloads from one project (no --exclusive-lock, no
-    MIN:MAX, one project, so the reserve never applies) are admitted as
+    MIN:MAX, one project) are admitted as
     before this change: on random sequences, every term it adds is zero at
     every step. Replaces comparing with main's code through git, which
     stops meaning anything once merged."""
@@ -2333,13 +2313,29 @@ class OrdinaryWorkloadInvariantTest(unittest.TestCase):
                 for step in range(40):
                     op = rng.random()
                     if op < 0.45:
-                        c.handle({"op": "acquire", "agent": f"a{rng.randrange(3)}",
-                                  "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6, 11]),
-                                  "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
-                                  "expect": rng.choice([60, 600, 3600]),
-                                  "headroom": rng.choice([0, 0, 0, 1, 2]),
-                                  "locks": rng.choice([[], [], ["nas"]]),
-                                  "io": rng.random() < 0.1, "running": rng.random() < 0.1})
+                        req = {"op": "acquire", "agent": f"a{rng.randrange(3)}",
+                               "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6, 11, 12]),
+                               "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
+                               "expect": rng.choice([60, 600, 3600]),
+                               "headroom": rng.choice([0, 0, 0, 1, 2]),
+                               "locks": rng.choice([[], [], ["nas"]]),
+                               "exclusive_locks": rng.choice([[], [], [], ["gpu"]]),
+                               "io": rng.random() < 0.1, "running": rng.random() < 0.1}
+                        reply = c.handle(dict(req))
+                        # The reply main gives: refused only when bigger than
+                        # the machine, else granted at its size or waiting with
+                        # main's reasons.
+                        claim = 1 if req["io"] else req["cores"]
+                        too_big = max(req["cores"], claim + req["headroom"]) > 12
+                        self.assertEqual("error" in reply, too_big and not req["running"],
+                                         (seed, step, reply))
+                        if "error" not in reply:
+                            self.assertIn(reply["state"], ("granted", "waiting"))
+                            if reply["state"] == "granted":
+                                self.assertEqual(reply["cores"], req["cores"])
+                            else:
+                                for new in ("fair share", "never shrunk", "reserve", "elastic"):
+                                    self.assertNotIn(new, reply["reason"], (seed, step))
                     elif op < 0.65:
                         ids = [x["id"] for x in c.state["leases"] + c.state["queue"]]
                         if ids:
@@ -2353,15 +2349,16 @@ class OrdinaryWorkloadInvariantTest(unittest.TestCase):
                         env["busy"] = rng.uniform(0, 12)
                         c.tick()
                     where = f"seed {seed} step {step}"
-                    self.assertEqual(c._counted_once(), set(), where)
-                    self.assertEqual(c._net_busy(), max(0.0, c.busy), where)
+                    once = c._counted_once()
+                    self.assertTrue(all(x.get("exclusive_locks") for x in c.state["leases"]
+                                        if x["id"] in once), where)
+                    if not once:
+                        self.assertEqual(c._net_busy(), max(0.0, c.busy), where)
                     claims = sum(c._cpu_claim(x) for x in c.state["leases"])
-                    self.assertEqual(c._unleased(), max(0.0, c.busy - claims), where)
-                    self.assertEqual(c._eps(), 0.0, where)
+                    self.assertEqual(c._unleased(), max(0.0, c.busy - claims), where)  # PR 11's
+                    if not once:
+                        self.assertEqual(c._eps(), 0.0, where)
                     self.assertLessEqual(len(c._projects()), 1, where)
-                    for x in c.state["queue"]:
-                        self.assertIsNone(c._reserve_short(x), where)
-                        self.assertNotEqual((c._why(x) or ("",))[0], "reserve", where)
                     self.assertEqual(resized, [], where)
                     self.assertFalse([e for e in ac.read_history(0, Path(tmp, "history.jsonl"))
                                       if e["event"] in ("resized", "unfair")], where)

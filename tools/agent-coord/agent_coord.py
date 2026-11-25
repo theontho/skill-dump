@@ -90,9 +90,6 @@ CONFIG_FILE = Path(
     / "agent-coord" / "config.toml"
 )
 DEFAULT_CONFIG = {
-    # Cores no single project's fixed and exclusive leases (with headroom),
-    # IO use and elastic MINs may take: kept for the other projects together.
-    "reserve_cores": 2.0,
     # Weight of a project not named under [projects.NAME].
     "default_weight": 1.0,
     # Least time between two changes of one lease's size (preemption excepted).
@@ -123,9 +120,8 @@ RESIZE_BACKOFF, RESIZE_ATTEMPTS = 30.0, 3
 # A lease is resized only once its client reported its scope exists, or this
 # long after its grant if the client never does.
 SCOPE_READY_AFTER = 60.0
-# The client protocol version new clients send; requests without it come from
-# older clients, which are never refused while waiting (that would end a job
-# another agent is waiting to run).
+# The client protocol version new clients send (they also send the project
+# they derived, "repo"); requests without it come from older clients.
 CLIENT_VERSION = 2
 
 HELP = """\
@@ -216,19 +212,16 @@ MESSAGES
                                            with wait/run times; default last 24h.
 
 PROJECTS
-  Use MIN:MAX for everything except timing runs. Elastic jobs share the
-  machine fairly between active projects (the git repository; a --project
-  name counts separately only if configured; fair share = cores x weight /
-  active weights, weight 1 by default) and can use every core when others are
-  idle: a waiting request shrinks other projects' elastic leases (never below
-  MIN) as far as its project's fair share. Fixed and exclusive jobs are never
-  shrunk. A project alone runs fixed jobs as before; while another project is
-  active, one project's fixed jobs, timing runs with headroom, IO use and MINs
-  are capped at all cores minus reserve_cores (2), counted at measured use like
-  admission; a timing run asking more is refused. A project that runs only
-  fixed jobs gets no fair-share protection. The line stays first come, first
-  served; a request waiting for its own project's cap does not hold others.
-  Optional ~/.config/agent-coord/config.toml: reserve_cores, resize timings,
+  Use MIN:MAX for everything except timing runs. Fairness between projects
+  applies to elastic (MIN:MAX) leases: a waiting request shrinks other
+  projects' elastic leases (never below MIN) as far as its project's fair
+  share (cores x weight / active projects' weights, weight 1 by default), and
+  elastic leases even out toward those shares. A project is the git
+  repository (a --project name counts separately only if configured); the
+  client says which, nothing enforces it (cooperating agents). Fixed and
+  timing leases are never shrunk, so a project that holds the machine with
+  fixed jobs keeps it until they end. The line stays first come, first
+  served. Optional ~/.config/agent-coord/config.toml: resize timings,
   [projects.NAME] weight = 2 (bad values are ignored and shown in status).
 
 Lease anything using more than 2 cores or 2 GB for more than a few minutes.
@@ -424,7 +417,6 @@ def measure_vms(sample: float = 1.0) -> list[dict]:
 
 # Allowed range (low, high, low exclusive?) of each setting.
 CONFIG_RANGES = {
-    "reserve_cores": (0.0, 64.0, False),
     "default_weight": (0.0, 1000.0, True),
     "resize_interval": (0.0, 3600.0, False),
     "idle_fraction": (0.0, 1.0, False),
@@ -558,6 +550,7 @@ class Coordinator:
         self.resize_async = resize_async
         self._pending: dict[str, tuple[float, str, str]] = {}  # id -> (cores, kind, note)
         self._jobs: "queue.Queue[tuple[str, str, float]]" = queue.Queue()
+        self._worker: threading.Thread | None = None
         self._low_since: dict[tuple[str, str], float] = {}
         self.state_file = state_file
         self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
@@ -833,23 +826,12 @@ class Coordinator:
         if (max(req["cores"], self._cpu_claim(req) + req.get("headroom", 0)) > cores
                 or req["mem"] > mem):
             return f"more than this computer has ({cores:g} cores, {human(mem)})"
-        limit = cores - self._reserve()
-        # A timing run or a MIN this big could never start beside another
-        # project; a plain fixed request may (while its project is alone).
-        never = self._timing(req) or (req.get("max_cores") and req.get("elastic", True))
-        if (never and not req["exclusive"] and self._reserve() > 0
-                and self._fixed_part(req) > limit + 1e-9):
-            return (f"{self._fixed_part(req):g} cores that cannot be shrunk (a timing run's size "
-                    f"plus headroom, or a MIN); one project may hold at most {limit:g} of "
-                    f"{cores:g} while others are active (reserve_cores = {self._reserve():g}). "
-                    "Ask --cores MIN:MAX, use --exclusive for a whole-machine run, or lower "
-                    "reserve_cores in the config")
         return None
 
     def _why(self, req: dict) -> tuple[str, str] | None:
         """(kind, reason) req can't start now, ignoring the line, or None.
-        kind is a stable category (exclusive, lock:NAME, disk, reserve,
-        cores, mem, available, headroom, too-big) for the history."""
+        kind is a stable category (exclusive, lock:NAME, disk, cores, mem,
+        available, headroom, too-big) for the history."""
         leases = self.state["leases"]
         holder = next((x for x in leases if x["exclusive"]), None)
         if holder:
@@ -866,8 +848,6 @@ class Coordinator:
                                 f"reservations and a {human(DISK_MARGIN)} margin")  # fmt: skip
         if too_big := self._too_big(req):
             return "too-big", too_big
-        if short := self._reserve_short(req):
-            return "reserve", short
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
         req_cores = self._cpu_claim(req)
@@ -896,7 +876,7 @@ class Coordinator:
                                     + self._fixed_hint(req))  # fmt: skip
         return None
 
-    # -- projects, fair shares and the reserve
+    # -- projects and fair shares
 
     def _project(self, x: dict) -> str:
         """The project x counts under: the repository its client derived
@@ -905,6 +885,8 @@ class Coordinator:
         repo and count under the name they give, else "default"."""
         name = x.get("project") or "default"
         repo = x.get("repo")
+        if not repo and x.get("client", 0) >= CLIENT_VERSION:
+            repo = "default"  # a current client that did not say: not a free name
         if repo and name != repo and name not in self.config["projects"]:
             return repo
         return name
@@ -915,15 +897,14 @@ class Coordinator:
 
     def _projects(self) -> dict[str, dict]:
         """Active projects (a running or waiting lease): what each holds
-        (CPU claims: grants, fixed sizes, measured use for IO), its
-        non-preemptible cores (see _fixed_part) and its waiting requests."""
+        (CPU claims: grants, fixed sizes, measured use for IO) and its waiting
+        requests."""
         projects: dict[str, dict] = {}
         for x in self.state["leases"]:
-            entry = projects.setdefault(self._project(x), {"held": 0.0, "fixed": 0.0, "waiting": []})
+            entry = projects.setdefault(self._project(x), {"held": 0.0, "waiting": []})
             entry["held"] += self._cpu_claim(x)
-            entry["fixed"] += self._fixed_part(x)
         for x in self.state["queue"]:
-            projects.setdefault(self._project(x), {"held": 0.0, "fixed": 0.0, "waiting": []})[
+            projects.setdefault(self._project(x), {"held": 0.0, "waiting": []})[
                 "waiting"].append(x)
         return projects
 
@@ -934,60 +915,23 @@ class Coordinator:
         total = sum(self._weight(p) for p in projects) or 1.0
         return {p: cores * self._weight(p) / total for p in projects}
 
-    def _reserve(self) -> float:
-        """reserve_cores, but never more than half the machine."""
-        return min(self.config["reserve_cores"], self.capacity()[0] / 2)
-
     def _timing(self, x: dict) -> bool:
         return bool(x.get("exclusive_locks") or x.get("headroom") or x.get("exclusive"))
 
-    def _fixed_part(self, x: dict) -> float:
-        """The cores of x that cannot be taken back: an elastic lease's MIN;
-        a timing run's size plus its headroom; an IO lease's measured use;
-        an ordinary fixed lease's size while it warms up, then its measured
-        use (as admission counts it), at most its size. A MIN:MAX lease that
-        cannot be resized counts as fixed."""
-        if x.get("io"):
-            return self._cpu_claim(x)
-        if x.get("elastic") and x.get("min_cores") is not None:
-            return x["min_cores"]
-        if self._timing(x):
-            return x["cores"] + x.get("headroom", 0)
-        own = self._own_cores.get(x["id"]) if "granted" in x else None
-        if own is not None and x["id"] not in {y["id"] for y in self._warming()}:
-            return min(x["cores"], own)
-        return x["cores"]
-
-    def _others_active(self, mine: str) -> bool:
-        return any(self._project(x) != mine for x in self.state["leases"] + self.state["queue"])
-
-    def _reserve_short(self, req: dict) -> str | None:
-        """The reserve rule: the non-preemptible cores of one project may
-        never exceed the machine's cores less reserve_cores, so the other
-        projects together always have that many to start in (from free
-        cores, or by shrinking elastic leases). Whole-machine --exclusive is
-        the one exception."""
-        if req["exclusive"] or self._reserve() <= 0:
-            return None  # reserve_cores = 0 turns the rule off
-        mine = self._project(req)
-        if not self._others_active(mine):
-            return None  # alone on the machine: every core, as before
-        cores, _ = self.capacity()
-        limit = cores - self._reserve()
-        held = sum(self._fixed_part(x) for x in self.state["leases"] if self._project(x) == mine)
-        if held + self._fixed_part(req) <= limit + 1e-9:
-            return None
-        return (f"while other projects are active, project {mine}'s fixed and timing leases "
-                f"and MINs may hold at most {limit:g} cores (reserve_cores = {self._reserve():g}); "
-                f"this would make {held + self._fixed_part(req):.1f}: it waits for its own "
-                "project's leases (other projects' requests may start meanwhile); "
-                "--cores MIN:MAX above MIN is not limited")
+    def _elastic_involved(self, req: dict | None = None) -> bool:
+        """Whether any MIN:MAX lease or request is around: fairness between
+        projects (hints, unfair notes, preemption) is about elastic leases;
+        without any, every decision and reply is as before this change."""
+        return bool((req and req.get("max_cores"))
+                    or any(x.get("max_cores") for x in self.state["leases"] + self.state["queue"]))
 
     def _fixed_hint(self, req: dict) -> str:
         """For a CPU wait of a project below its fair share: what holds the
         cores (other projects' leases, fixed ones never shrunk, elastic ones
         with what they could still give), or that a fixed request is bigger
         than what elastic leases are shrunk to give it."""
+        if not self._elastic_involved(req):
+            return ""
         projects = self._projects()
         mine = self._project(req)
         shares = self._shares(projects)
@@ -1091,9 +1035,32 @@ class Coordinator:
 
     def resize_worker(self) -> None:
         """Run queued resize calls outside the lock, one at a time, and
-        apply each result under it."""
+        apply each result under it. Survives any failure of one job: logs
+        it, and drops that job's pending entry, so the lease is free to be
+        resized (or fixed) again."""
         while True:
-            self.resize_job(self._jobs.get())
+            job = self._jobs.get()
+            try:
+                self.resize_job(job)
+            except Exception as e:  # noqa: BLE001 - keep resizing the others
+                print(f"agent-coord: resize job {job[0]} failed: {e!r}", file=sys.stderr, flush=True)
+            finally:
+                self._pending.pop(job[0], None)
+
+    def ensure_worker(self, start: bool = False) -> bool:
+        """Start the resize worker (start=True, from serve), or restart it if
+        it was started and has stopped (a watchdog, from every tick; an
+        in-process user that runs resize_job itself never gets one).
+        Returns whether a thread was started."""
+        if not self.resize_async or (self._worker is not None and self._worker.is_alive()):
+            return False
+        if self._worker is None and not start:
+            return False
+        if self._worker is not None:
+            print("agent-coord: resize worker had stopped; restarted", file=sys.stderr, flush=True)
+        self._worker = threading.Thread(target=self.resize_worker, daemon=True)
+        self._worker.start()
+        return True
 
     def resize_job(self, job: tuple[str, str, float]) -> None:
         """One queued resize: the systemctl call without the lock, then its
@@ -1105,15 +1072,17 @@ class Coordinator:
             ok = False
         with self.lock:
             pending = self._pending.pop(lease_id, None)
-            x = next((y for y in self.state["leases"] if y["id"] == lease_id), None)
-            if x is not None and pending is not None and x.get("scope") == scope:
-                target, kind, note = pending
-                if kind == "undo" and not ok:  # a growth, counted already: take it back
-                    self._apply(x, target, "retry", "growth could not be applied")
-                self._resized(x, target, kind, note, ok)
-            self._prune()
-            self._admit()
-            self._save()
+            try:
+                x = next((y for y in self.state["leases"] if y["id"] == lease_id), None)
+                if x is not None and pending is not None and x.get("scope") == scope:
+                    target, kind, note = pending
+                    if kind == "undo" and not ok:  # a growth, counted already: take it back
+                        self._apply(x, target, "retry", "growth could not be applied")
+                    self._resized(x, target, kind, note, ok)
+                self._prune()
+                self._admit()
+            finally:
+                self._save()
 
     def _settled(self, x: dict, now: float) -> bool:
         return now - x.get("resized_at", x.get("granted", now)) >= self.config["resize_interval"]
@@ -1144,16 +1113,17 @@ class Coordinator:
 
     def _entitled(self, req: dict, projects: dict[str, dict]) -> float:
         """What req's project may reach by shrinking other projects' elastic
-        leases: its fair share, and at least the reserve."""
+        leases: its fair share."""
         mine = self._project(req)
-        projects.setdefault(mine, {"held": 0.0, "fixed": 0.0, "waiting": [req]})
-        return max(self._shares(projects)[mine], self._reserve())
+        projects.setdefault(mine, {"held": 0.0, "waiting": [req]})
+        return self._shares(projects)[mine]
 
     def _target(self, req: dict) -> float:
         """The size a request aims for: a fixed size; a MIN:MAX request as
-        much as its project's entitlement leaves (at least MIN, at most MAX)."""
+        much as its project's entitlement leaves (at least MIN, at most MAX);
+        MIN when it starts by backfill (at MIN) or cannot be resized."""
         low, high = req["cores"], req.get("max_cores")
-        if not high or high <= low:
+        if not high or high <= low or not req.get("elastic") or req.get("_at_min"):
             return low
         projects = self._projects()
         room = self._entitled(req, projects) - projects[self._project(req)]["held"]
@@ -1164,8 +1134,8 @@ class Coordinator:
         (MAX within its project's entitlement) as are neither granted nor
         needed by requests waiting for CPU behind it; at least MIN."""
         low, high = req["cores"], req.get("max_cores")
-        if not high or high <= low:
-            return low
+        if not high or high <= low or not req.get("elastic"):
+            return low  # without a scope it could never be shrunk: MIN, fixed
         waiting = 0.0
         for x in self.state["queue"]:
             why = None if x is req else self._why(x)
@@ -1184,7 +1154,7 @@ class Coordinator:
         fits now.
 
         - Other projects' elastic leases give only while req's project would
-          stay within its entitlement (fair share, at least the reserve):
+          stay within its entitlement (its fair share):
           asking for a big fixed size never gets a project more than asking
           MIN:MAX. The project furthest over its share gives first, then the
           lease with the largest surplus over its MIN, a core at a time.
@@ -1294,7 +1264,7 @@ class Coordinator:
         project below its fair share; tell the holders of ordinary fixed
         leases (not timing runs, which must be fixed) to ask for MIN:MAX."""
         mine = self._project(req)
-        if req.get("unfair_told") or mine not in projects or (
+        if not self._elastic_involved(req) or req.get("unfair_told") or mine not in projects or (
                 projects[mine]["held"] >= shares[mine] - 1e-9):
             return False
         fixed = self._holding_back(mine, projects, shares)
@@ -1467,26 +1437,10 @@ class Coordinator:
             self._footprints[pid] = self.footprint(pid)
         return self._footprints[pid]
 
-    def _refuse_too_big(self) -> bool:
-        """Refuse queued requests that can never start (the machine, or the
-        reserve for a timing run, changed under them: a config reload). Only
-        from clients that understand a refusal; older clients' requests keep
-        waiting and the line passes them."""
-        changed = False
-        for x in list(self.state["queue"]):
-            if x.get("client", 0) >= CLIENT_VERSION and (reason := self._too_big(x)):
-                self.state["queue"].remove(x)
-                self.state.setdefault("refused", {})[x["id"]] = f"asks for {reason}"
-                for old in list(self.state["refused"])[:-100]:
-                    del self.state["refused"][old]
-                self._log_end(x, False, why="refused: too big")
-                changed = True
-        return changed
-
     def _admit_pass(self) -> bool:
         """Start requests in order, backfilling around a blocked head without
         postponing its projected start (exclusive windows keep their rules)."""
-        changed = self._refuse_too_big()
+        changed = False
         while self.state["queue"]:
             head = self.state["queue"][0]
             if "head_since" not in head:
@@ -1545,7 +1499,8 @@ class Coordinator:
         (its fair share, up to MAX), shrink other projects' elastic leases
         for it as a waiting request would. So asking MIN:MAX never gets a
         project less than asking a fixed size."""
-        if not req.get("max_cores") or self._grant_size(req) >= self._target(req):
+        if (not req.get("max_cores") or not req.get("elastic")
+                or self._grant_size(req) >= self._target(req)):
             return False
         before = {x["id"]: x["cores"] for x in self.state["leases"]}
         self._preempt(req)
@@ -1729,11 +1684,15 @@ class Coordinator:
             req.pop("backfill_reason", None)
             req.pop("backfill_head", None)
             why = self._why(req)
-            if why and why[0] in CPU_WAIT_KINDS and self._preempt(
-                    req, allowed=lambda req=req: self._may_pass(req)):
-                why = None  # elastic leases were shrunk for it (not only for the head)
+            # A backfilled request starts at its MIN: shrink others only for that.
+            req["_at_min"] = True
+            try:
+                if why and why[0] in CPU_WAIT_KINDS and self._preempt(
+                        req, allowed=lambda req=req: self._may_pass(req)):
+                    why = None  # elastic leases were shrunk for it (not only for the head)
+            finally:
+                req.pop("_at_min", None)
             if not why and self._may_pass(req):
-                self._top_up(req)
                 self.state["queue"].remove(req)
                 self._grant(req)
                 started = True
@@ -1768,10 +1727,7 @@ class Coordinator:
         - A stuck request (see _stuck) doesn't count as being ahead: no lease
           ending would let it start, so the line behind it moves on, in order.
           It takes its turn again as soon as it would fit.
-        - Nor does a request that waits only for its own project (the reserve:
-          its project's fixed cores while others are active) or that can never
-          fit (too big, from an older client): holding others back gains it
-          nothing, and others pass it by the ordinary rules."""
+"""
         queue = self.state["queue"]
         ahead = queue[: queue.index(req)] if req in queue else queue
         if not ahead:
@@ -1783,14 +1739,6 @@ class Coordinator:
 
         if req["exclusive"]:
             return hold("exclusive requests never overtake")
-
-        def own_wait(x):
-            why = self._why(x)
-            return why is not None and why[0] in ("reserve", "too-big")
-
-        ahead = [x for x in ahead if x["exclusive"] or not own_wait(x)]
-        if not ahead:
-            return True
         for x in ahead:
             if not self._stuck(x) and set(req.get("locks", ())) & set(x.get("locks", ())):
                 return hold(f"lock order behind {x.get('id', 'queued request')}")
@@ -1914,6 +1862,7 @@ class Coordinator:
             # Smoothed over ~10 s: a moment's burst shouldn't hold the line.
             self.busy += BUSY_SMOOTHING * (sample["busy"] - self.busy)
             self._reload_config()
+            self.ensure_worker()
             changed = self._prune()
             changed |= self._hint_io(now)
             changed |= self._admit()
@@ -2033,8 +1982,6 @@ class Coordinator:
         return {"id": lease["id"], **self._ticket(lease["id"])}
 
     def _ticket(self, lease_id: str) -> dict:
-        if lease_id in self.state.get("refused", {}):
-            return {"error": self.state["refused"][lease_id]}
         for x in self.state["leases"]:
             if x["id"] == lease_id:
                 return {"state": "granted", "cores": x["cores"],
@@ -2160,12 +2107,12 @@ class Coordinator:
         holding_back: dict[str, list[str]] = {}
         for name, entry in sorted(projects.items()):
             row = {"name": name, "weight": self._weight(name), "share": round(shares[name], 2),
-                   "held": round(entry["held"], 2), "fixed": round(entry["fixed"], 2),
+                   "held": round(entry["held"], 2),
                    "waiting": len(entry["waiting"]),
                    "waiting_cores": sum(x["cores"] for x in entry["waiting"])}
             cpu_wait = [x for x in entry["waiting"]
                         if (why := self._why(x)) is not None and why[0] in CPU_WAIT_KINDS]
-            if cpu_wait and entry["held"] < shares[name] - 1e-9:
+            if cpu_wait and entry["held"] < shares[name] - 1e-9 and self._elastic_involved():
                 fixed = self._holding_back(name, projects, shares)
                 if fixed:
                     row["warning"] = (f"below its fair share while fixed leases "
@@ -2175,15 +2122,8 @@ class Coordinator:
                         holding_back.setdefault(x["id"], []).append(name)
             project_rows.append(row)
 
-        limit = cores - self._reserve()
-
         def lease_row(x):
             row = {**x, "project": self._project(x)}
-            mine = self._project(x)
-            if (self._reserve() > 0 and self._others_active(mine)
-                    and projects[mine]["fixed"] > limit + 1e-9 and not x.get("elastic")
-                    and not x.get("io")):
-                row["over_cap"] = limit
             if x["id"] in holding_back:
                 row["holding_back"] = holding_back[x["id"]]
             if x.get("io"):
@@ -2213,7 +2153,6 @@ class Coordinator:
             "busy_cores": round(self.busy, 1),
             "available": self.available,
             "config_errors": self.config.get("errors", []),
-            "reserve": self._reserve(),
         }
 
 
@@ -2225,8 +2164,7 @@ def serve(
     coordinator_args.setdefault("resize", resize_scope)
     coordinator_args.setdefault("resize_async", True)
     coordinator = Coordinator(state_file, **coordinator_args)
-    if coordinator.resize_async:
-        threading.Thread(target=coordinator.resize_worker, daemon=True).start()
+    coordinator.ensure_worker(start=True)
     sweep_lease_files(socket_path.parent / "leases")
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     socket_path.unlink(missing_ok=True)
@@ -2688,9 +2626,6 @@ def cmd_status(args: argparse.Namespace) -> int:
                 flag += f" SHRUNK ({x.get('resize_note', '')})"
             elif x.get("resize_note") and state == "held":
                 flag += f" ({x['resize_note']})"
-        if x.get("over_cap") is not None:
-            flag += (f" (its project's fixed cores exceed {x['over_cap']:g} while others are "
-                     "active: no new fixed lease of it starts until they are back under)")
         if x.get("holding_back"):
             flag += f" HOLDS BACK project {', '.join(x['holding_back'])} (fixed: never shrunk)"
         mem = x.get("claimed_mem", x["mem"])
@@ -2704,11 +2639,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  {x['id']:<6} {state:<7} {cpu} {human(mem):>6} "
               f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){why}")
     if len(s.get("projects", [])) > 1 or any(p.get("warning") for p in s.get("projects", [])):
-        print("projects (active; fair share = cores x weight / active weights; one project's "
-              f"fixed cores stay {s.get('reserve', 0):g} below all):")
+        print("projects (active; fair share = cores x weight / active weights; "
+              "applies to elastic leases):")
         for p in s["projects"]:
             print(f"  {p['name']:<24} weight {p['weight']:g}  share {p['share']:.1f}  "
-                  f"holds {p['held']:g} ({p['fixed']:g} fixed)  waiting {p['waiting']}"
+                  f"holds {p['held']:g}  waiting {p['waiting']}"
                   + (f" ({p['waiting_cores']:g} cores)" if p["waiting"] else "")
                   + (f"  WARNING: {p['warning']}" if p.get("warning") else ""))
     for error in s.get("config_errors", []):
