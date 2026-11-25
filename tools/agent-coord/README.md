@@ -62,6 +62,10 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   themselves.
 - **CPU is admitted on measured use**: host-wide busy cores (smoothed over ~10 s),
   plus each non-IO lease started in the last minute at its full size while it ramps up.
+  Leases counted at full size (warming up, or `--exclusive-lock`) count once:
+  their own measured use (smoothed like the busy figure, from zero, and counted
+  once when one lease runs inside another's process tree) is taken out of the
+  busy cores, so only the rest of the load counts beside them.
   Leases usually use less than they ask, and sharing CPU only slows jobs a
   little, since each is capped at its size at nice 19. CPU should therefore stay
   busy, not idle behind reservations. Time spent waiting on disk is not CPU use.
@@ -192,3 +196,7 @@ systemctl --user status agent-coord
 journalctl --user -u agent-coord
 python3 -m unittest -v test_agent_coord     # in tools/agent-coord
 ```
+
+For a private trial instance, point `AGENT_COORD_RUNTIME_DIR` and
+`AGENT_COORD_STATE_DIR` at a temporary directory (its socket, state and history),
+for both `serve` and the client commands.

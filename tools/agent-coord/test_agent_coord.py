@@ -39,6 +39,9 @@ class CoordinatorTest(unittest.TestCase):
             measure=lambda: {"vms": list(self.vms), "busy": self.busy,
                              "available": self.available},
             cap=lambda: (8.0, 16 * GIB),
+            # No real CPU readings (the test process's own CPU time would leak
+            # into admission): tests that need lease use inject it.
+            cpu_seconds=lambda pid: None,
         )
 
     def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=(),
@@ -768,18 +771,27 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(3, agent="c")["state"], "granted")
         self.assertEqual(self.ask(1, agent="d")["state"], "waiting")  # c warms up
 
-    def measure_leases(self, usage, busy=None):
-        """Two ticks with each lease pid using usage[pid] cores (no real pids
-        are signalled: cpu_seconds is looked up in a dict)."""
+    def measure_leases(self, usage, busy=None, trees=None):
+        """Tick until the smoothed measurements settle, with each lease pid
+        using usage[pid] cores and the host busy (default: their sum). No
+        process is signalled: CPU time and trees are looked up in dicts."""
         cpu = {pid: 0.0 for pid in usage}
         self.c.cpu_seconds = cpu.get
+        self.c.tree_pids = lambda pid: (trees or {}).get(pid, {pid})
         self.busy = self.c.busy = sum(usage.values()) if busy is None else busy
         with patch.object(ac.time, "monotonic", return_value=1000) as clock:
             self.c.tick()
-            clock.return_value += 4
-            for pid, cores in usage.items():
-                cpu[pid] += cores * 4
-            self.c.tick()
+            for _ in range(80):
+                clock.return_value += 4
+                for pid, cores in usage.items():
+                    cpu[pid] += cores * 4
+                self.c.tick()
+
+    def free_cores(self):
+        return self.c.handle({"op": "status"})["free"]["cores"]
+
+    def fits(self, cores):
+        return self.c.handle({"op": "check", "cores": cores, "mem": GIB})["ok"]
 
     def test_exclusive_lock_lease_is_not_counted_twice(self):
         # The stall: an 8-core GPU timing run (headroom 1) measured at 8.5 of
@@ -789,19 +801,77 @@ class CoordinatorTest(unittest.TestCase):
         timed = self.ask(8, agent="perf", exclusive_locks=["gpu"], headroom=1)
         self.age(timed, ac.WARMUP + 1, "granted")
         self.measure_leases({os.getpid(): 8.5})
-        status = self.c.handle({"op": "status"})
-        self.assertAlmostEqual(status["free"]["cores"], 4.0, places=1)
-        self.assertFalse(self.c.handle({"op": "check", "cores": 4, "mem": GIB})["ok"])
-        self.assertTrue(self.c.handle({"op": "check", "cores": 3, "mem": GIB})["ok"])
+        self.assertAlmostEqual(self.free_cores(), 4.0, places=1)  # 12 - 8, not -4.5
+        # Headroom keeps 1 more core: about 3 cores admissible.
+        self.assertTrue(self.fits(2.5))
+        self.assertFalse(self.fits(4))
         waiting = self.ask(4, agent="cpu4")
         self.assertEqual(waiting["state"], "waiting")
         self.release(waiting)
-        self.assertEqual(self.ask(3, agent="cpu3")["state"], "granted")
-        # Load beside it still counts: 2 more cores busy elsewhere.
-        self.release(self.c.state["leases"][-1])
-        self.measure_leases({os.getpid(): 8.5}, busy=10.5)
-        self.assertFalse(self.c.handle({"op": "check", "cores": 2, "mem": GIB})["ok"])
-        self.assertTrue(self.c.handle({"op": "check", "cores": 1, "mem": GIB})["ok"])
+        self.assertEqual(self.ask(2, agent="cpu2")["state"], "granted")
+
+    def test_exclusive_lock_lease_below_its_size_keeps_its_cores(self):
+        self.configure(cores=12, mem=58)
+        timed = self.ask(8, agent="perf", exclusive_locks=["gpu"])
+        self.age(timed, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 3.0})
+        self.assertAlmostEqual(self.free_cores(), 4.0, places=1)  # its unused 5 stay reserved
+        self.assertTrue(self.fits(3.9))
+        self.assertFalse(self.fits(5))
+
+    def test_two_exclusive_lock_leases_count_once_each(self):
+        self.configure(cores=12, mem=58)
+        gpu = self.ask(4, agent="gpu", exclusive_locks=["gpu"], pid=os.getpid())
+        nas = self.ask(3, agent="nas", exclusive_locks=["nas"], pid=os.getppid())
+        for lease in (gpu, nas):
+            self.age(lease, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 4.0, os.getppid(): 3.0})
+        self.assertAlmostEqual(self.free_cores(), 5.0, places=1)
+        self.assertTrue(self.fits(4.9))
+        self.assertFalse(self.fits(6))
+
+    def test_exclusive_lock_lease_plus_unleased_load(self):
+        self.configure(cores=12, mem=58)
+        timed = self.ask(8, agent="perf", exclusive_locks=["gpu"])
+        self.age(timed, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 8.0}, busy=10.0)  # 2 cores of other work
+        self.assertAlmostEqual(self.free_cores(), 2.0, places=1)
+        self.assertTrue(self.fits(1.9))
+        self.assertFalse(self.fits(3))
+
+    def test_nested_exclusive_lock_leases_are_measured_once(self):
+        # A timing run that starts another leased job inside its own tree:
+        # the inner job's use is part of the outer measurement.
+        self.configure(cores=12, mem=58)
+        outer = self.ask(4, agent="perf", exclusive_locks=["gpu"], pid=os.getpid())
+        inner = self.ask(2, agent="perf", exclusive_locks=["nas"], pid=os.getppid())
+        for lease in (outer, inner):
+            self.age(lease, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 4.0, os.getppid(): 2.0}, busy=7.0,
+                            trees={os.getpid(): {os.getpid(), os.getppid()}})
+        # 4 + 2 reserved, plus 7 busy less the outer tree's 4: 9 used.
+        self.assertAlmostEqual(self.free_cores(), 3.0, places=1)
+
+    def test_a_new_lease_is_counted_in_full_while_its_measurement_catches_up(self):
+        self.configure(cores=12, mem=58)
+        first = self.ask(6, agent="a", pid=os.getpid())
+        self.age(first, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 6.0})
+        second = self.ask(4, agent="b", pid=os.getppid())  # warming: counts at 4
+        self.assertEqual(second["state"], "granted")
+        with patch.object(ac.time, "monotonic", return_value=5000) as clock:
+            cpu = {os.getpid(): 0.0, os.getppid(): 0.0}
+            self.c.cpu_seconds = cpu.get
+            self.c.tick()
+            clock.return_value += 4
+            cpu[os.getpid()] += 24
+            cpu[os.getppid()] += 16
+            self.busy = 10.0
+            self.c.tick()  # the host figure has risen by only a fifth of b's 4
+        # b's own use is smoothed from zero like the host figure, so it never
+        # takes more out of the busy figure than that holds: still 2 free.
+        self.assertLessEqual(self.free_cores(), 2.0 + 0.01)
+        self.assertFalse(self.fits(3))
 
     def test_exclusive_lock_and_exclusive_together_are_refused(self):
         self.assertIn("error", self.ask(1, exclusive=True, exclusive_locks=["gpu"]))
