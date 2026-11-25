@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from uuid import uuid4
 
@@ -128,6 +129,22 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             json.loads((self.data / "agent_questions.json").read_text())[0]["answer"],
             "resolved",
         )
+
+    def test_dashboard_keeps_question_line_breaks(self):
+        import dashboard
+
+        questions = self.root / "rendered-questions.json"
+        questions.write_text(json.dumps([
+            {"id": 1, "question": "Intro\n- #1 <go>\n- #2 hold", "default": "hold"},
+            {"id": 2, "question": "Done?\nyes", "answer": "ok\nthanks"},
+        ]))
+        with mock.patch.object(dashboard, "QUESTIONS", questions), mock.patch.object(
+            dashboard, "STATE", self.root / "missing-state.json"
+        ):
+            html = dashboard.page()
+        self.assertIn("<div class=qtext>Intro\n- #1 &lt;go&gt;\n- #2 hold</div>", html)
+        self.assertIn("<div class=qtext>Done?\nyes</div>", html)
+        self.assertIn("white-space:pre-wrap", html)
 
     def fake_draft(self, head, *, statuses, review_head=None):
         state = self.root / "ready"

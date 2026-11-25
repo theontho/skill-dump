@@ -270,7 +270,7 @@ def page():
         awaiting = [q for q in load(AGENT_QUESTIONS, []) if not q.get("answer")]
         rows = "".join(
             f"<li><b>{esc(q.get('agent'))}</b> {esc(q.get('pr'))}: "
-            f"{esc(q.get('question'))}</li>"
+            f"<div class=qtext>{esc(q.get('question'))}</div></li>"
             for q in awaiting
         )
         agent_q = (
@@ -458,7 +458,7 @@ def page():
     qhtml = (
         "".join(
             f"<div class='card q'><div><b>Q{esc(q['id'])}</b> <small>{esc(q.get('asked'))}</small></div>"
-            f"<p>{esc(q['question'])}</p>"
+            f"<div class=qtext>{esc(q['question'])}</div>"
             + (
                 f"<p><i>Default if unanswered: {esc(q.get('default'))}</i></p>"
                 if q.get("default")
@@ -470,7 +470,7 @@ def page():
                 else (
                     f"<form method=post action=/answer><input type=hidden name=id value='{esc(q['id'])}'>"
                     f"<input type=hidden name=token value='{ANSWER_TOKEN}'>"
-                    "<textarea name=answer rows=2></textarea><button>Answer</button></form>"
+                    "<textarea name=answer rows=3></textarea><button>Answer</button></form>"
                 )
             )
             + "</div>"
@@ -479,7 +479,7 @@ def page():
         or "<p>No open questions.</p>"
     )
     dq = "".join(
-        f"<li><b>Q{esc(q['id'])}</b> {esc(q['question'])}<br>&rarr; <i>{esc(q['answer'])}</i></li>"
+        f"<li><b>Q{esc(q['id'])}</b><div class=qtext>{esc(q['question'])}</div>&rarr; <i class=qtext>{esc(q['answer'])}</i></li>"
         for q in done_q[-10:]
     )
     log = "".join(
@@ -497,6 +497,7 @@ def page():
 <style>body{{font:14px system-ui;margin:16px;background:#111;color:#ddd}}a{{color:#8ab4f8}}
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;padding:4px 6px;text-align:left;vertical-align:top}}
 .tag{{color:#fff;padding:1px 6px;border-radius:8px;font-size:12px;white-space:nowrap}}.grid{{display:flex;gap:8px;flex-wrap:wrap}}
+.qtext{{white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0}}.q textarea{{width:100%;box-sizing:border-box}}
 .card{{background:#1c1c1c;border:1px solid #333;border-radius:6px;padding:8px;min-width:220px;flex:1}}
 .q{{border-color:#ef6c00}}textarea{{width:100%;background:#000;color:#ddd}}h2{{margin-top:22px}}</style></head><body>
 <h1>PR backlog coordinator</h1><nav><a href="/lifecycle">PR lifecycle</a> · <a href="/tests">Tests</a></nav><div>Updated {esc(s.get("updated"))} — {esc(s.get("headline"))}</div><div>{esc(summary)}</div>
