@@ -97,14 +97,28 @@ def evidence(pr, head):
     return reviewed_head, latest, running_certs(pr, head)
 
 
+def blocking(statuses):
+    """Certifications that stop readiness: any test failure, or an error on a required one.
+
+    An error on an optional platform (host offline, infrastructure) only means hosted CI covers it.
+    """
+    required = set(P.get("drafts", "required_statuses", []))
+    return {
+        context: state
+        for context, state in statuses.items()
+        if state == "failure" or (state == "error" and context in required)
+    }
+
+
 def complete(result):
     accepted, statuses, running = result
     required = set(P.get("drafts", "required_statuses", []))
     return (
         accepted
         and bool(statuses)
-        and required <= statuses.keys()
-        and set(statuses.values()) == {"success"}
+        and all(statuses.get(context) == "success" for context in required)
+        and "pending" not in statuses.values()
+        and not blocking(statuses)
         and not running
     )
 
@@ -127,7 +141,7 @@ def watch(pr):
             return head
         accepted, statuses, running = result
         if not running:
-            if {"failure", "error"} & set(statuses.values()):
+            if blocking(statuses):
                 raise ValueError(f"certification failed on {head[:9]}: {statuses}")
             if idle_since is None:
                 idle_since = time.monotonic()

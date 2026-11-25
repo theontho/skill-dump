@@ -135,6 +135,25 @@ class Project:
             else []
         )
 
+    def reachable(self, key):
+        """True for local hosts and SSH hosts that answer within the connect timeout."""
+        argv = self.ssh(key)
+        if not argv:
+            return True
+        try:
+            return (
+                subprocess.run(
+                    [*argv, "true"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                ).returncode
+                == 0
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
     def prepare(self):
         self.data.mkdir(parents=True, mode=0o700, exist_ok=True)
         (self.data / "locks").mkdir(mode=0o700, exist_ok=True)

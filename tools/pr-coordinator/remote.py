@@ -243,7 +243,13 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                 for c in load(P.data / "state.json", {}).get("certs", [])
                 if c.get("status") == "queued"
             }
-            for key in slots:
+            online = [key for key in slots if P.reachable(key)]
+            if not online and target not in P.get("certification", "must_run", []):
+                # e.g. a laptop that left: hosted CI covers this platform.
+                status("skipped")
+                record("log", f"PR #{pr}: {target} cert skipped; no host online ({', '.join(slots)})")
+                return 0
+            for key in online:
                 preferred = P.hosts[key].get("cert_priority")
                 if preferred != target and preferred in waiting:
                     continue

@@ -69,6 +69,11 @@ that queue to dashboard readers but does not put it in the owner answer form.
   `cert_priority` for a host's preferred layer and `slots` for its concurrency.
   `shell_prefix` is an optional trusted remote shell prefix (e.g. tool PATH).
   `process_probe` and `process_probe_ssh` can supply a POSIX `ps`/load fallback.
+  Hosts that don't answer SSH within the connect timeout are skipped when
+  picking a certification slot. If none of a target's hosts is online and the
+  target isn't in `must_run`, its certification is recorded as skipped at once
+  (e.g. a laptop that left; hosted CI covers that platform). `finish-draft`
+  stops only for test failures, or for errors on `drafts.required_statuses`.
 - **Certification:** `certification.slots` maps targets to ordered host keys.
   `local_command` runs in the selected worktree. `remote_command` also runs
   on the controller, and should invoke the project's remote controller with

@@ -173,6 +173,9 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             def ssh(self, key):
                 return None
 
+            def reachable(self, key):
+                return True
+
         def fake_run(argv, *, stdout=None, **kwargs):
             calls.append(argv)
             busy = len(calls) == 1
@@ -198,6 +201,50 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
         self.assertEqual(len(calls), 2)
         self.assertNotIn("error", states)
         self.assertEqual(states[-1], "pass")
+
+    def test_certification_skips_at_once_when_no_host_is_online(self):
+        import contextlib
+
+        import remote
+
+        states, ran = [], []
+
+        class OfflineProject:
+            data = self.root
+            hosts = {"laptop": {"slots": 1, "ssh": "laptop"}}
+
+            def get(self, section, key, default=None):
+                return {"slots": {"macos": ["laptop"]}, "must_run": ["generic"]}.get(
+                    key, default
+                )
+
+            def reachable(self, key):
+                return False
+
+        with mock.patch.object(remote, "P", OfflineProject()), mock.patch.object(
+            remote, "locked", lambda *a, **k: contextlib.nullcontext()
+        ), mock.patch.object(
+            remote, "record", lambda kind, *a: states.append(a[1]) if kind == "cert-state" else None
+        ), mock.patch.object(remote, "run", lambda *a, **k: ran.append(a)), mock.patch.object(
+            remote.time, "sleep", side_effect=AssertionError("waited for an offline host")
+        ):
+            self.assertEqual(remote.certify(self.root, 7, "macos", "a" * 40, "b" * 40), 0)
+        self.assertEqual(states[-1], "skipped")
+        self.assertEqual(ran, [])
+
+    def test_optional_platform_errors_do_not_block_readiness(self):
+        import drafts
+
+        class Drafts:
+            def get(self, section, key, default=None):
+                return ["local-ci/generic"] if key == "required_statuses" else default
+
+        ok = {"local-ci/generic": "success"}
+        with mock.patch.object(drafts, "P", Drafts()):
+            self.assertTrue(drafts.complete((True, {**ok, "local-ci/macos-arm64": "error"}, False)))
+            self.assertFalse(drafts.complete((True, {**ok, "local-ci/macos-arm64": "failure"}, False)))
+            self.assertFalse(drafts.complete((True, {"local-ci/generic": "error"}, False)))
+            self.assertFalse(drafts.complete((True, {**ok, "local-ci/windows-x64": "pending"}, False)))
 
     def fake_draft(self, head, *, statuses, review_head=None):
         state = self.root / "ready"
