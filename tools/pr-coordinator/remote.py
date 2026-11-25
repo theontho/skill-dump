@@ -15,6 +15,8 @@ from uuid import uuid4
 from landing import assert_owner, json_gh
 from runtime import P, cli, load, locked
 
+RT_NOT_ADMITTED = 75
+
 
 def run(argv, *, cwd=None, check=True, **kwargs):
     return subprocess.run(argv, cwd=cwd or P.checkout, check=check, **kwargs)
@@ -74,6 +76,11 @@ def rt_main():
     parser.add_argument(
         "--envs", help="override environments sent to the preparation hook"
     )
+    parser.add_argument(
+        "--admit-now",
+        action="store_true",
+        help="decline with exit 75 instead of waiting for remote capacity",
+    )
     raw = sys.argv[1:]
     split = raw.index("--") if "--" in raw else 2
     gate = raw[split + (split < len(raw) and raw[split] == "--") :]
@@ -90,16 +97,40 @@ def rt_main():
     if any(c in wt.name for c in "\r\n/") or ":" in wt.name:
         parser.error("worktree name contains unsupported characters")
     envs = args.envs if args.envs is not None else P.get("remote_tests", "envs", "")
-    args = dict(
-        host=host,
-        sha=sha,
-        worktree=str(wt),
-        remote_worktree=dest,
-        host_checkout=root,
-        envs=",".join(envs.replace(",", " ").split()),
+    context = {
+        "host": host,
+        "sha": sha,
+        "worktree": str(wt),
+        "remote_worktree": dest,
+        "host_checkout": root,
+        "envs": ",".join(envs.replace(",", " ").split()),
+    }
+
+    admission = P.expand(
+        spec.get("rt_admission", []), label=f"hosts.{host}.rt_admission", **context
     )
-    with locked(f"rt-{host}.lock"):
-        prep = P.command("remote_tests", "prepare", **args)
+
+    def admitted():
+        try:
+            return bool(
+                admission
+                and remote(host, admission, check=False, timeout=30).returncode == 0
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def declined():
+        print(f"Remote tests: {host} cannot admit this run now.", file=sys.stderr)
+        return RT_NOT_ADMITTED
+
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(locked(f"rt-{host}.lock", wait=not args.admit_now))
+        except BlockingIOError:
+            return declined()
+        if args.admit_now and not admitted():
+            return declined()
+        prep = P.command("remote_tests", "prepare", **context)
         if not prep:
             raise ValueError(
                 "remote_tests.prepare must provision the configured remote worktree"
@@ -119,13 +150,15 @@ def rt_main():
         run(
             [*argv, f"{wt}/", f"{spec['ssh']}:{dest.removeprefix('~/')}/"], timeout=1800
         )
-        provision = P.command("remote_tests", "provision", **args)
+        provision = P.command("remote_tests", "provision", **context)
         if provision:
             remote(host, provision, cwd=dest, timeout=1800)
         rid = f"rt-{uuid4().hex[:12]}"
         prefix = P.command(
-            "remote_tests", "prefix", default=spec.get("rt_prefix", []), **args
+            "remote_tests", "prefix", default=spec.get("rt_prefix", []), **context
         )
+        if args.admit_now and not admitted():
+            return declined()
         record(
             "run",
             rid,
@@ -138,9 +171,11 @@ def rt_main():
             wt.name,
         )
         try:
-            return remote(
+            result = remote(
                 host, [*prefix, *gate], cwd=dest, timeout=5400, check=False
             ).returncode
+            # Keep capacity denial distinguishable from a failed remote command.
+            return 1 if args.admit_now and result == RT_NOT_ADMITTED else result
         finally:
             record("run", rid, "done")
 

@@ -61,6 +61,9 @@ that queue to dashboard readers but does not put it in the owner answer form.
   must use `--auto`, never `--admin`. `provision`, `regenerate`, `quick_gate`,
   `quick_tests`, `quick_host`, `quick_local_prefix`, and `ci_capacity` are
   opt-in commands. Quick tests absent in the refreshed worktree are omitted.
+  `quick_host` uses `rt --admit-now` and falls back to `quick_local_prefix`
+  when the remote host cannot admit the job immediately. Remote test failures
+  still fail the gate; they are not retried locally.
 - **Hosts:** entries have a key, display text, SSH alias (omitted for local),
   platform, core count, roles, checkout, `windows` and `agent_coord`. Use
   `cert_priority` for a host's preferred layer and `slots` for its concurrency.
@@ -110,6 +113,12 @@ that queue to dashboard readers but does not put it in the owner answer form.
   list passed to hooks that use `{envs}`.
   Use the host's `rt_prefix` to hold resource leases and `rt_root` to keep
   disposable worker checkouts apart from primary checkouts.
+  `rt HOST WORKTREE --admit-now -- COMMAND` declines with exit 75 if the
+  host's per-controller slot is busy, the host is unreachable, or its
+  configured `rt_admission` command is missing or returns nonzero. Set that
+  command to match the resources in `rt_prefix` (e.g. `agent-coord check`).
+  Probes run before copying and before launching; the prefix still owns the
+  actual lease. Explicit `rt` calls without `--admit-now` can still wait.
 - **Test evidence:** `tests --refresh` explicitly reads hosted job attempts
   and JUnit ZIPs, plus retained local/SSH test output; it doesn't rerun tests.
   `tests --jobs-only`, `tests --resume-jobs`, `tests --annotations`, and

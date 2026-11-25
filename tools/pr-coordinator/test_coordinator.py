@@ -327,6 +327,59 @@ print(refresh(7, Path(sys.argv[3]), 'feature'))
         )
         self.assertFalse((self.checkout / "generated.txt").exists())
 
+    def test_busy_remote_quick_gate_falls_back_without_synchronizing(self):
+        remote, head = self.create_git()
+        self.fake_review(head, queued=False)
+        ran = self.root / "local-quick-gate"
+        reached = self.root / "remote-admission-checked"
+        config = self.config.read_text()
+        config = config[: config.index("quick_tests")]
+        self.config.write_text(
+            config
+            + f"""
+quick_host = "worker"
+quick_gate = [{json.dumps(sys.executable)}, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()", {json.dumps(str(ran))}]
+[hosts.worker]
+ssh = "worker"
+rt = true
+checkout = "~/src/gadgets"
+rt_admission = ["agent-coord", "check", "--cores", "4", "--mem", "8G"]
+[remote_tests]
+prepare = ["must-not-run"]
+"""
+        )
+        ssh = self.root / "ssh"
+        ssh.write_text(
+            f"""#!{sys.executable}
+import sys
+from pathlib import Path
+if not sys.argv[-1].startswith("agent-coord check "):
+    raise SystemExit("remote preparation or testing was attempted")
+Path({str(reached)!r}).touch()
+raise SystemExit(1)
+"""
+        )
+        ssh.chmod(0o700)
+        result = self.command(
+            "rt",
+            "worker",
+            str(self.checkout),
+            "--admit-now",
+            "--",
+            "false",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertTrue(reached.exists())
+        self.assertFalse(ran.exists())
+        reached.unlink()
+        self.assertEqual(self.refresh(), "True")
+        self.assertTrue(reached.exists())
+        self.assertTrue(ran.exists())
+        self.assertNotEqual(
+            self.git("--git-dir", str(remote), "rev-parse", "feature"), head
+        )
+
     def test_train_retries_cancellations_only_not_timeouts_or_test_failures(self):
         jobs = [
             {"name": "required", "conclusion": "failure"},

@@ -20,6 +20,7 @@ from landing import (
     review,
 )
 from lane import acquire, touches
+from remote import RT_NOT_ADMITTED
 from runtime import P, cli, gh_argv, load, locked, questions, save, uuid4
 
 HERE = P.data
@@ -314,9 +315,11 @@ def refresh(n, wt, branch, *, active=lambda: True):
     code, out = 0, ""
     if gate and (quick or not QUICK_TESTS):
         host = P.get("landing", "quick_host")
-        if host and sh([*P.ssh(host), "true"], timeout=30)[0] == 0:
-            code, out = sh(cli("rt", host, wt, "--", *gate, *quick), timeout=5400)
-        else:
+        if host:
+            code, out = sh(
+                cli("rt", host, wt, "--admit-now", "--", *gate, *quick), timeout=5400
+            )
+        if not host or code == RT_NOT_ADMITTED:
             command = P.command("landing", "quick_local_prefix", pr=n)
             code, out = sh([*command, *gate, *quick], cwd=wt, timeout=5400)
     if code != 0:

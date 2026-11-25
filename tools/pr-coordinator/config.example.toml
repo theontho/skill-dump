@@ -102,6 +102,7 @@ rt = true
 # agent_env_session = "coordenv"
 cert_priority = "linux"
 rt_prefix = ["agent-coord", "run", "--cores", "2", "--mem", "4G", "--"]
+rt_admission = ["agent-coord", "check", "--cores", "2", "--mem", "4G"]
 # cert_prepare/cert_cleanup override the shared hooks on this host.
 
 [hosts.worker.junit]
