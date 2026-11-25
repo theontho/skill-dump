@@ -145,6 +145,10 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
         self.assertIn("<div class=qtext>Intro\n- #1 &lt;go&gt;\n- #2 hold</div>", html)
         self.assertIn("<div class=qtext>Done?\nyes</div>", html)
         self.assertIn("white-space:pre-wrap", html)
+        # An answer being typed must survive the periodic refresh.
+        self.assertNotIn("http-equiv=refresh", html)
+        self.assertIn("localStorage", html)
+        self.assertIn("document.activeElement", html)
 
     def test_certification_waits_when_the_controller_finds_the_host_busy(self):
         import contextlib

@@ -73,7 +73,9 @@ Agent questions go to `pr-coord --project <project> ask 'Question and context'
 --pr '#N' --machine <agent> --default '<safe fallback>'`. Proceed with a safe
 default or park the PR rather than asking the owner directly. The coordinator
 answers via `agent-questions ID ANSWER`; only unresolved policy decisions are
-rewritten with context, options and a default for `ask --owner`. The owner can
+rewritten with context, options and a default for `ask --owner`; when one
+owner question bundles several decisions, number each (1., 2., …) so the owner
+can answer by number. The owner can
 answer via the trusted dashboard (if enabled) or `answer ID ANSWER`.
 
 `/` shows PRs, a hoverable dependency graph and conflict matrix, host leases,

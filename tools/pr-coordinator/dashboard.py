@@ -262,6 +262,23 @@ def runners_panel(s):
     )
 
 
+# Reload every minute, except while an answer is being typed; unsent answers survive reloads.
+KEEP_DRAFTS = """<script>
+const key = id => "pr-coord-draft-" + id;
+for (const f of document.querySelectorAll("form[action='/answer']")) {
+  const id = f.querySelector("[name=id]").value, t = f.querySelector("textarea");
+  t.value = localStorage.getItem(key(id)) || "";
+  t.addEventListener("input", () => localStorage.setItem(key(id), t.value));
+  f.addEventListener("submit", () => localStorage.removeItem(key(id)));
+}
+setInterval(() => {
+  const busy = [...document.querySelectorAll("textarea")].some(
+    t => t === document.activeElement || t.value.trim());
+  if (!busy) location.reload();
+}, 60000);
+</script>"""
+
+
 def page():
     s = load(STATE, {})
     qs = load(QUESTIONS, [])
@@ -492,7 +509,7 @@ def page():
             continue
         counts[pr.get("stage")] = counts.get(pr.get("stage"), 0) + 1
     summary = " · ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-    return f"""<!doctype html><html><head><meta charset=utf-8><meta http-equiv=refresh content=60>
+    return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'><title>PR backlog coordinator</title>
 <style>body{{font:14px system-ui;margin:16px;background:#111;color:#ddd}}a{{color:#8ab4f8}}
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;padding:4px 6px;text-align:left;vertical-align:top}}
@@ -513,7 +530,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;
 <h2>Certification queue (one run per host)</h2><div class=grid>{cert_hosts}</div>
 <details><summary>Recent certification results</summary><table><tr><th>PR</th><th>OS</th><th>SHA</th><th>Result</th><th>At</th></tr>{recent}</table></details>
 <h2>Pull requests</h2>{pr_tables}
-<h2>Answered</h2><ul>{dq}</ul><h2>Log</h2><ul>{log}</ul></body></html>"""
+<h2>Answered</h2><ul>{dq}</ul><h2>Log</h2><ul>{log}</ul>{KEEP_DRAFTS}</body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
