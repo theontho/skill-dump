@@ -201,6 +201,17 @@ def wait_merged_or_removed(n, head, since, active=lambda: True):
         time.sleep(180)
 
 
+def settled_head(n, expected, attempts=5, pause=30):
+    """The PR head, giving GitHub time to report our own just-pushed head before calling it foreign."""
+    head = pr_info(n)["headRefOid"]
+    for _ in range(attempts):
+        if head == expected:
+            break
+        time.sleep(pause)
+        head = pr_info(n)["headRefOid"]
+    return head
+
+
 def refresh(n, wt, branch, *, active=lambda: True):
     """Merge origin/main; regenerate; push. Returns True if HEAD changed and was pushed."""
     git_step(wt, "fetch", "-q", P.remote, P.base, branch, timeout=180)
@@ -484,7 +495,12 @@ def land(entry):
             )
             return
         status(n, "waiting", "waiting for PR checks")
-        checked_head = pr_info(n)["headRefOid"]
+        # After our own push GitHub can still report the previous head for a while; use what we pushed.
+        checked_head = (
+            sh(["git", "rev-parse", "HEAD"], cwd=wt)[1].strip()
+            if pushed is True
+            else pr_info(n)["headRefOid"]
+        )
         deadline = time.time() + 3 * 3600
         time.sleep(120 if pushed else 0)
         while active():
@@ -521,7 +537,7 @@ def land(entry):
             time.sleep(180)
         if not active():
             return
-        head = pr_info(n)["headRefOid"]
+        head = settled_head(n, checked_head)
         if head != checked_head:
             need_agent(n, f"#{n}: head changed outside the train; no enqueue made.")
             return

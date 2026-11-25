@@ -520,6 +520,19 @@ raise SystemExit(1)
             self.git("--git-dir", str(remote), "rev-parse", "feature"), head
         )
 
+    def test_train_waits_for_github_to_report_its_own_push(self):
+        import train
+
+        reported = iter(["old", "old", "pushed"])
+        with mock.patch.object(
+            train, "pr_info", lambda n: {"headRefOid": next(reported)}
+        ), mock.patch.object(train.time, "sleep"):
+            self.assertEqual(train.settled_head(7, "pushed"), "pushed")
+        with mock.patch.object(
+            train, "pr_info", lambda n: {"headRefOid": "someone-else"}
+        ), mock.patch.object(train.time, "sleep"):
+            self.assertEqual(train.settled_head(7, "pushed"), "someone-else")
+
     def test_train_retries_cancellations_only_not_timeouts_or_test_failures(self):
         jobs = [
             {"name": "required", "conclusion": "failure"},
