@@ -112,7 +112,10 @@ CPU_WAIT_KINDS = ("cores", "headroom")
 SCOPE_PREFIX = os.environ.get("AGENT_COORD_SCOPE_PREFIX") or "agent-coord"
 if not re.fullmatch(r"[A-Za-z0-9_-]+", SCOPE_PREFIX):
     SCOPE_PREFIX = "agent-coord"
-SCOPE_RE = re.compile(r"[A-Za-z0-9_-]+-L\d+-\d+\.scope")
+# The service resizes only names with its own prefix; a client accepts any
+# well-formed name the service gives it.
+SCOPE_RE = re.compile(re.escape(SCOPE_PREFIX) + r"-L\d+-\d+\.scope")
+ANY_SCOPE_RE = re.compile(r"[A-Za-z0-9_-]+-L\d+-\d+\.scope")
 RESIZE_TIMEOUT = 5.0  # seconds for one systemctl set-property
 # A failed resize is retried after RESIZE_BACKOFF s, doubling; after
 # RESIZE_ATTEMPTS failures in a row the lease is fixed at its size.
@@ -216,7 +219,8 @@ PROJECTS
   applies to elastic (MIN:MAX) leases: a waiting request shrinks other
   projects' elastic leases (never below MIN) as far as its project's fair
   share (cores x weight / active projects' weights, weight 1 by default), and
-  elastic leases even out toward those shares. A project is the git
+  elastic leases even out toward those shares; a timing run may take them down
+  to their MIN, whatever its share. A project is the git
   repository (a --project name counts separately only if configured); the
   client says which, nothing enforces it (cooperating agents). Fixed and
   timing leases are never shrunk, so a project that holds the machine with
@@ -692,9 +696,9 @@ class Coordinator:
         return max(0.0, self.busy - sum(g["cores"] for g in self._vms()) - leased)
 
     def _eps(self) -> float:
-        """Tolerance for CPU checks: smoothed measurements of leases counted
-        once leave hundredths of a core of noise; none otherwise (as on main)."""
-        return CPU_EPS if self._counted_once() else 0.0
+        """Tolerance for CPU checks: smoothed measurements of elastic leases
+        leave hundredths of a core of noise; none without one (as on #11)."""
+        return CPU_EPS if any(x.get("elastic") for x in self.state["leases"]) else 0.0
 
     def _size(self, lease: dict) -> float:
         """Cores a lease may use now: its size (for an elastic lease, the
@@ -872,7 +876,7 @@ class Coordinator:
                 whose = "this request" if keeper is req else (
                     f"{keeper['agent']}'s lease {keeper['id']} ({keeper['label']})")
                 return "headroom", (f"{max(cores - claimed, 0):.1f} cores unclaimed; "
-                                    f"{need:g} kept free for {whose}"
+                                    f"{need:g} are kept free for {whose}"
                                     + self._fixed_hint(req))  # fmt: skip
         return None
 
@@ -939,7 +943,8 @@ class Coordinator:
         if held >= shares.get(mine, 0.0) - 1e-9:
             return ""
         entitled = self._entitled(req, projects)
-        if (not req.get("max_cores") and held + req["cores"] > entitled + 1e-9
+        if (not req.get("max_cores") and not self._timing(req)
+                and held + req["cores"] > entitled + 1e-9
                 and any(x.get("elastic") and self._project(x) != mine
                         for x in self.state["leases"])):
             return (f"; other projects' elastic leases are shrunk only to give project "
@@ -986,11 +991,13 @@ class Coordinator:
             return False
         if not self.resize_async:
             return self._resized(x, cores, kind, note, self.resize(scope, cores))
-        self._pending[x["id"]] = (float(cores), kind, note)
+        entry = (float(cores), kind, note)
         if cores > x["cores"]:  # count a growth at once (conservative)
-            self._pending[x["id"]] = (x["cores"], "undo", "")
+            entry = (x["cores"], "undo", "")
             self._apply(x, cores, kind, note)
-        self._jobs.put((x["id"], scope, float(cores)))
+        self._pending[x["id"]] = entry
+        # The job carries its own entry: only that entry is ever cleared by it.
+        self._jobs.put((x["id"], scope, float(cores), entry))
         return None
 
     def _apply(self, x: dict, cores: float, kind: str, note: str) -> None:
@@ -1044,8 +1051,9 @@ class Coordinator:
                 self.resize_job(job)
             except Exception as e:  # noqa: BLE001 - keep resizing the others
                 print(f"agent-coord: resize job {job[0]} failed: {e!r}", file=sys.stderr, flush=True)
-            finally:
-                self._pending.pop(job[0], None)
+                with self.lock:  # clear this job's own entry, not a newer one
+                    if self._pending.get(job[0]) is job[3]:
+                        del self._pending[job[0]]
 
     def ensure_worker(self, start: bool = False) -> bool:
         """Start the resize worker (start=True, from serve), or restart it if
@@ -1062,16 +1070,19 @@ class Coordinator:
         self._worker.start()
         return True
 
-    def resize_job(self, job: tuple[str, str, float]) -> None:
+    def resize_job(self, job: tuple) -> None:
         """One queued resize: the systemctl call without the lock, then its
-        result applied (and the line re-admitted) with it."""
-        lease_id, scope, cores = job
+        result applied (and the line re-admitted) with it. Only the pending
+        entry this job was queued with is taken; a newer one stays."""
+        lease_id, scope, cores, entry = job
         try:
             ok = self.resize(scope, cores)
         except Exception:  # noqa: BLE001 - a failure like any other
             ok = False
         with self.lock:
-            pending = self._pending.pop(lease_id, None)
+            pending = None
+            if self._pending.get(lease_id) is entry:
+                pending = self._pending.pop(lease_id)
             try:
                 x = next((y for y in self.state["leases"] if y["id"] == lease_id), None)
                 if x is not None and pending is not None and x.get("scope") == scope:
@@ -1154,7 +1165,9 @@ class Coordinator:
         fits now.
 
         - Other projects' elastic leases give only while req's project would
-          stay within its entitlement (its fair share):
+          stay within its entitlement (its fair share); a timing run
+          (--exclusive-lock or --headroom) may take them down to their MIN
+          whatever its share, as far as it needs to start with its headroom:
           asking for a big fixed size never gets a project more than asking
           MIN:MAX. The project furthest over its share gives first, then the
           lease with the largest surplus over its MIN, a core at a time.
@@ -1225,6 +1238,7 @@ class Coordinator:
         target = self._target(req)
         elastic = [x for x in self.state["leases"] if self._donor(x)]
         before = {x["id"]: x["cores"] for x in elastic}
+        timing = self._timing(req)
 
         def fits(size):
             # Start at size, and (for a request behind the head) be allowed
@@ -1238,7 +1252,9 @@ class Coordinator:
             while not fits(target):
                 others = [x for x in elastic if self._project(x) != mine and surplus(x) > 1e-9]
                 own = [x for x in elastic if self._project(x) == mine and surplus(x) > 1e-9]
-                if others and held[mine] + target <= entitled + 1e-9:
+                # A timing run may take other projects' elastic cores down
+                # to their MIN, whatever its share; others only up to theirs.
+                if others and (timing or held[mine] + target <= entitled + 1e-9):
                     x = max(others, key=lambda x: (held[self._project(x)] - shares[self._project(x)],
                                                    surplus(x)))
                 elif own and not fits(low):
@@ -1726,8 +1742,7 @@ class Coordinator:
           Disk and lock safeguards remain.
         - A stuck request (see _stuck) doesn't count as being ahead: no lease
           ending would let it start, so the line behind it moves on, in order.
-          It takes its turn again as soon as it would fit.
-"""
+          It takes its turn again as soon as it would fit."""
         queue = self.state["queue"]
         ahead = queue[: queue.index(req)] if req in queue else queue
         if not ahead:
@@ -2532,7 +2547,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if has_scopes():
             # The service names the scope (and resizes it by that name).
             scope = reply.get("scope") or scope_name(lease_id)
-            if not SCOPE_RE.fullmatch(scope):
+            if not ANY_SCOPE_RE.fullmatch(scope):
                 raise SystemExit(f"agent-coord: bad scope name {scope!r}")
         if args.max_cores and not elastic:
             print(f"agent-coord: {lease_id} cannot be resized (no systemd scope); it keeps "

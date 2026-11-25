@@ -221,7 +221,9 @@ host's busy cores), like a timing run; idle shrink keeps grants near real use.
   rules let pass; behind a lock-waiting head, also leaving that head its room)
   shrinks running elastic leases until it fits:
   - other projects' elastic leases, only while the requesting project stays
-    within its fair share. So
+    within its fair share, except for a timing run (`--exclusive-lock` or
+    `--headroom`): it may take other projects' elastic cores down to their
+    MIN, whatever its share, as far as it needs to start with its headroom. So
     asking for a big fixed size never gets a project more than asking MIN:MAX:
     on 12 cores with another project's busy 2:12 at 12, a fixed 10 waits ("other
     projects' elastic leases are shrunk only to give project B its fair share
@@ -273,8 +275,9 @@ project (`git rev-parse --git-common-dir`). Outside git it is the agent name.
 `--project NAME` counts as its own project only if NAME is listed under
 `[projects.NAME]` in the config; otherwise it shares its repository's project.
 Two repositories in folders of the same name are one project unless one of
-them uses a configured name. Requests from older clients count under the name
-they give, or `default`. The project is supplied by the client and is not
+them uses a configured name. A current client that sends no repository counts
+as project `default`; requests from older clients count under the name they
+give, or `default`. The project is supplied by the client and is not
 enforced: this is for cooperating agents (a client that lies about its
 repository gets more than its share). A project is active while it has a
 running or waiting lease; idle projects claim nothing.
