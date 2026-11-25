@@ -1,0 +1,126 @@
+# PR coordinator
+
+`pr-coord` coordinates a GitHub PR backlog across machines. The controller runs on
+Linux/macOS with Python 3.11+, Git and `gh`; remote features use SSH, `rt` also
+uses rsync, and resource probes and leases can use `agent-coord`. Windows can be
+a remote certification/JUnit worker. Installing the command does not start
+anything. No Python packages are needed for the tool.
+
+## Set up a project
+
+Copy [`config.example.toml`](config.example.toml) to
+`~/.config/pr-coordinator/<project>.toml` and set the repository, owner, local
+checkout, landing policy and hosts. Config and data are private, outside all
+checkouts by default. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
+`--project PROJECT` selects the project (`PR_COORD_PROJECT` is an optional
+default). `--config FILE` and `--data-dir DIR` override the selection. Place
+these switches **before** the command.
+
+```sh
+pr-coord --project project status
+pr-coord --project project dashboard --bind 127.0.0.1 --port 8787
+pr-coord --project project run                  # dashboard + collectors
+pr-coord --project project run --landing        # also supervise, train, yield, and cancel
+```
+
+Use one foreground `run` per project in a managed terminal or service. It stops
+the other children if any exits, and stops its children on Ctrl-C or SIGTERM.
+Alternatively run `dashboard`, `collect`, `supervise`, and `train run`
+separately. `collect --mutate` explicitly enables yield/stale cancellation;
+`collect --once` and `supervise --once` run one cycle. `events` blocks until a
+new main failure, queue drop, or question, prints it and exits; restart it on
+notification. Monitor foreground errors and supervise processes externally.
+No units are installed or enabled by default.
+
+The dashboard reads only local snapshots and does not contact GitHub. `/` has PR
+tables, conflicts, dependencies, leases, certifications and questions;
+`/lifecycle` shows phases, rework and job traces; `/tests` shows CI cost, per-test
+results and candidates for less frequent execution. The HTTP server has no
+authentication. Keep it on loopback and use an SSH tunnel, or put it behind an
+authenticated proxy on a trusted network. Turn on `dashboard.allow_answers` to
+enable owner answers from the UI; otherwise use `pr-coord answer ID TEXT`.
+
+## Configuration and command contracts
+
+- **GitHub:** `github.repo`, `owner`, `tracked_authors`, `base_branch`, `remote`.
+  Tracked bots appear in the dashboards but are not automatically refreshed or
+  enqueued as owner PRs. Mutating loops check the authenticated owner. A
+  `hands-off` label forbids all mutation. A `priority` PR can yield capacity;
+  an existing reviewed queue entry can be moved to the front. `land-asap`
+  authorizes cancelled-only retries and front enqueueing, without editing the
+  collaborator's branch. Coordinate ownership and label rules with the repo.
+- **Landing:** `lane.generated` is a list of full-path regexes, with ordered
+  PR classes `top` and `priority`. `landing.pr_checks_ready` receives `gh pr
+  checks --json bucket,name,workflow,link` on stdin; use it for draft-to-ready
+  run selection and superseded attempts. Without it, every returned job must
+  pass or skip and all `required_checks` must pass. `aggregate_checks` lists
+  failing rollups that do not block a cancellation-only retry. `merge_flags`
+  must use `--auto`, never `--admin`. `provision`, `regenerate`, `quick_gate`,
+  `quick_tests`, `quick_host`, `quick_local_prefix`, and `ci_capacity` are
+  opt-in commands. Quick tests absent in the refreshed worktree are omitted.
+- **Hosts:** entries have a key, display text, SSH alias (omitted for local),
+  platform, core count, roles, checkout, `windows` and `agent_coord`. Use
+  `cert_priority` for a host's preferred layer and `slots` for its concurrency.
+  `shell_prefix` is an optional trusted remote shell prefix (e.g. tool PATH).
+  `process_probe` and `process_probe_ssh` can supply a POSIX `ps`/load fallback.
+- **Certification:** `certification.slots` maps targets to ordered host keys.
+  `local_command` runs in the selected worktree. `remote_command` also runs
+  on the controller, and should invoke the project's remote controller with
+  its `remote_config`. Optional `environments` outputs a whitespace-separated
+  environment list, supplied as one argument to preparation hooks. Local and
+  remote preparation/cleanup and `notify` are explicit hooks. A host may
+  override `cert_prepare` and `cert_cleanup`; on Windows the
+  `["powershell-script", "SCRIPT", "ARG", ...]` form runs the configured code
+  with `$args`. Project hooks own lockfile validation, worker input caches,
+  limits and teardown. `cert-pr` uses an existing clean worktree on the PR
+  branch or prepares a dedicated one, then waits for the configured targets;
+  run it in a managed background shell if needed.
+- **Remote tests:** `rt HOST WORKTREE -- COMMAND ...` sends the current
+  worktree, including uncommitted changes, to the configured SSH worker. Only
+  point this at trusted machines. `remote_tests.prepare` must provision the
+  destination before `rsync --delete` and excludes must preserve `.git`.
+  `remote_tests.provision` can prepare environments after synchronization.
+  `rt HOST WORKTREE --envs "base dev" -- COMMAND` overrides the environment
+  list passed to hooks that use `{envs}`.
+  Use the host's `rt_prefix` to hold resource leases and `rt_root` to keep
+  disposable worker checkouts apart from primary checkouts.
+- **Test evidence:** `tests --refresh` explicitly reads hosted job attempts
+  and JUnit ZIPs, plus retained local/SSH test output; it doesn't rerun tests.
+  `tests --jobs-only`, `tests --resume-jobs`, `tests --annotations`, and
+  `reports --local-only` select individual collection paths. `tests` without
+  flags rebuilds from cached inputs and the local checkout. Configure
+  `tests.hosted_workflows` (workflow → event → stage), `workflow_events` (an
+  optional event allowlist per workflow), `event_stages`, `nightly_workflows`,
+  `release_workflows`, `stage_workflows`, `artifact_pattern`,
+  `artifact_xml_names`, and per-host `junit` glob paths. A `tiers_command`
+  takes a JSON array of test-file names on stdin and returns a JSON object
+  keyed by name with `tier` and `portable` fields. `stage_descriptions`,
+  `stage_details`, `stage_highlights`, `workflow_purpose`, `job_purpose`, and
+  `areas` can explain project-specific selection policy.
+
+Hooks are argv arrays. Known values such as `{repo}`, `{checkout}`, `{data}`,
+`{worktree}`, `{pr}`, `{host}`, `{sha}`, `{base}`, `{platform}`, `{layer}`,
+`{envs}`, `{remote_worktree}`, and `{remote_config}` are substituted as single
+arguments; availability depends on the command. Do not copy untrusted hooks.
+
+## Migrate and cut over
+
+1. Stop **only** the old dashboard, supervisor, collector, train and event
+   watcher through their existing launcher. Let current refresh and
+   certification work finish first; stop agent submissions while migrating.
+2. Before installing, run the new entry point in the approved dev checkout:
+   `./tools/pr-coordinator/pr-coord --project PROJECT migrate --from OLD_DIR`.
+   It copies recognized JSON/JSONL snapshots, caches and lane/priority markers
+   without overwriting existing files or importing scripts or process locks.
+   The target defaults to `~/.local/state/pr-coordinator/PROJECT/`. Keep the old
+   directory intact for rollback. Use a separate `--data-dir` to preview a copy.
+3. After the owner approves distribution and the commit lands in skill-dump,
+   run `skill-dump update`; do not edit the installed clone.
+4. Verify `pr-coord --project PROJECT status`; start
+   `pr-coord --project PROJECT run --landing` under your process manager and
+   re-arm `pr-coord --project PROJECT events`. Use dashboard-only mode to
+   inspect migrated data before enabling any mutations.
+
+For browser verification on a populated copy, run `browser_smoke.py --base
+http://127.0.0.1:8787 --out out/browser.json`. This optional test needs Chromium
+and `websocket-client`; the regular tool and test suite do not.

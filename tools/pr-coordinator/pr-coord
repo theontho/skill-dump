@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Operate one configured pull request coordination project."""
+
+import argparse
+import importlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import runtime
+
+STATE_COMMANDS = (
+    "agent",
+    "ask",
+    "answers",
+    "pr",
+    "log",
+    "headline",
+    "machine",
+    "run-state",
+    "cert-state",
+    "sync",
+)
+COMMANDS = {
+    "dashboard": ("dashboard", "main", "serve the PR, lifecycle and test pages"),
+    "train": ("train", "main", "hand ready PRs to the landing train"),
+    "lane": ("lane", "main", "reserve a conflict-free generated-files lane"),
+    "cert": ("remote", "cert_main", "certify a worktree at the exact published head"),
+    "cert-pr": ("remote", "cert_pr_main", "certify a PR from a managed worktree"),
+    "rt": ("remote", "rt_main", "run tests against a synchronized remote copy"),
+    "events": ("events", "main", "watch for main failures, drops, and questions"),
+    "tests": ("tests_inventory", "main", "build or refresh test inventory"),
+    "reports": ("tests_reports", "main", "collect JUnit reports"),
+    "triage": ("triage", "main", "list PR landing metadata as JSON lines"),
+    "graph": ("graph", "main", "refresh conflict and dependency graph"),
+    "lifecycle": ("lifecycle", "main", "refresh lifecycle evidence"),
+    "hosts": ("collect_hosts", "main", "refresh host leases and workloads"),
+    "yield-runners": (
+        "yield_runners",
+        "main",
+        "yield hosted runner slots to priority PRs",
+    ),
+    "cancel-stale": (
+        "cancel_stale",
+        "main",
+        "cancel work superseded by newer owner PR heads",
+    ),
+    "reconcile": ("reconcile", "main", "reconcile interrupted certification jobs"),
+    "worktree-clean": (
+        "wt_clean",
+        "main",
+        "archive and remove specified clean worktrees",
+    ),
+}
+LOCAL = {
+    "migrate": "copy old coordinator datasets without overwriting existing files",
+    "status": "show local data locations and status",
+    "run": "run dashboard and read-only collector (or opt into landing)",
+    "collect": "refresh host, PR lifecycle and dependency datasets",
+    "supervise": "run the auto-enqueue loop",
+    "capacity": "wait for priority holds and run the project's CI capacity gate",
+    "release-hold": "wait for a PR to merge, then remove the manual hold",
+    "host-back": "wait for a configured SSH host to become reachable",
+    "answer": "record an answer to an owner question",
+    "agent-questions": "list or answer queued implementer questions",
+}
+
+DATASETS = {
+    "state.json",
+    "questions.json",
+    "agent_questions.json",
+    "train.json",
+    "events_seen.json",
+    "triage.jsonl",
+    "lifecycle.json",
+    "lifecycle-cache.json",
+    "lifecycle-coord-history.json",
+    "tests_inventory.json",
+    "tests_inventory_activity.json",
+    "tests_inventory_git.json",
+    "tests_inventory_reports.json",
+    "tests_inventory_run_list.json",
+    "yield_cancelled.json",
+    "events_known.json",
+    "events_known.txt",
+}
+CACHES = {
+    "tests_inventory_annotations",
+    "tests_inventory_reports",
+    "tests_inventory_runs",
+}
+LIVE_MARKERS = {"hold", "yield", "lane.holders", "lane.priority", "lane.top"}
+
+
+def migrate(args):
+    parser = argparse.ArgumentParser(description=LOCAL["migrate"])
+    parser.add_argument("--from", dest="source", required=True, type=Path)
+    parsed = parser.parse_args(args)
+    source = parsed.source.expanduser().resolve(strict=True)
+    data = runtime.P.data
+    if source == data or source in data.parents or data in source.parents:
+        parser.error("source and destination must be separate directories")
+    paths = [source / name for name in sorted(DATASETS)]
+    paths += [p for name in sorted(CACHES) for p in (source / name).glob("**/*.json")]
+    lockdir = source / "locks"
+    paths += [
+        p
+        for p in lockdir.glob("*")
+        if p.name in LIVE_MARKERS or p.name.startswith("jumped-")
+    ]
+    copied = skipped = 0
+    with runtime.locked("migrate.lock", wait=False):
+        for path in paths:
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or not path.resolve().is_relative_to(source)
+            ):
+                continue
+            legacy_known = path == source / "events_known.txt"
+            target = data / (
+                "events_known.json" if legacy_known else path.relative_to(source)
+            )
+            if target.exists() or target.is_symlink():
+                skipped += 1
+                continue
+            target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            try:
+                # Stage alongside the target, and publish without replacing an existing dataset.
+                stage = target.with_name(f".migrate-{runtime.uuid4().hex}")
+                with os.fdopen(
+                    os.open(stage, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb"
+                ) as stream:
+                    if legacy_known:
+                        names = [
+                            name
+                            for line in path.read_text().splitlines()
+                            if (name := line.strip())
+                        ]
+                        stream.write(json.dumps(names).encode())
+                    else:
+                        with path.open("rb") as old:
+                            shutil.copyfileobj(old, stream)
+                try:
+                    os.link(stage, target)
+                    copied += 1
+                except FileExistsError:
+                    skipped += 1
+            finally:
+                stage.unlink(missing_ok=True)
+    print(f"Copied {copied} files; kept {skipped} existing files in {data}.")
+
+
+def run_stack(args):
+    parser = argparse.ArgumentParser(description=LOCAL["run"])
+    parser.add_argument(
+        "--landing",
+        action="store_true",
+        help="also supervise, run train and yield/cancel GitHub jobs",
+    )
+    parser.add_argument("--bind")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--read-only", action="store_true")
+    flags = parser.parse_args(args)
+    dashboard = ["dashboard"]
+    for arg in ("bind", "port"):
+        if (value := getattr(flags, arg)) is not None:
+            dashboard += [f"--{arg}", str(value)]
+    if flags.read_only:
+        dashboard.append("--read-only")
+    commands = [dashboard, ["collect"]]
+    if flags.landing:
+        from landing import assert_owner
+
+        assert_owner()
+        commands[1].append("--mutate")
+        commands += [["supervise"], ["train", "run"]]
+    children = []
+    previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        with runtime.locked("stack.lock", wait=False):
+            for command in commands:
+                children.append(
+                    (
+                        command[0],
+                        subprocess.Popen(runtime.cli(*command), start_new_session=True),
+                    )
+                )
+            while True:
+                for name, process in children:
+                    code = process.poll()
+                    if code is not None:
+                        raise RuntimeError(
+                            f"{name} exited with status {code}; stopping stack"
+                        )
+                time.sleep(1)
+    finally:
+        for _, process in children:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for _, process in children:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        signal.signal(signal.SIGTERM, previous)
+
+
+def extra(command, args):
+    from landing import json_gh, paused
+
+    p = runtime.P
+    parser = argparse.ArgumentParser(description=LOCAL[command])
+    if command == "capacity":
+        if any(flag in args for flag in ("--help", "-h")):
+            return parser.print_help()
+        while paused():
+            time.sleep(120)
+        capacity = p.command("landing", "ci_capacity")
+        return (
+            subprocess.run([*capacity, *args], cwd=p.checkout).returncode
+            if capacity
+            else 0
+        )
+    if command == "status":
+        parser.parse_args(args)
+        print(
+            json.dumps(
+                {
+                    "project": p.name,
+                    "repo": p.repo,
+                    "config": str(p.config_file),
+                    "data": str(p.data),
+                    "hold": paused(),
+                    "state": runtime.load(p.data / "state.json", {}),
+                    "train": runtime.load(p.data / "train.json", []),
+                },
+                indent=1,
+            )
+        )
+    elif command == "host-back":
+        parser.add_argument("host", choices=list(p.hosts))
+        host = parser.parse_args(args).host
+        ssh = p.ssh(host)
+        while (
+            ssh
+            and subprocess.run(
+                [*ssh, "true"], capture_output=True, timeout=30
+            ).returncode
+        ):
+            time.sleep(120)
+        print(f"{host} is reachable")
+    elif command == "release-hold":
+        parser.add_argument("pr", type=int)
+        pr = parser.parse_args(args).pr
+        while json_gh("pr", "view", str(pr), "--json", "state")["state"] != "MERGED":
+            time.sleep(120)
+        (p.data / "locks/hold").unlink(missing_ok=True)
+        return subprocess.run(
+            runtime.cli("log", f"#{pr} merged; released fast-track hold")
+        ).returncode
+    elif command in {"answer", "agent-questions"}:
+        agent = command == "agent-questions"
+        parser.add_argument("id", nargs="?" if agent else None)
+        parser.add_argument("answer", nargs="*")
+        options = parser.parse_args(args)
+        if options.id is None:
+            print(
+                json.dumps(runtime.load(p.data / "agent_questions.json", []), indent=1)
+            )
+            return
+        if not options.answer:
+            parser.error("provide the answer")
+
+        def update(rows):
+            for row in rows:
+                if str(row["id"]) == options.id:
+                    row.update(
+                        answer=" ".join(options.answer),
+                        answered_at=time.strftime("%Y-%m-%d %H:%M"),
+                    )
+                    return rows
+            raise ValueError(f"unknown question {options.id}")
+
+        runtime.questions(update, agent=agent)
+
+
+def main():
+    help_lines = {name: desc for name, (_, _, desc) in COMMANDS.items()} | LOCAL
+    help_lines.update(
+        {name: "read or update coordinator state" for name in STATE_COMMANDS}
+    )
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Commands:\n"
+        + "\n".join(f"  {n:<17} {d}" for n, d in help_lines.items()),
+    )
+    parser.add_argument(
+        "--project", default=os.environ.get("PR_COORD_PROJECT", "default")
+    )
+    parser.add_argument("--config", type=Path, help="override project TOML path")
+    parser.add_argument("--data-dir", type=Path, help="override project data directory")
+    parser.add_argument("command", choices=help_lines)
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    opts = parser.parse_args()
+    try:
+        help_args = (
+            opts.args[: opts.args.index("--")] if "--" in opts.args else opts.args
+        )
+        help_only = any(argument in {"--help", "-h"} for argument in help_args)
+        runtime.P = runtime.Project(
+            opts.project,
+            config_file=opts.config,
+            data_dir=opts.data_dir,
+            required=not help_only,
+        )
+        if not help_only:
+            runtime.P.prepare()
+        cmd, args = opts.command, opts.args
+        sys.argv = [f"pr-coord {cmd}", *args]
+        if cmd in COMMANDS:
+            if cmd in {"cancel-stale", "yield-runners"}:
+                if help_only:
+                    print(COMMANDS[cmd][2])
+                    return 0
+                from landing import assert_owner
+
+                assert_owner()
+            module, function, _ = COMMANDS[cmd]
+            return getattr(importlib.import_module(module), function)()
+        if cmd in STATE_COMMANDS:
+            import coord
+
+            op = {"run-state": "run", "cert-state": "cert"}.get(cmd, cmd)
+            sys.argv.insert(1, op)
+            return coord.main()
+        if cmd == "migrate":
+            return migrate(args)
+        if cmd == "run":
+            return run_stack(args)
+        if cmd in {"supervise", "collect"}:
+            from loops import loop
+
+            return loop(cmd)
+        return extra(cmd, args)
+    except KeyboardInterrupt:
+        return 130
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        KeyError,
+        subprocess.SubprocessError,
+    ) as exc:
+        print(f"pr-coord: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

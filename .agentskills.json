@@ -45,6 +45,18 @@
       }
     },
     {
+      "id": "pr-coordinator",
+      "name": "pr-coordinator",
+      "description": "Use when the owner asks to coordinate or land a pull request backlog across machines.",
+      "license": "MIT",
+      "path": "skills/pr-coordinator/SKILL.md",
+      "sha256": "e1bac37c124b71088be32907449641105653eee31c5fe829c2cd8c94544c16d1",
+      "metadata": {
+        "author": "theontho",
+        "version": "1.0.0"
+      }
+    },
+    {
       "id": "transcript-summarize",
       "name": "transcript-summarize",
       "description": "Downloads video transcripts via subtitles using yt-dlp, deduplicates and cleans them into plain-text files, then produces an AI summary of each video. WHEN: \"summarize video\", \"video summary\", \"transcript summary\", \"summarize YouTube\", \"get transcript\", \"video transcript\", \"watch summary\".",

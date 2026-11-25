@@ -33,3 +33,8 @@ The credential helpers support macOS and Linux without separate platform forks.
 platform; the full tooling suite additionally needs Linux for agent-coord.
 `cli-launchers` and `hf-op` retain the shared standalone launchers and Hugging Face
 token wrapper; `npm run tools:test:launchers` exercises them without real agents or credentials.
+
+`pr-coord` is opt-in. Keep real project settings in `~/.config/pr-coordinator/`
+and datasets in `~/.local/state/pr-coordinator/`; only the example configuration
+belongs in this repo. Test landing changes using local Git and fake `gh`, never a
+live project.

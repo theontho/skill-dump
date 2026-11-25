@@ -1,0 +1,150 @@
+# Copy outside the repository to ~/.config/pr-coordinator/<project>.toml.
+# Hooks are trusted argv arrays, not shell fragments. Empty optional hooks are skipped.
+[github]
+repo = "example/project"
+owner = "owner-login"
+tracked_authors = ["owner-login", "app/dependabot"]
+base_branch = "main"
+remote = "origin"
+
+[paths]
+checkout = "~/src/project"
+worktree_root = "~/src/worktrees"
+worktree_pattern = "pr-{pr}"
+cert_pattern = "cert-pr-{pr}"
+# data_dir = "~/.local/state/pr-coordinator/project"
+
+[dashboard]
+host = "127.0.0.1"
+port = 8787
+allow_answers = false
+headline_hours = 24
+# headline_since = "2026-01-01T00:00:00Z"
+# runner_limit = 20
+
+[labels]
+priority = "priority"
+hands_off = "hands-off"
+land_asap = "land-asap"
+machine_prefix = "machine-"
+
+[lane]
+generated = ['generated/.*', 'tools/regenerate\.py']
+priority = []
+top = []
+hold_seconds = 7200
+
+[landing]
+merge_flags = ["--squash", "--auto"]
+required_checks = ["required"]
+aggregate_checks = ["required"]
+require_approval = false
+yield_grace_minutes = 3
+# The readiness gate receives gh's JSON over stdin and should check run metadata,
+# ready transitions, and the current head; zero means ready.
+# pr_checks_ready = ["python3", "scripts/pr_checks_ready.py", "--pr", "{pr}"]
+# ci_capacity = ["python3", "scripts/ci_capacity.py", "--wait"]
+quick_tests = ["tests/test_interface.py"]
+quick_gate = ["python3", "-m", "pytest", "-q"]
+# quick_host = "worker"
+# quick_local_prefix = ["agent-coord", "run", "--cores", "2", "--mem", "4G", "--",]
+# provision = ["./scripts/prepare", "--locked"]
+# regenerate = ["./scripts/regenerate"]
+
+[events]
+interval = 90
+ignored_check_prefixes = ["local-ci/", "rerun"]
+
+[loops]
+supervise_seconds = 300
+collect_seconds = 60
+
+[hosts.controller]
+display = "Controller"
+description = "POSIX controller"
+checkout = "~/src/project"
+platform = "linux-x64"
+cores = 8
+roles = ["coordinator", "certification"]
+windows = false
+agent_coord = true
+slots = 1
+
+[hosts.controller.junit]
+cert_worktrees = ["~/src/project", "~/src/worktrees/cert-pr-*"]
+cert_xml = "out/certify/*/*/*.xml"
+cert_log = "out/certify/*/*/run.log"
+# cert_result_marker = "CERTIFICATION_RESULT"
+
+[hosts.worker]
+ssh = "worker-alias"
+checkout = "~/src/project"
+platform = "linux-x64"
+cores = 8
+roles = ["certification", "rt"]
+windows = false
+agent_coord = true
+slots = 1
+rt = true
+cert_priority = "linux"
+rt_prefix = ["agent-coord", "run", "--cores", "2", "--mem", "4G", "--"]
+# cert_prepare/cert_cleanup override the shared hooks on this host.
+
+[hosts.worker.junit]
+cert_worktrees = ["~/src/project/scratch/certify-*"]
+rt_worktrees = ["~/src/project/scratch/rt-*"]
+rt_xml = "out/**/*.xml"
+
+[certification]
+default_targets = ["generic", "linux"]
+must_run = ["generic"]
+slot_timeout = 2700
+status_prefix = "local-ci/"
+local_command = ["just", "certify"]
+# remote_config = "~/.config/pr-coordinator/remote-hosts.toml"
+# remote_command = ["just", "certify", "--remote", "{host}", "--remote-config", "{remote_config}"]
+# environments = ["./scripts/cert-envs", "{base}", "{sha}", "{platform}", "{layer}"]
+# controller_prepare = ["./scripts/provision"]
+# local_prepare = ["./scripts/prepare-cert", "{envs}"]
+# remote_prepare = ["prepare-cert", "{sha}", "{base}", "{remote_worktree}", "{envs}"]
+# remote_cleanup = ["cleanup-cert", "{remote_worktree}"]
+# cancel_process_matches = ["your-cert-controller"]
+# notify = ["agent-coord", "send", "--to", "coordinator", "{message}"]
+generic_args = ["--generic-only"]
+linux_args = ["--platform-only"]
+
+[certification.layers]
+linux = "platform"
+
+[certification.slots]
+generic = ["controller"]
+linux = ["worker", "controller"]
+
+[remote_tests]
+# This hook runs on the target and must create the exact-SHA worktree before rsync.
+# prepare = ["prepare-rt", "{host_checkout}", "{remote_worktree}", "{sha}"]
+# envs = "default dev"
+# provision = ["provision-rt", "{envs}"]
+excludes = [".git", "out", ".venv", "node_modules", "target", ".env*"]
+
+[tests]
+activity_days = 7
+report_days = 14
+artifact_pattern = 'junit-(.+)'
+artifact_xml_names = ["junit.xml"]
+test_roots = ["tests"]
+test_file_pattern = 'tests/(?:[^/]+/)*test_[^/]+\.py'
+source_roots = ["src", "scripts"]
+nightly_workflows = ["nightly.yml"]
+release_workflows = ["release.yml"]
+release_always = ["release.yml"]
+suite_workflows = ["nightly.yml"]
+priority_workflows = ["checks.yml"]
+# tiers_command = ["python3", "scripts/classify_tests.py"]
+
+[tests.hosted_workflows."checks.yml"]
+pull_request = "ready"
+merge_group = "queue"
+
+[tests.hosted_workflows."nightly.yml"]
+schedule = "nightly"
