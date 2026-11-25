@@ -768,6 +768,41 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(3, agent="c")["state"], "granted")
         self.assertEqual(self.ask(1, agent="d")["state"], "waiting")  # c warms up
 
+    def measure_leases(self, usage, busy=None):
+        """Two ticks with each lease pid using usage[pid] cores (no real pids
+        are signalled: cpu_seconds is looked up in a dict)."""
+        cpu = {pid: 0.0 for pid in usage}
+        self.c.cpu_seconds = cpu.get
+        self.busy = self.c.busy = sum(usage.values()) if busy is None else busy
+        with patch.object(ac.time, "monotonic", return_value=1000) as clock:
+            self.c.tick()
+            clock.return_value += 4
+            for pid, cores in usage.items():
+                cpu[pid] += cores * 4
+            self.c.tick()
+
+    def test_exclusive_lock_lease_is_not_counted_twice(self):
+        # The stall: an 8-core GPU timing run (headroom 1) measured at 8.5 of
+        # 12 cores was counted at 8.5 measured + 8 reserved = 16.5, so nothing
+        # (not even 2 cores) was admitted beside it for the whole run.
+        self.configure(cores=12, mem=58)
+        timed = self.ask(8, agent="perf", exclusive_locks=["gpu"], headroom=1)
+        self.age(timed, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 8.5})
+        status = self.c.handle({"op": "status"})
+        self.assertAlmostEqual(status["free"]["cores"], 4.0, places=1)
+        self.assertFalse(self.c.handle({"op": "check", "cores": 4, "mem": GIB})["ok"])
+        self.assertTrue(self.c.handle({"op": "check", "cores": 3, "mem": GIB})["ok"])
+        waiting = self.ask(4, agent="cpu4")
+        self.assertEqual(waiting["state"], "waiting")
+        self.release(waiting)
+        self.assertEqual(self.ask(3, agent="cpu3")["state"], "granted")
+        # Load beside it still counts: 2 more cores busy elsewhere.
+        self.release(self.c.state["leases"][-1])
+        self.measure_leases({os.getpid(): 8.5}, busy=10.5)
+        self.assertFalse(self.c.handle({"op": "check", "cores": 2, "mem": GIB})["ok"])
+        self.assertTrue(self.c.handle({"op": "check", "cores": 1, "mem": GIB})["ok"])
+
     def test_exclusive_lock_and_exclusive_together_are_refused(self):
         self.assertIn("error", self.ask(1, exclusive=True, exclusive_locks=["gpu"]))
 
