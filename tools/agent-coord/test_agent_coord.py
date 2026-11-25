@@ -879,17 +879,30 @@ class CoordinatorTest(unittest.TestCase):
         self.assertAdmissible(2.0)
 
     def test_nested_exclusive_lock_leases_are_measured_once(self):
-        # Two timing leases, the inner one in the outer's tree (whose
-        # measurement includes it): neither is subtracted twice.
+        # Two timing leases, the inner one in the outer's tree: the outer
+        # tree's measurement includes the inner one (6 + 2 = 8). Per
+        # outermost tree, its use up to both sizes comes off, once.
         outer = os.getpid()
         self.timed(size=6, headroom=0, pid=outer)
         inner = self.ask(2, agent="perf", exclusive_locks=["nas"], pid=os.getppid())
         self.age(inner, ac.WARMUP + 1, "granted")
-        self.measure_leases({outer: 6.0, os.getppid(): 2.0}, busy=7.0,
+        self.measure_leases({outer: 8.0, os.getppid(): 2.0}, busy=9.0,
                             trees={outer: {outer, os.getppid()}})
-        # 6 + 2 reserved; 7 busy less the outer tree's 6: 1 of other work.
+        # 6 + 2 reserved; 9 busy less the tree's 8: 1 of other work.
         self.assertAlmostEqual(self.free_cores(), 3.0, places=1)
 
+    def test_process_trees_are_walked_only_for_leases_counted_once(self):
+        calls = []
+        self.configure(cores=12, mem=58, footprint=lambda pid: GIB)  # in use: no IO hint
+        for pid in (os.getpid(), os.getppid()):
+            self.age(self.ask(3, pid=pid), ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 1.0, os.getppid(): 1.0})
+        self.c.tree_pids = lambda pid: calls.append(pid) or {pid}
+        self.c.tick()
+        self.assertEqual(calls, [])  # ordinary leases only: no walk
+        self.ask(2, agent="perf", exclusive_locks=["gpu"])
+        self.c.tick()
+        self.assertTrue(calls)
     def test_a_ramping_exclusive_lock_lease_is_not_over_subtracted(self):
         # Its own use is smoothed from zero like the host figure, so while it
         # ramps up it never takes more out of the busy figure than that holds.
@@ -2294,79 +2307,64 @@ class RealScopeTest(unittest.TestCase):
             subprocess.run(["systemctl", "--user", "stop", scope], capture_output=True)
 
 
-class SameAsMainWithoutExclusiveLeasesTest(unittest.TestCase):
-    """Without exclusive-lock leases, admission decides exactly as main's
-    code (the merge base with origin/main) on the same random workloads."""
+class OrdinaryWorkloadInvariantTest(unittest.TestCase):
+    """Fixed-only workloads from one project (no --exclusive-lock, no
+    MIN:MAX, one project, so the reserve never applies) are admitted as
+    before this change: on random sequences, every term it adds is zero at
+    every step. Replaces comparing with main's code through git, which
+    stops meaning anything once merged."""
 
-    @classmethod
-    def setUpClass(cls):
-        here = Path(__file__).resolve().parent
-        try:
-            base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=here,
-                                  capture_output=True, text=True, check=True, timeout=10).stdout.strip()
-            top = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=here,
-                                 capture_output=True, text=True, check=True, timeout=10).stdout.strip()
-            source = subprocess.run(["git", "show", f"{base}:{top}agent_coord.py"], cwd=here,
-                                    capture_output=True, text=True, check=True, timeout=10).stdout
-        except (OSError, subprocess.SubprocessError) as e:
-            raise unittest.SkipTest(f"main's agent_coord.py is not available: {e}")
-        cls.tmp = tempfile.TemporaryDirectory()
-        path = Path(cls.tmp.name, "main_agent_coord.py")
-        path.write_text(source)
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("main_agent_coord", path)
-        cls.main = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.main)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.tmp.cleanup()
-
-    def test_random_workloads_decide_as_on_main(self):
+    def test_new_terms_are_zero_for_fixed_only_single_project_workloads(self):
         import random
         pids = [os.getpid(), os.getppid()]
         for seed in range(60):
             rng = random.Random(seed)
             env = {"busy": 0.0, "now": 100000.0, "mono": 1000.0, "cpu": {pid: 0.0 for pid in pids}}
+            resized = []
             with tempfile.TemporaryDirectory() as tmp, \
                     patch("time.time", side_effect=lambda: env["now"]), \
                     patch("time.monotonic", side_effect=lambda: env["mono"]):
-                coordinators = [
-                    module.Coordinator(
-                        Path(tmp, name, "state.json"),
-                        measure=lambda: {"vms": [], "busy": env["busy"], "available": 64 * GIB},
-                        cap=lambda: (12.0, 58 * GIB), footprint=lambda pid: 0,
-                        cpu_seconds=lambda pid: env["cpu"].get(pid))
-                    for module, name in ((self.main, "main"), (ac, "branch"))]
+                c = ac.Coordinator(
+                    Path(tmp, "state.json"),
+                    measure=lambda: {"vms": [], "busy": env["busy"], "available": 64 * GIB},
+                    cap=lambda: (12.0, 58 * GIB), footprint=lambda pid: 0,
+                    cpu_seconds=lambda pid: env["cpu"].get(pid),
+                    resize=lambda scope, cores: resized.append(scope) or True)
                 for step in range(40):
                     op = rng.random()
                     if op < 0.45:
-                        request = {"op": "acquire", "agent": f"a{rng.randrange(3)}",
-                                   "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6]),
-                                   "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
-                                   "expect": rng.choice([60, 600, 3600]),
-                                   "headroom": rng.choice([0, 0, 0, 1, 2]),
-                                   "locks": rng.choice([[], [], ["nas"]]),
-                                   "io": rng.random() < 0.1}
-                        replies = [c.handle(dict(request)) for c in coordinators]
+                        c.handle({"op": "acquire", "agent": f"a{rng.randrange(3)}",
+                                  "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6, 11]),
+                                  "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
+                                  "expect": rng.choice([60, 600, 3600]),
+                                  "headroom": rng.choice([0, 0, 0, 1, 2]),
+                                  "locks": rng.choice([[], [], ["nas"]]),
+                                  "io": rng.random() < 0.1, "running": rng.random() < 0.1})
                     elif op < 0.65:
-                        ids = [x["id"] for x in coordinators[0].state["leases"]
-                               + coordinators[0].state["queue"]]
+                        ids = [x["id"] for x in c.state["leases"] + c.state["queue"]]
                         if ids:
-                            victim = rng.choice(ids)
-                            replies = [c.handle({"op": "release", "id": victim}) for c in coordinators]
+                            c.handle({"op": "release", "id": rng.choice(ids)})
                     else:
                         dt = rng.choice([2, 4, 15, 40])
                         env["now"] += dt
                         env["mono"] += dt
                         for pid in pids:
-                            env["cpu"][pid] += rng.uniform(0, 6) * dt
+                            env["cpu"][pid] += rng.uniform(0, 8) * dt
                         env["busy"] = rng.uniform(0, 12)
-                        for c in coordinators:
-                            c.tick()
-                    states = [([x["id"] for x in c.state["leases"]], [x["id"] for x in c.state["queue"]])
-                              for c in coordinators]
-                    self.assertEqual(states[0], states[1], f"seed {seed} step {step}")
+                        c.tick()
+                    where = f"seed {seed} step {step}"
+                    self.assertEqual(c._counted_once(), set(), where)
+                    self.assertEqual(c._net_busy(), max(0.0, c.busy), where)
+                    claims = sum(c._cpu_claim(x) for x in c.state["leases"])
+                    self.assertEqual(c._unleased(), max(0.0, c.busy - claims), where)
+                    self.assertEqual(c._eps(), 0.0, where)
+                    self.assertLessEqual(len(c._projects()), 1, where)
+                    for x in c.state["queue"]:
+                        self.assertIsNone(c._reserve_short(x), where)
+                        self.assertNotEqual((c._why(x) or ("",))[0], "reserve", where)
+                    self.assertEqual(resized, [], where)
+                    self.assertFalse([e for e in ac.read_history(0, Path(tmp, "history.jsonl"))
+                                      if e["event"] in ("resized", "unfair")], where)
 
 
 class FootprintTest(unittest.TestCase):

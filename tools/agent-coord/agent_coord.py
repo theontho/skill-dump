@@ -688,12 +688,12 @@ class Coordinator:
         _net_busy: a just-shrunk elastic lease's use still in the smoothed
         busy figure is its own, not someone else's. For every other lease,
         and a timing run, this is its claim, as on main."""
-        once, covered = self._counted_once(), self._covered()
+        once, outer_of = self._counted_once(), self._nesting()
         leased = 0.0
         for x in self.state["leases"]:
             claim = self._cpu_claim(x)
             own = self._own_cores.get(x["id"])
-            if own is not None and x["id"] in once and x["id"] not in covered:
+            if own is not None and x["id"] in once and x["id"] not in outer_of:
                 claim = max(claim, min(own, self._size_avg.get(x["id"], 0.0)))
             leased += claim
         return max(0.0, self.busy - sum(g["cores"] for g in self._vms()) - leased)
@@ -740,21 +740,34 @@ class Coordinator:
         full = self._full_ids()
         return sum(self._size(x) for x in leases if x["id"] in full)
 
-    def _covered(self) -> set[str]:
-        """Measured leases whose process is inside another measured lease's
-        tree (a lease started from within a lease, or two leases on one
-        pid): their use is already in the outer one's measurement."""
+    def _nesting(self) -> dict[str, str]:
+        """For each measured lease whose process is inside another measured
+        lease's tree (a lease started from within a lease, or two leases on
+        one pid), the outermost such lease: its measurement includes the
+        inner one's use."""
         measured = [x for x in self.state["leases"] if x["id"] in self._own_cores]
-        covered = set()
+        outer_of = {}
         for i, x in enumerate(measured):
             for j, outer in enumerate(measured):
                 if outer is x:
                     continue
                 tree = self._trees.get(outer["id"], {outer["pid"]})
                 if x["pid"] in tree and (x["pid"] != outer["pid"] or j < i):
-                    covered.add(x["id"])
+                    outer_of[x["id"]] = outer["id"]
                     break
-        return covered
+        for inner in list(outer_of):
+            root, seen = outer_of[inner], {inner}
+            while root in outer_of and root not in seen:
+                seen.add(root)
+                root = outer_of[root]
+            outer_of[inner] = root
+        return outer_of
+
+    def _once_cap(self, x: dict) -> float:
+        """How much of a counted-once lease's measured use is its own: its
+        size, or the size it had over the smoothing window (a shrink is not
+        yet out of the busy figure either)."""
+        return max(self._size(x), self._size_avg.get(x["id"], 0.0))
 
     def _counted_once(self) -> set[str]:
         """Leases reserved at their full size all along, whose own measured
@@ -772,14 +785,19 @@ class Coordinator:
         Lease use is smoothed like the busy figure, and counted once per
         process tree."""
         once = self._counted_once()
-        covered = self._covered()
+        outer_of = self._nesting()
+        caps = {x["id"]: self._once_cap(x) for x in self.state["leases"] if x["id"] in once}
+        inside: dict[str, float] = {}  # counted-once leases nested in each outermost tree
+        for inner, root in outer_of.items():
+            if inner in caps:
+                inside[root] = inside.get(root, 0.0) + caps[inner]
         net = self.busy
         for x in self.state["leases"]:
             own = self._own_cores.get(x["id"])
-            if own is not None and x["id"] in once and x["id"] not in covered:
-                # Up to its size, or the size it had over the smoothing window
-                # (a shrink is not yet out of the busy figure either).
-                net -= min(own, max(self._size(x), self._size_avg.get(x["id"], 0.0)))
+            if own is not None and x["id"] in once and x["id"] not in outer_of:
+                # Per outermost tree: its use, up to the sizes of the
+                # counted-once leases in it.
+                net -= min(own, caps[x["id"]] + inside.get(x["id"], 0.0))
         return max(0.0, net)
 
     def _warming(self) -> list[dict]:
@@ -1880,10 +1898,13 @@ class Coordinator:
             targets = [(x["id"], x["pid"]) for x in self.state["leases"]
                        if x.get("io") or x.get("exclusive_locks") or x.get("min_cores")
                        or (x["cores"] >= 2 and not x.get("io_hint"))]
+            walk = any(x.get("exclusive_locks") or x.get("elastic") for x in self.state["leases"])
         now = time.monotonic()
         by_pid = {pid: self.cpu_seconds(pid) for pid in {pid for _, pid in targets}}
+        # Process trees matter only for leases counted once: walk them only
+        # when one exists (and more than one lease is measured).
         trees = {pid: (self.tree_pids or tree_pids)(pid) for pid in by_pid
-                 if by_pid[pid] is not None} if len(targets) > 1 else {}  # fmt: skip
+                 if by_pid[pid] is not None} if len(targets) > 1 and walk else {}  # fmt: skip
         samples = {lease_id: by_pid[pid] for lease_id, pid in targets if by_pid[pid] is not None}
         with self.lock:
             self._trees = {lease_id: trees[pid] for lease_id, pid in targets if pid in trees}
