@@ -408,7 +408,8 @@ def cert_pr_main():
     from worktrees import prepare
 
     sha = pr["headRefOid"]
-    with locked(f"cert-pr-{args.pr}.lock", wait=False):
+    # Per head: a push while an older head certifies must start the new head (the old run is superseded).
+    with locked(f"cert-pr-{args.pr}-{sha}.lock", wait=False):
         with locked(f"worktree-pr-{args.pr}.lock"):
             wt = prepare(args.pr, pr, "cert")
         prep = P.command(

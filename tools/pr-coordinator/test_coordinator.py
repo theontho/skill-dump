@@ -246,6 +246,25 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             self.assertFalse(drafts.complete((True, {"local-ci/generic": "error"}, False)))
             self.assertFalse(drafts.complete((True, {**ok, "local-ci/windows-x64": "pending"}, False)))
 
+    def test_certification_of_an_older_head_does_not_count_for_the_new_head(self):
+        import fcntl
+
+        import drafts
+
+        locks = self.root / "locks"
+        locks.mkdir()
+
+        class Data:
+            data = self.root
+
+        old, new = "a" * 40, "b" * 40
+        with (locks / f"cert-pr-7-{old}.lock").open("a") as held, mock.patch.object(
+            drafts, "P", Data()
+        ), mock.patch("runtime.P", Data()):
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertTrue(drafts.running_certs(7, old))
+            self.assertFalse(drafts.running_certs(7, new))
+
     def fake_draft(self, head, *, statuses, review_head=None):
         state = self.root / "ready"
         review = {

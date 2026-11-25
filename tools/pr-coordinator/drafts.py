@@ -49,7 +49,7 @@ def handoff_worktree(pr, head):
 
 def running_certs(pr, head):
     try:
-        with locked(f"cert-pr-{pr}.lock", wait=False):
+        with locked(f"cert-pr-{pr}-{head}.lock", wait=False):
             pass
     except BlockingIOError:
         return True
