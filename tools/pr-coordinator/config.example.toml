@@ -114,6 +114,11 @@ rt_xml = "out/**/*.xml"
 default_targets = ["generic", "linux"]
 must_run = ["generic"]
 slot_timeout = 2700
+# Controller output meaning "host busy, try later" (a lock taken outside these slots): wait and
+# retry up to busy_retries times, busy_retry_seconds apart, instead of recording an error.
+busy_markers = ["No available certification host"]
+busy_retries = 20
+busy_retry_seconds = 120
 status_prefix = "local-ci/"
 local_command = ["just", "certify"]
 # remote_config = "~/.config/pr-coordinator/remote-hosts.toml"

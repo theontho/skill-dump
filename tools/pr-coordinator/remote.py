@@ -206,7 +206,7 @@ def cert_args(wt, pr, target, sha, base, host):
     )
 
 
-def certify(wt, pr, target, sha, base):
+def certify(wt, pr, target, sha, base, _attempt=0):
     slots = P.get("certification", "slots", {}).get(target, [])
     if not slots:
         raise ValueError(f"no hosts configured in certification.slots.{target}")
@@ -288,6 +288,7 @@ def certify(wt, pr, target, sha, base):
         command += P.command("certification", target + "_args", **ctx)
         command += P.expand(P.hosts[host].get("cert_args", []), **ctx)
         log_path = path / f"cert-{pr}-{target}-{short}.log"
+        start = log_path.stat().st_size if log_path.exists() else 0
         code = 1
         with log_path.open("a", encoding="utf-8") as log:
             output = dict(stdout=log, stderr=subprocess.STDOUT)
@@ -331,6 +332,22 @@ def certify(wt, pr, target, sha, base):
                         code = code or 1
                 print(f"\nEXIT {code}", file=log)
         text = log_path.read_text(encoding="utf-8", errors="replace")
+        # The project's controller may refuse a host it finds busy (e.g. a lock taken outside these slots):
+        # wait for it instead of reporting an error.
+        busy = code != 0 and any(
+            marker in text[start:]
+            for marker in P.get("certification", "busy_markers", [])
+        )
+        if busy and _attempt < P.get("certification", "busy_retries", 20):
+            status("queued")
+            record("log", f"PR #{pr}: {target} cert host {host} busy; retrying")
+            retry = True
+        else:
+            retry = False
+    if retry:
+        time.sleep(P.get("certification", "busy_retry_seconds", 120))
+        return certify(wt, pr, target, sha, base, _attempt + 1)
+    with ExitStack():
         failure = any(
             marker in text
             for marker in P.get("certification", "test_failure_markers", [])

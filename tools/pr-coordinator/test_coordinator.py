@@ -146,6 +146,59 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
         self.assertIn("<div class=qtext>Done?\nyes</div>", html)
         self.assertIn("white-space:pre-wrap", html)
 
+    def test_certification_waits_when_the_controller_finds_the_host_busy(self):
+        import contextlib
+
+        import remote
+
+        calls, states = [], []
+
+        class FakeProject:
+            data = self.root
+            hosts = {"worker": {"slots": 1}}
+
+            def get(self, section, key, default=None):
+                return {
+                    "slots": {"generic": ["worker"]},
+                    "busy_markers": ["No available certification host"],
+                    "test_failure_markers": ["failed tests"],
+                }.get(key, default)
+
+            def command(self, section, key, *, default=(), **values):
+                return ["certify"] if key == "local_command" else []
+
+            def expand(self, argv, **values):
+                return list(argv)
+
+            def ssh(self, key):
+                return None
+
+        def fake_run(argv, *, stdout=None, **kwargs):
+            calls.append(argv)
+            busy = len(calls) == 1
+            stdout.write("No available certification host\n" if busy else "ok\n")
+            stdout.flush()
+            return subprocess.CompletedProcess(argv, 1 if busy else 0)
+
+        def fake_record(kind, *args):
+            if kind == "cert-state":
+                states.append(args[1])
+
+        with mock.patch.object(remote, "P", FakeProject()), mock.patch.object(
+            remote, "locked", lambda *a, **k: contextlib.nullcontext()
+        ), mock.patch.object(remote, "run", fake_run), mock.patch.object(
+            remote, "record", fake_record
+        ), mock.patch.object(
+            remote, "json_gh", lambda *a: {"headRefOid": "a" * 40}
+        ), mock.patch.object(
+            remote, "cert_args", lambda *a: {}
+        ), mock.patch.object(remote.time, "sleep"):
+            code = remote.certify(self.root, 7, "generic", "a" * 40, "b" * 40)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("error", states)
+        self.assertEqual(states[-1], "pass")
+
     def fake_draft(self, head, *, statuses, review_head=None):
         state = self.root / "ready"
         review = {
