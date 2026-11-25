@@ -340,6 +340,81 @@ print(refresh(7, Path(sys.argv[3]), 'feature'))
                 )
             )
 
+    def test_queue_rebuild_retry_waits_for_hold_and_never_uses_a_different_head(self):
+        state = self.root / "enqueue"
+        gh = self.root / "gh"
+        gh.write_text(
+            f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+kind, action, *rest = sys.argv[1:]
+head = os.environ["TEST_PR_HEAD"]
+p = Path({str(state)!r})
+if kind == "pr" and action == "view":
+    data = {{"state": "MERGED" if p.exists() else "OPEN", "headRefOid": head}}
+elif kind == "api" and action == "graphql":
+    pull = {{"mergeQueueEntry": None, "isDraft": False, "baseRefName": "trunk",
+        "state": "OPEN", "author": {{"login": "owner"}}, "isCrossRepository": False,
+        "labels": {{"nodes": [], "pageInfo": {{"hasNextPage": False}}}},
+        "reviewThreads": {{"nodes": [], "pageInfo": {{"hasNextPage": False}}}},
+        "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": None,
+        "timelineItems": {{"nodes": [{{"reason": "failed_checks", "createdAt": "2026-01-01T00:00:00Z"}}]}}}}
+    data = {{"data": {{"repository": {{"pullRequest": dict(pull, headRefOid=head)}}}}}}
+elif kind == "run" and action == "list":
+    data = [{{"databaseId": 10, "headBranch": "gh-readonly-queue/trunk/pr-7-a"}}]
+elif kind == "run" and action == "view":
+    data = {{"jobs":[{{"name":"test", "conclusion":"cancelled"}}]}}
+elif kind == "pr" and action == "checks":
+    data = [{{"name":"required", "bucket":"pass"}}]
+elif kind == "pr" and action == "merge":
+    p.write_text(rest[rest.index("--match-head-commit") + 1])
+    data = {{}}
+else:
+    raise SystemExit(f"unexpected fake gh invocation: {{sys.argv}}")
+print(json.dumps(data))
+"""
+        )
+        gh.chmod(0o700)
+        source = """
+import sys
+from unittest.mock import patch
+from pathlib import Path
+import runtime
+runtime.P = runtime.Project('gadgets', config_file=Path(sys.argv[1]), data_dir=Path(sys.argv[2]))
+runtime.P.prepare()
+import train
+hold = runtime.P.data / "locks/hold"
+hold.touch()
+def clock(_):
+    hold.unlink(missing_ok=True)
+with patch.object(train.time, "sleep", side_effect=clock):
+    print(train.wait_merged_or_removed(7, "expected", "2026-01-01T00:00:00Z"))
+"""
+        for head in ("expected", "changed"):
+            result = subprocess.run(
+                [sys.executable, "-c", source, str(self.config), str(self.data)],
+                cwd=TOOL,
+                env={
+                    **self.env,
+                    "TEST_PR_HEAD": head,
+                    "PATH": f"{self.root}{os.pathsep}{self.env.get('PATH', os.defpath)}",
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if head == "expected":
+                self.assertEqual(state.read_text(), "expected")
+                self.assertEqual(result.stdout.strip(), "True")
+                state.unlink()
+            else:
+                self.assertFalse(state.exists())
+                self.assertEqual(result.stdout.strip(), "False")
+                rows = json.loads((self.data / "agent_questions.json").read_text())
+                self.assertIn("could not safely enqueue", rows[0]["question"])
+
     def test_source_conflict_aborts_and_routes_to_coordinator(self):
         remote, head = self.create_git("source.txt")
         self.assertEqual(self.refresh(), "None")
