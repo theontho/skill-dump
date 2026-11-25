@@ -21,7 +21,12 @@ is the same file, installed as `~/.local/bin/agent-coord` by `skill-dump install
 agent-coord status                       # who holds what, the line, what is free
 agent-coord check --cores 4 --mem 8G     # exit 0 if it would start now
 
-# Heavy job: waits in line, then runs capped at 4 cores / 8G, nice 19, idle IO.
+# Heavy job, elastic: starts once 2 cores are free, with up to 8 if free; may
+# be shrunk toward 2 and grow back while it runs (nice 19, idle IO).
+agent-coord run --cores 2:8 --mem 8G --label "full test suite" -- \
+    sh -c 'make -j"$COMPUTE_LEASE_CORES" test'
+
+# Fixed size (never resized): waits for 4 cores, runs capped at 4 cores / 8G.
 agent-coord run --cores 4 --mem 8G --label "ultima chr20 realign" -- \
     wgsextract realign --threads 4 ...
 
@@ -62,12 +67,13 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   themselves.
 - **CPU is admitted on measured use**: host-wide busy cores (smoothed over ~10 s),
   plus each non-IO lease started in the last minute at its full size while it ramps up.
-  An `--exclusive-lock` lease counts once: its own measured use, up to its
-  size (smoothed like the busy figure, from zero, and counted once when one
-  lease runs inside another's process tree), is taken out of the busy cores,
-  so only the rest of the load counts beside its full size. Use above its size
-  (a job in its tree but in a scope of its own, an uncapped hold) still counts
-  as load.
+  `--exclusive-lock` leases, and elastic leases at their grant, count once:
+  their own measured use, up to their size (smoothed like the busy figure,
+  from zero, so a shrink leaves it as the busy figure does; counted once when
+  one lease runs inside another's process tree), is taken out of the busy
+  cores, so only the rest of the load counts beside their full size. Use above
+  their size (a job in the tree but in a scope of its own, an uncapped hold)
+  still counts as load. Warming leases are counted as before.
   Leases usually use less than they ask, and sharing CPU only slows jobs a
   little, since each is capped at its size at nice 19. CPU should therefore stay
   busy, not idle behind reservations. Time spent waiting on disk is not CPU use.
@@ -100,8 +106,9 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   options (`-o`, `--outdir`, `-T`, `--tmp-dir`, ...), are on it; reading inputs
   from it is fine. Active work goes on the SSDs (`/home`, `/mnt/Windows`).
   `--allow-archive` overrides, e.g. to archive a finished result.
-- First come, first served: nothing overtakes the request at the head of the
-  line, so big jobs are not starved, with these exceptions for requests that fit now:
+- First come, first served (across projects too): nothing overtakes the request
+  at the head of the line, so big jobs are not starved, with these exceptions
+  for requests that fit now:
   - **EASY backfill past a capacity wait**: a later job that fits now may start
     if its expected end precedes the head's projected start, or if it leaves
     enough cores, memory and headroom for the head at that time. Remaining
@@ -169,17 +176,207 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   under the same accounting. IO jobs can still burst up to their cap.
 - A lease ends when its process exits; dead holders and waiters are dropped.
 
+## Elastic leases, projects and the reserve
+
+In short: **use `--cores MIN:MAX` for everything except timing runs.** Elastic
+jobs share the machine fairly between active projects and can use every core
+when the others are idle. Fixed and exclusive jobs are never shrunk. A project
+alone on the machine runs fixed jobs exactly as before; while another project
+is active, one project's fixed and timing jobs are capped at all cores minus a
+small reserve, and a project that runs only fixed jobs gets no fair-share
+protection: it gets cores only as they free up.
+
+### Elastic leases
+
+`run --cores MIN:MAX` asks for at least MIN cores and at most MAX (clamped to the
+machine). It is admitted as soon as MIN fits; the line's backfill and `--expect`
+projections count it at MIN. It starts with as many cores up to its target as
+are not granted to anyone (grants, fixed sizes, load outside leases, headroom)
+and not needed by requests waiting for CPU behind it; its target is MAX within
+its project's fair share. At least MIN.
+
+The command runs in a systemd scope the service names
+(`agent-coord-LEASE-CLIENTPID.scope`). **The service resizes it itself**, with
+`systemctl --user set-property --runtime SCOPE CPUQuota=N%` (5 s timeout), on a
+worker thread so that a slow user bus never holds up other requests:
+
+- A shrink counts only after the call succeeded (a request waiting for those
+  cores starts then, usually within a second); a growth counts at once and is
+  taken back if the call fails.
+- A lease is resized only after its `run` client reported that its command
+  runs in the scope (or 60 s after its grant if the client never does).
+- A failed call is retried after 30 s, then 60 s; after 3 failures in a row the
+  lease is fixed at the size it has (`status`: "fixed: scope not resizable",
+  and its holder is told). Meanwhile preemption uses other leases.
+- The service acts only on scopes it named, by that exact name; it never
+  signals a process. Without a systemd user session a MIN:MAX request gets one
+  size at its start and keeps it.
+
+An elastic lease counts at its grant (its own measured use is taken out of the
+host's busy cores), like a timing run; idle shrink keeps grants near real use.
+
+- **Preemption.** A request that waits only for CPU (cores or headroom) and is
+  allowed to start at its place in line (the head, or a request the backfill
+  rules let pass; behind a lock-waiting head, also leaving that head its room)
+  shrinks running elastic leases until it fits:
+  - other projects' elastic leases, only while the requesting project stays
+    within its entitlement: its fair share, and at least `reserve_cores`. So
+    asking for a big fixed size never gets a project more than asking MIN:MAX:
+    on 12 cores with another project's busy 2:12 at 12, a fixed 10 waits ("other
+    projects' elastic leases are shrunk only to give project B its fair share
+    (6 of 12 cores) ... --cores MIN:MAX would start now") while a 2:10 starts at
+    6 and the other lease is shrunk to 6. The project furthest over its share
+    gives first, then the lease with the largest surplus over its MIN;
+  - the requesting project's own elastic leases, toward MIN, only as far as it
+    needs to reach its MIN or fixed size.
+
+  Nothing changes unless the request then fits. Never below MIN; fixed, `--io`
+  and timing leases (`--exclusive`, `--exclusive-lock`, `--headroom`) are never
+  shrunk; nothing is killed. A shrunk lease's holder gets an inbox note. A
+  MIN:MAX request that would start below its target shrinks others the same
+  way before it starts.
+- **Evening out.** About once a minute, a busy elastic lease of a project under
+  its share takes cores from elastic leases of projects over theirs.
+- **Idle shrink.** Using under half its grant for 2 minutes, an elastic lease
+  is offered down to max(MIN, ceil(peak use / 0.7)).
+- **Growth.** Using at least 75% of its grant, it grows toward MAX when nothing
+  waits for cores, into cores that are neither measured busy nor granted to
+  anyone: every such core up to its project's share, then keeping a core
+  free. At most one change a minute per lease, except when preempted.
+- **The command learns its grant** from `COMPUTE_LEASE_CORES` at start, and
+  from `COMPUTE_LEASE_FILE`, rewritten atomically (temp file + rename) after
+  every change: line 1 is the whole cores to use now (at least 1), line 2 a
+  JSON object with `lease`, `min`, `max`, `granted`, `reason` and `time`
+  (`read -r cores < "$COMPUTE_LEASE_FILE"`). Polling this file is the
+  recommended way to follow changes; the scope is already capped by then, so a
+  command that ignores it is throttled, not broken. `COMPUTE_LEASE_MIN` and
+  `COMPUTE_LEASE_MAX` are set too. The `run` client's follower only reads the
+  grant and rewrites the file; nothing in the lease depends on it, and it
+  survives errors. The client removes the file when the command ends; the
+  service removes files of dead clients at start.
+- **`--notify-signal`** also sends SIGUSR1 to the process `run` started (only
+  that pid, from its own `Popen`; never a process group) after each change.
+  SIGUSR1 terminates a process that has not installed a handler: a command
+  still starting, or a wrapper such as `sh -c`, `make` or `uv run`, is killed by
+  it. Use it only for programs that handle SIGUSR1 from their first moment.
+
+Memory stays fixed (`--mem`): it cannot be taken back safely.
+
+### Projects and fair shares
+
+Each lease belongs to a project: the git repository `run` or `check` is called
+in (for `hold`, the held process's working directory where readable), named
+after its main checkout's folder, so all worktrees of one repository are one
+project (`git rev-parse --git-common-dir`). Outside git it is the agent name.
+`--project NAME` counts as its own project only if NAME is listed under
+`[projects.NAME]` in the config; otherwise it shares its repository's project,
+so inventing names gains nothing. Two repositories in folders of the same name
+are one project unless one of them uses a configured name. Requests from older
+clients count under the name they give, or `default`. A project is active while
+it has a running or waiting lease; idle projects claim nothing.
+
+Each active project's **fair share** is cores x weight / (sum of the active
+projects' weights), weight 1 by default. Shares decide how far a waiting
+request may shrink other projects' elastic leases, how big a MIN:MAX lease
+starts and how elastic leases even out. They do not reorder the line, which
+stays first come, first served with the backfill rules above.
+
+### The reserve
+
+While **another project is active**, a project's **non-preemptible** cores
+may not exceed the machine's cores minus `reserve_cores` (2). They are counted
+the way admission counts them: elastic leases at their MIN; timing runs
+(`--exclusive-lock`, `--headroom`) at size plus headroom; `--io` leases at
+measured use; ordinary fixed leases at their size while they warm up, then at
+measured use (at most their size). A project alone on the machine is not
+capped: its fixed jobs are admitted exactly as before.
+
+- A request that would take its project past the cap waits for its own
+  project's leases, with a reason that says so. It does not hold back other
+  projects' requests: they pass it by the ordinary rules (as they pass a stuck
+  request).
+- A timing run whose size plus headroom alone exceeds the cap (10 + 1 on 12
+  cores), or a MIN that does, is refused at once with a message naming
+  `reserve_cores` and the ways out (`--cores MIN:MAX`, whole-machine
+  `--exclusive`, or a lower `reserve_cores`). A plain fixed request that big
+  is not refused: it can run while its project is alone. A waiting request
+  that becomes too big (a config change) is refused if its client is current;
+  an older client's request keeps waiting, and others pass it.
+- When another project arrives while one holds fixed leases above the cap,
+  nothing is shrunk or killed: the newcomer gets what is free and what elastic
+  leases give back; `status` marks the fixed leases (over the cap, holding the
+  newcomer back), and no new fixed lease of the first project starts until it
+  is back under.
+- Whole-machine `--exclusive` keeps its own rules and is exempt.
+  `reserve_cores = 0` turns the rule off.
+
+What it guarantees: while several projects are active, the one holding the
+most non-preemptible cores leaves at least `reserve_cores` cores that are free
+or held by elastic leases above MIN, for all the other projects together (one
+pool, not one per project). A project asking for that many can use them
+through the ordinary line rules, by preemption if need be.
+
+What it does not guarantee: another project may already hold the pool (an
+elastic lease gives back only down to its MIN: beside an 8-core timing run with
+headroom 1, a 2:4 lease of one project can hold the 3 remaining cores, and a
+third project's 2-core request then waits for it; the waiting reason names it);
+several projects with fixed leases can between them fill the machine; fixed
+leases that were already running when another project arrived are not
+shrunk; a project that runs only fixed jobs gets cores only as they free up,
+never its fair share; and load outside leases still counts. When leases of
+other projects keep a waiting project below its share, its reason names them
+(fixed and timing ones "never shrunk", elastic ones with what they could still
+give), `status` marks fixed ones `HOLDS BACK`, history records an `unfair`
+event, and holders of ordinary fixed leases (not timing runs) get one inbox
+note suggesting MIN:MAX.
+
+**Accounting invariant**: the sizes in force (fixed sizes, elastic grants after
+their scope is capped, headroom) add up to at most the machine, except where
+fixed sizes and MINs were admitted on measured use of leases using less than
+they hold (as before this change); elastic sizes above MIN come only from
+cores granted to no one.
+
+`agent-coord status` lists the active projects with weight, share, cores held
+(and how many are non-preemptible) and requests waiting, when more than one is
+active.
+
+### Configuration
+
+Optional: `~/.config/agent-coord/config.toml` (or `$AGENT_COORD_CONFIG`), re-read
+when it changes. Every value is checked: an unknown key, a value of the wrong
+type or out of range, or a file that is not valid TOML keeps the default, is
+logged once per load and is listed in `status`; a bad file never stops the
+service. Defaults and ranges:
+
+```toml
+reserve_cores = 2        # 0..64 (0 turns the reserve off), used up to half the machine
+default_weight = 1       # > 0, <= 1000
+resize_interval = 60     # 0..3600 s between changes of one lease (preemption excepted)
+idle_fraction = 0.5      # 0..1: idle shrink below this share of the grant ...
+idle_after = 120         # 0..86400 s ...
+idle_target_use = 0.7    # (0..1]: ... down to ceil(peak / this)
+grow_demand = 0.75       # (0..1]: grow while using at least this share of the grant
+grow_margin = 1          # 0..64 cores kept free beyond a project's share when growing
+
+[projects.some-repo]
+weight = 2               # > 0, <= 1000
+```
+
 ## History
 
 Every lease event is appended as one JSON line to
 `~/.local/state/agent-coord/history.jsonl`, rotated at 8 MB (four older files,
 `history.jsonl.1` .. `.4`, are kept). Events: `requested`, `waiting` (the head
 of the line's reason, logged when its kind changes: `exclusive`, `lock:NAME`,
-`cores`, `mem`, `available`, `disk`, `headroom`; later requests also log changed
+`cores`, `mem`, `available`, `disk`, `headroom`, `reserve`; later requests also log changed
 backfill hold reasons), `started` (with `wait` seconds and any backfill reason),
+`resized` (an elastic lease's grant changed: `from`, new `cores`, `kind`
+`preempted`, `grew`, `idle` or `fixed`, and the `reason`, e.g. which request
+preempted it), `unfair` (fixed leases keep a waiting project below its share),
 `overrun` (with the delaying lease's notice), `ended` (with `wait`, `run` seconds
 and the command's exit `code` when `run` reports it) and `cancelled` (released or died while waiting). Each
-carries the lease id, agent, label, cores, mem, IO flag, locks, expected seconds and
+carries the lease id, agent, project, label, cores (and `min_cores`/`max_cores` for
+MIN:MAX), mem, IO flag, locks, expected seconds and
 estimate source, and exclusive mode
 (`machine`, `lock` or null); never commands, paths or environment.
 `agent-coord history [--since 6h] [--json]` prints it (default: last 24 h).
@@ -197,11 +394,15 @@ user session it still runs, uncapped, at nice 19 / idle IO.
 systemctl --user status agent-coord
 journalctl --user -u agent-coord
 python3 -m unittest -v test_agent_coord     # in tools/agent-coord
+# Opt-in: also run commands in real transient scopes (agent-coord-test-*) and
+# resize one; by default a seam stands in for systemd.
+AGENT_COORD_SYSTEMD_TESTS=1 python3 -m unittest -v test_agent_coord
 ```
 
-`AGENT_COORD_RUNTIME_DIR` and `AGENT_COORD_STATE_DIR` are for tests and
-throwaway trial instances only: they point `serve` and the client commands at
-another socket, state and history. Never set them in an agent's normal shell or
-in the user manager's environment: clients would miss the shared service, and
-the shared service itself would start from an empty state, forgetting every
-live lease.
+The tests run private instances only. `AGENT_COORD_RUNTIME_DIR`,
+`AGENT_COORD_STATE_DIR`, `AGENT_COORD_CONFIG` and `AGENT_COORD_SCOPE_PREFIX` are for
+tests and throwaway trial instances only (their own socket, lease files, state,
+history, config and scope names, for both `serve` and the client commands).
+Never set them in an agent's normal shell or in the user manager's environment:
+clients would miss the shared service, and the shared service itself would
+start from an empty state, forgetting every live lease.
