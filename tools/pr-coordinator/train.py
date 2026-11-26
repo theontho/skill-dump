@@ -372,20 +372,30 @@ def existing_tests(wt):
     return [test for test in QUICK_TESTS if (Path(wt) / test).is_file()]
 
 
-def land_safely(entry):
-    try:
-        with locked(f"land-pr-{entry['pr']}.lock", wait=False):
-            land(entry)
-    except BlockingIOError:
-        return
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-        KeyError,
-        subprocess.SubprocessError,
-    ) as exc:
-        need_agent(entry["pr"], f"Train stopped safely: {exc}")
+def land_safely(entry, attempts=3, pause=120):
+    """Land a PR; retry transient failures (GitHub API, network) before asking for help.
+
+    land() resumes from the PR's current state, so a retry repeats no completed step.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            with locked(f"land-pr-{entry['pr']}.lock", wait=False):
+                land(entry)
+            return
+        except BlockingIOError:
+            return
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            KeyError,
+            subprocess.SubprocessError,
+        ) as exc:
+            if attempt == attempts:
+                need_agent(entry["pr"], f"Train stopped safely: {exc}")
+                return
+            sh([*cli(), "log", f"train #{entry['pr']}: retrying after: {exc}"])
+            time.sleep(pause * attempt)
 
 
 def land(entry):

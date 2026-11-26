@@ -533,6 +533,35 @@ raise SystemExit(1)
         ), mock.patch.object(train.time, "sleep"):
             self.assertEqual(train.settled_head(7, "pushed"), "someone-else")
 
+    def test_train_retries_a_transient_failure_before_asking_for_help(self):
+        import contextlib
+
+        import train
+
+        calls, asked = [], []
+
+        def flaky(entry):
+            calls.append(entry["pr"])
+            if len(calls) < 3:
+                raise subprocess.CalledProcessError(1, ["gh", "pr", "diff"])
+
+        patches = (
+            mock.patch.object(train, "land", flaky),
+            mock.patch.object(train, "locked", lambda *a, **k: contextlib.nullcontext()),
+            mock.patch.object(train, "need_agent", lambda n, why: asked.append(why)),
+            mock.patch.object(train, "sh", lambda *a, **k: (0, "")),
+            mock.patch.object(train.time, "sleep"),
+        )
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            train.land_safely({"pr": 7, "worktree": "wt"})
+            self.assertEqual((len(calls), asked), (3, []))
+            calls.clear()
+            train.land_safely({"pr": 7, "worktree": "wt"}, attempts=2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(asked), 1)
+
     def test_train_retries_cancellations_only_not_timeouts_or_test_failures(self):
         jobs = [
             {"name": "required", "conclusion": "failure"},
