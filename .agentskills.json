@@ -47,10 +47,10 @@
     {
       "id": "pr-coordinator",
       "name": "pr-coordinator",
-      "description": "Use when the owner asks to coordinate or land a pull request backlog across machines.",
+      "description": "Use when the owner asks to coordinate work across machines: landing a pull request backlog, then working through the issue queue with implementer agents.",
       "license": "MIT",
       "path": "skills/pr-coordinator/SKILL.md",
-      "sha256": "f451dec3c07e830f0e7bb81bfa7ab4867243871945366cc85474bf3f17f59fe1",
+      "sha256": "13f9c4cbd822e7a3163f24daf40f9ba8f48ff807f7ef150707e2cec54e9628bb",
       "metadata": {
         "author": "theontho",
         "version": "1.0.0"

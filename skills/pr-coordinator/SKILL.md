@@ -1,6 +1,6 @@
 ---
 name: pr-coordinator
-description: "Use when the owner asks to coordinate or land a pull request backlog across machines."
+description: "Use when the owner asks to coordinate work across machines: landing a pull request backlog, then working through the issue queue with implementer agents."
 license: MIT
 metadata:
   author: theontho
@@ -9,9 +9,26 @@ metadata:
 
 # PR coordinator
 
-Use when the owner asks to coordinate or land a pull request backlog across
-machines. Keep one coordinator per project. An implementer handles one existing
-PR; don't open new issues or PRs as part of a landing assignment.
+Use when the owner asks to coordinate work across machines. Keep one
+coordinator per project. An implementer handles one existing PR; don't open new
+issues or PRs as part of a landing assignment.
+
+## Two phases: land the backlog, then work the issue queue
+
+Landing the PR backlog is only the first phase. When the backlog is merged or
+handed to the landing train, switch to **issue-queue mode** without waiting to
+be told: work the repository's issue queue in its own priority order (for
+example, efficiency items, then bugs, then the roadmap's "Up next"), keeping
+every machine staffed with implementer or long-run work suited to its hardware.
+
+- Waiting on the owner blocks only the items that need an owner decision,
+  never the whole queue. Ask once, park those items, and move on.
+- A machine with no agent, no lease and no long run is a defect, not a resting
+  state. When `events` reports an idle host, dispatch the next suitable item.
+- Before ending a turn, check that unblocked work remains assigned on every
+  machine; if not, assign it.
+- Landing continues in the background: implementers hand drafts to
+  `finish-draft`, and the train lands them.
 
 ## Coordinator setup
 
