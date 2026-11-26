@@ -15,6 +15,7 @@ import json
 import subprocess
 import time
 
+from host_activity import update_idle
 from runtime import P, gh_argv, load, questions, save, uuid4
 
 HERE = P.data
@@ -28,22 +29,13 @@ def now():
     return time.strftime("%Y-%m-%d %H:%M")
 
 
-MACHINES = [
-    (
-        value.get("display", key),
-        key,
-        value.get("description", value.get("platform", "")),
-    )
-    for key, value in P.hosts.items()
-    if value.get("dashboard", True)
-]
-
-
-def derive_machines(s):
-    """Machine cards come from the certification queue so they never go stale."""
+def derive_machines(s, hosts, busy):
+    """Build machine cards from current dashboard work and host probes."""
     certs = s.get("certs", [])
     s["machines"] = []
-    for name, host, os_desc in MACHINES:
+    for host, spec in hosts.items():
+        if not spec.get("dashboard", True):
+            continue
         running = [
             c for c in certs if c.get("host") == host and c.get("status") == "running"
         ]
@@ -68,23 +60,27 @@ def derive_machines(s):
             task += ("; " if task else "") + "; ".join(
                 f"tests for {r.get('label')}" for r in tests
             )
-            running = running or tests
-        if not P.hosts[host].get("ssh"):
+        if not spec.get("ssh"):
             task = "coordinator, dashboard, implementer agents" + (
                 "; " + task if task else ""
             )
-        live = s.get("hosts", {}).get(host, {})
-        busy_live = any(
-            r.get("state") in ("held", "running") for r in live.get("leases", [])
-        )
+        reachable = s.get("hosts", {}).get(host, {}).get("reachable")
+        if reachable is False:
+            status = "offline"
+        elif host in busy:
+            status = "busy"
+        else:
+            status = "idle" if reachable else "unknown"
+        since = s.get("host_idle", {}).get(host, {}).get("since")
+        if status == "idle" and since is not None:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(since))
+            task += (" · " if task else "") + f"idle since {stamp}"
         s["machines"].append(
             {
-                "name": name,
-                "os": os_desc,
-                "status": "busy"
-                if running or busy_live or not P.hosts[host].get("ssh")
-                else "idle",
-                "task": task or ("" if busy_live else "idle"),
+                "name": spec.get("display", host),
+                "os": spec.get("description", spec.get("platform", "")),
+                "status": status,
+                "task": task,
             }
         )
 
@@ -265,7 +261,7 @@ def main():
             else:
                 next(x for x in s["prs"] if x["number"] == num)["title"] = title
         s["prs"].sort(key=lambda x: x["number"])
-    derive_machines(s)
+    derive_machines(s, P.hosts, update_idle(s, P))
     s["updated"] = now()
     save(STATE, s)
 

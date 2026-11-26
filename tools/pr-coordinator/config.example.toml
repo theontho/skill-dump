@@ -65,6 +65,7 @@ required_statuses = ["local-ci/generic", "local-ci/linux-x64"]
 
 [events]
 interval = 90
+idle_minutes = 45
 ignored_check_prefixes = ["local-ci/", "rerun"]
 
 [loops]
@@ -90,6 +91,7 @@ cert_log = "out/certify/*/*/run.log"
 
 [hosts.worker]
 ssh = "worker-alias"
+# idle_alert = false  # suppress idle events for a dedicated host
 checkout = "~/src/project"
 platform = "linux-x64"
 cores = 8

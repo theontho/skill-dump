@@ -1,30 +1,34 @@
 """Collect live work on every host (agent-coord leases; heavy processes on the MacBook) into state.json."""
 
-import json
+import fcntl
 import re
 import subprocess
 import time
 from pathlib import Path
 
-from runtime import P, load
+from coord import derive_machines
+from host_activity import update_idle
+from runtime import P, load, save
 
 HERE = P.data
 
 LEASE = re.compile(
-    r"^\s+(L\d+)\s+(held|waiting)\s+(\d+) cores\s+([\d.]+G)\s+(\d+) min\s+(.*)$"
+    r"^\s+(L\d+)\s+(held|waiting)\s+([\d.]+)"
+    r"(?: cores|-core cap(?:, [\d.]+ used)?)\s+([\d.]+G)\s+(\d+) min\s+(.*)$"
 )
 
 
 def run(cmd, timeout=40):
     try:
-        return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        ).stdout
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return result.stdout if result.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
 
-def leases(host, prefix):
+def leases(prefix):
     cmd = (
         ["agent-coord", "status"] if prefix is None else [*prefix, "agent-coord status"]
     )
@@ -41,7 +45,7 @@ def leases(host, prefix):
                 {
                     "id": m.group(1),
                     "state": m.group(2),
-                    "cores": int(m.group(3)),
+                    "cores": float(m.group(3)),
                     "mem": m.group(4),
                     "minutes": int(m.group(5)),
                     "label": label,
@@ -89,19 +93,20 @@ def main():
     hosts = {}
     for key, host in P.hosts.items():
         if host.get("agent_coord"):
-            hosts[key] = leases(key, P.ssh(key) or None)
+            hosts[key] = leases(P.ssh(key) or None)
         elif host.get("process_probe"):
             hosts[key] = process_probe(key, host["process_probe"])
-    lock = open(HERE / "state.lock", "w")
-    import fcntl
-
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    state = load(HERE / "state.json", {"prs": [], "machines": [], "log": []})
-    state["hosts"] = hosts
-    state["hosts_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    tmp = HERE / "state.tmp"
-    tmp.write_text(json.dumps(state, indent=1))
-    tmp.replace(HERE / "state.json")
+        else:
+            hosts[key] = {"reachable": P.reachable(key)}
+    with (HERE / "state.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = HERE / "state.json"
+        state = load(path, {"prs": [], "machines": [], "log": []})
+        state["hosts"] = hosts
+        now = time.time()
+        state["hosts_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        derive_machines(state, P.hosts, update_idle(state, P, observed_at=now))
+        save(path, state)
 
 
 if __name__ == "__main__":

@@ -5,9 +5,10 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 from runtime import Project
@@ -48,7 +49,7 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             "GIT_CONFIG_GLOBAL": os.devnull,
         }
 
-    def command(self, *args, check=True):
+    def command(self, *args, check=True, timeout=None):
         return subprocess.run(
             [
                 sys.executable,
@@ -66,6 +67,7 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             capture_output=True,
             text=True,
             check=check,
+            timeout=timeout,
         )
 
     def test_config_selection_and_data_override(self):
@@ -149,6 +151,149 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
         self.assertNotIn("http-equiv=refresh", html)
         self.assertIn("localStorage", html)
         self.assertIn("document.activeElement", html)
+
+    def idle_project(self, *, threshold_override=None):
+        with self.config.open("a") as config:
+            config.write("""
+[hosts.worker]
+display = "Worker display"
+ssh = "worker-alias"
+[hosts.dedicated]
+idle_alert = false
+""")
+            if threshold_override is not None:
+                config.write(f"\n[events]\nidle_minutes = {threshold_override}\n")
+        return Project("gadgets", config_file=self.config, data_dir=self.data)
+
+    def test_idle_event_uses_continuous_reachable_observations(self):
+        from events import idle_hosts
+        from host_activity import update_idle
+
+        project = self.idle_project()
+        cases = [
+            ("idle", {}, {"reachable": True}, True),
+            ("unreachable", {}, {"reachable": False}, False),
+            ("missing observation", {}, {}, False),
+            (
+                "agent key",
+                {"agents": [{"machine": "worker", "status": "working"}]},
+                {"reachable": True},
+                False,
+            ),
+            (
+                "agent display",
+                {"agents": [{"machine": "Worker display", "status": "waiting"}]},
+                {"reachable": True},
+                False,
+            ),
+            (
+                "agent alias",
+                {"agents": [{"machine": "worker-alias", "status": "working"}]},
+                {"reachable": True},
+                False,
+            ),
+            (
+                "held lease",
+                {},
+                {"reachable": True, "leases": [{"state": "held"}]},
+                False,
+            ),
+            (
+                "waiting lease",
+                {},
+                {"reachable": True, "leases": [{"state": "waiting"}]},
+                True,
+            ),
+            (
+                "certification",
+                {"certs": [{"host": "worker", "status": "running"}]},
+                {"reachable": True},
+                False,
+            ),
+            (
+                "remote tests",
+                {"runs": [{"host": "worker", "status": "running"}]},
+                {"reachable": True},
+                False,
+            ),
+            (
+                "heavy process",
+                {},
+                {"reachable": True, "leases": [{"state": "running"}]},
+                False,
+            ),
+        ]
+        for name, work, worker, expected in cases:
+            with self.subTest(name=name):
+                state = {
+                    **work,
+                    "hosts": {"worker": worker, "dedicated": {"reachable": True}},
+                }
+                for minute in range(46):
+                    now = minute * 60
+                    update_idle(state, project, observed_at=now)
+                    matches = idle_hosts(state, project, now=now)
+                    self.assertEqual(bool(matches), expected and minute == 45)
+                if expected:
+                    self.assertEqual(
+                        matches[0][1],
+                        "IDLE: Worker display has had no agent, lease or long run for 45 min",
+                    )
+                    self.assertFalse(idle_hosts(state, project, now=now + 3600))
+
+    def test_idle_event_rearms_only_after_work_and_shares_dashboard_marker(self):
+        import dashboard
+        from coord import derive_machines
+        from host_activity import update_idle
+
+        project = self.idle_project(threshold_override=1)
+        self.data.mkdir()
+        path = self.data / "state.json"
+        fake_gh = self.root / "gh"
+        fake_gh.write_text("#!/bin/sh\nexit 0\n")
+        fake_gh.chmod(0o755)
+        self.env["PATH"] = f"{self.root}{os.pathsep}{self.env['PATH']}"
+        start = int(time.time()) - 190
+        state = {"hosts": {"worker": {"reachable": True}}, "prs": [], "log": []}
+
+        def qualify(since):
+            update_idle(state, project, observed_at=since)
+            busy = update_idle(state, project, observed_at=since + 60)
+            derive_machines(state, project.hosts, busy)
+            path.write_text(json.dumps(state))
+
+        qualify(start)
+        with (
+            mock.patch.object(dashboard, "STATE", path),
+            mock.patch.object(dashboard, "P", project),
+        ):
+            self.assertIn("idle since ", dashboard.page())
+        self.assertIn("IDLE: Worker display", self.command("events", timeout=5).stdout)
+        state["hosts"]["worker"]["reachable"] = False
+        update_idle(state, project, observed_at=start + 61)
+        state["hosts"]["worker"]["reachable"] = True
+        qualify(start + 63)
+        self.command("ask", "next question", "--machine", "worker")
+        result = self.command("events", timeout=5).stdout
+        self.assertIn("AGENT QUESTION", result)
+        self.assertNotIn("IDLE:", result)
+
+        self.command("agent", "brief-worker", "working", "--machine", "worker-alias")
+        self.command("agent", "brief-worker", "done")
+        state = json.loads(path.read_text())
+        qualify(start + 126)
+        self.assertIn("IDLE: Worker display", self.command("events", timeout=5).stdout)
+
+    def test_host_snapshot_reports_io_lease_as_work(self):
+        from collect_hosts import leases
+
+        with mock.patch(
+            "collect_hosts.run",
+            return_value="  L17 held    1-core cap, 0 used   0.5G     5 min  dev: download (pid 17)\n",
+        ):
+            snapshot = leases(None)
+        self.assertTrue(snapshot["reachable"])
+        self.assertEqual([(row["state"], row["label"]) for row in snapshot["leases"]], [("held", "dev: download")])
 
     def test_certification_waits_when_the_controller_finds_the_host_busy(self):
         import contextlib

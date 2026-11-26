@@ -81,6 +81,9 @@ class Project:
             )
         )
         self.hosts = self.settings.get("hosts", {})
+        idle_minutes = self.get("events", "idle_minutes", 45)
+        if type(idle_minutes) is not int or idle_minutes < 1:
+            raise ValueError("events.idle_minutes must be a positive integer")
         for key, host in self.hosts.items():
             if not SLUG.fullmatch(key) or not isinstance(host, dict):
                 raise ValueError(f"invalid host entry: {key!r}")
@@ -143,11 +146,12 @@ class Project:
         try:
             return (
                 subprocess.run(
-                    [*argv, "true"],
+                    [*argv, "exit 0"],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=30,
+                    check=False,
                 ).returncode
                 == 0
             )

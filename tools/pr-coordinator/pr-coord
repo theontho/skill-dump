@@ -33,7 +33,11 @@ COMMANDS = {
     "cert": ("remote", "cert_main", "certify a worktree at the exact published head"),
     "cert-pr": ("remote", "cert_pr_main", "certify a PR from a managed worktree"),
     "rt": ("remote", "rt_main", "run tests against a synchronized remote copy"),
-    "events": ("events", "main", "watch for main failures, drops, and questions"),
+    "events": (
+        "events",
+        "main",
+        "watch for main failures, drops, questions, and idle hosts",
+    ),
     "tests": ("tests_inventory", "main", "build or refresh test inventory"),
     "reports": ("tests_reports", "main", "collect JUnit reports"),
     "triage": ("triage", "main", "list PR landing metadata as JSON lines"),

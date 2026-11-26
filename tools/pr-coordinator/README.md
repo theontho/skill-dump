@@ -28,9 +28,11 @@ the other children if any exits, and stops its children on Ctrl-C or SIGTERM.
 Alternatively run `dashboard`, `collect`, `supervise`, and `train run`
 separately. `collect --mutate` explicitly enables yield/stale cancellation;
 `collect --once` and `supervise --once` run one cycle. `events` blocks until a
-new main failure, queue drop, or question, prints it and exits; restart it on
-notification. Monitor foreground errors and supervise processes externally.
-No units are installed or enabled by default.
+new main failure, queue drop, question, or idle-host alert, prints it and exits;
+restart `events` on notification. It is separate from `run`: updating the tool
+and re-arming `events` does not require restarting `run`. Monitor foreground
+errors and supervise processes externally. No units are installed or enabled
+by default.
 
 The dashboard reads only local snapshots and does not contact GitHub. `/` has PR
 tables, conflicts, dependencies, leases, certifications and questions;
@@ -45,6 +47,18 @@ that queue to dashboard readers but does not put it in the owner answer form.
 
 ## Configuration and command contracts
 
+- **Idle hosts:** `[events] idle_minutes` (default `45`) is the minimum time a
+  host must be observed reachable without working or waiting dashboard agents,
+  held `agent-coord` leases, heavy processes from a configured process probe,
+  or running certifications or remote tests. Report agents with
+  `pr-coord agent NAME STATUS --machine HOST` using the host key, display name,
+  or SSH alias. The host collector supplies the observations; `events` does
+  not probe the hosts itself. Enable `agent_coord = true` on hosts whose leases
+  should be collected; hosts without a workload probe get a reachability check.
+  An offline host is not idle. Loss of observations resets the timer, but a
+  reported host must be seen busy before another alert.
+  Set `idle_alert = false` in a host entry to suppress its alerts without
+  hiding the dashboard's “idle since” marker.
 - **GitHub:** `github.repo`, `owner`, `tracked_authors`, `base_branch`, `remote`.
   Tracked bots appear in the dashboards but are not automatically refreshed or
   enqueued as owner PRs. Mutating loops check the authenticated owner. A

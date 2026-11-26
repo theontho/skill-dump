@@ -2,6 +2,7 @@
 
 Events: a failed check on main's head commit; a PR removed from the merge queue for a reason other than
 manual/merged; an owner answer on the dashboard; a new agent question for the coordinator.
+Reachable hosts that have been idle for the configured threshold also wake the coordinator.
 Seen events are remembered in events_seen.json so each is reported once.
 """
 
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 
+from host_activity import busy_hosts, probe_window
 from runtime import P, cli, gh_argv, load, save
 
 HERE = P.data
@@ -116,6 +118,35 @@ def agent_questions():
     ]
 
 
+def idle_hosts(state, project, *, now):
+    threshold = project.get("events", "idle_minutes", 45)
+    observed_at = state.get("hosts_observed_at")
+    if observed_at is None or not 0 <= now - observed_at <= probe_window(project):
+        return []
+    busy = busy_hosts(state, project.hosts)
+    live = state.get("hosts", {})
+    events = []
+    for key, spec in project.hosts.items():
+        if (
+            not spec.get("idle_alert", True)
+            or key in busy
+            or not live.get(key, {}).get("reachable")
+        ):
+            continue
+        episode = state.get("host_idle", {}).get(key, {})
+        since = episode.get("since")
+        if since is not None and observed_at - since >= threshold * 60:
+            minutes = int((observed_at - since) // 60)
+            host = spec.get("display", key)
+            events.append(
+                (
+                    f"idle:{key}:{episode['id']}",
+                    f"IDLE: {host} has had no agent, lease or long run for {minutes} min",
+                )
+            )
+    return events
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -133,14 +164,16 @@ def main():
                 events += collect()
             except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                 print(f"events: {exc}", file=sys.stderr, flush=True)
+        events += idle_hosts(load(HERE / "state.json", {}), P, now=time.time())
         new = [(k, msg) for k, msg in events if k not in seen]
         if new:
             seen.update(k for k, _ in new)
             save(SEEN, sorted(seen))
-            if not first:
-                for _, msg in new:
-                    subprocess.run([*cli(), "log", "EVENT " + msg[:300]])
-                print("\n".join(msg for _, msg in new))
+            notify = [(k, msg) for k, msg in new if not first or k.startswith("idle:")]
+            if notify:
+                for _, msg in notify:
+                    subprocess.run([*cli(), "log", "EVENT " + msg[:300]], check=False)
+                print("\n".join(msg for _, msg in notify))
                 return
         first = False
         time.sleep(interval)
