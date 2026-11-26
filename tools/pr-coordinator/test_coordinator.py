@@ -395,6 +395,27 @@ idle_alert = false
             self.assertFalse(drafts.complete((True, {"local-ci/generic": "error"}, False)))
             self.assertFalse(drafts.complete((True, {**ok, "local-ci/windows-x64": "pending"}, False)))
 
+    def test_finish_draft_requests_missing_certification_once_per_head(self):
+        import drafts
+
+        class Drafts:
+            def get(self, section, key, default=None):
+                return 0 if key in {"poll_seconds", "idle_seconds"} else default
+
+        head = "a" * 40
+        with mock.patch.object(drafts, "P", Drafts()), mock.patch.object(
+            drafts, "owner_pr", return_value={"headRefOid": head}
+        ), mock.patch.object(
+            drafts, "evidence", return_value=(True, {}, False)
+        ), mock.patch.object(drafts, "request_certification") as request:
+            with self.assertRaisesRegex(ValueError, "no running certification"):
+                drafts.watch(7, certify=True)
+            request.assert_called_once_with(7)
+            request.reset_mock()
+            with self.assertRaisesRegex(ValueError, "no running certification"):
+                drafts.watch(7)
+            request.assert_not_called()
+
     def test_certification_of_an_older_head_does_not_count_for_the_new_head(self):
         import fcntl
 

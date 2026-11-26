@@ -123,11 +123,26 @@ def complete(result):
     )
 
 
-def watch(pr):
+def request_certification(pr):
+    """Start cert-pr in the background; it certifies the PR's current head."""
+    log = P.data / "logs" / f"cert-pr-{pr}-auto.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as out:
+        subprocess.Popen(
+            cli("cert-pr", pr),
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def watch(pr, *, certify=False):
     interval = P.get("drafts", "poll_seconds", 120)
     grace = P.get("drafts", "idle_seconds", 480)
     idle_since = None
     previous_head = None
+    requested = set()
     while True:
         head = owner_pr(pr, draft=True)["headRefOid"]
         result = evidence(pr, head)
@@ -143,6 +158,14 @@ def watch(pr):
         if not running:
             if blocking(statuses):
                 raise ValueError(f"certification failed on {head[:9]}: {statuses}")
+            if certify and not statuses and head not in requested:
+                # The implementer handed over without queuing certification.
+                print(f"PR {pr} head {head[:9]}: requesting certification", flush=True)
+                request_certification(pr)
+                requested.add(head)
+                idle_since = None
+                time.sleep(interval)
+                continue
             if idle_since is None:
                 idle_since = time.monotonic()
             if time.monotonic() - idle_since >= grace:
@@ -200,7 +223,7 @@ def wait_registered():
 
 def finish(pr):
     with locked(f"finish-draft-{pr}.lock", wait=False):
-        head = watch(pr)
+        head = watch(pr, certify=True)
         with locked("draft-admission.lock"):
             wait_registered()
             capacity = P.command("landing", "ci_capacity", pr=pr)
