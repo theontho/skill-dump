@@ -30,6 +30,14 @@ PR; don't open new issues or PRs as part of a landing assignment.
    and questions. On notification, take action and restart the watcher. Keep
    the configuration and run commands in the handoff so another coordinator
    can resume without changing deployment files.
+5. Start implementers on another machine with `pr-coord --project <project>
+   remote-agent <host> <name> <prompt-file>` (tmux on POSIX hosts). On a
+   Windows host (`windows = true`) the agent runs detached under the host's
+   `agent_root`; check it with `remote-agent <host> --list`, read its log with
+   `remote-agent <host> <name> --log`, and stop it with `remote-agent <host>
+   <name> --stop` (only that agent's verified process tree). Never kill agent
+   processes by name. See the README for the credential holder (`agent-env`)
+   and its limits.
 
 ## Implementer runbook
 

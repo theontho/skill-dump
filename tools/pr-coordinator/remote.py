@@ -3,6 +3,7 @@
 import argparse
 import base64
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -39,7 +40,8 @@ def remote(host, argv, *, cwd=None, **kwargs):
     if P.hosts[host].get("windows"):
 
         def ps(arg):
-            return "'" + str(arg).replace("'", "''") + "'"
+            # PowerShell also ends a single-quoted string at U+2018..U+201B.
+            return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", str(arg)) + "'"
 
         script = "$ErrorActionPreference='Stop'; "
         if cwd:

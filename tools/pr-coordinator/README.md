@@ -3,7 +3,7 @@
 `pr-coord` coordinates a GitHub PR backlog across machines. The controller runs on
 Linux/macOS with Python 3.11+, Git and `gh`; remote features use SSH, `rt` also
 uses rsync, and resource probes and leases can use `agent-coord`. Windows can be
-a remote certification/JUnit worker. Installing the command does not start
+a remote certification/JUnit worker and run remote implementers. Installing the command does not start
 anything. No Python packages are needed for the tool.
 
 ## Set up a project
@@ -98,17 +98,122 @@ that queue to dashboard readers but does not put it in the owner answer form.
   `ATTENTION` means an operator must investigate; already-ready PRs can be
   submitted with `handoff PR`. It reuses the clean PR branch worktree or creates
   one and fast-forwards only; it does not discard local changes.
-- **Remote implementers:** opt a POSIX host in with `remote_agents = true`
-  and configure `[remote_agents]` with `command` (agent argv before `-p PROMPT`),
-  `report` (controller reporter argv), and an optional `runbook` file.
+- **Remote implementers:** opt a host in with `remote_agents = true` and
+  configure `[remote_agents]` with `command` (agent argv before `-p PROMPT`),
+  `report` (reporter argv, run on the host), and an optional `runbook` file.
   `remote-agent HOST NAME PROMPT_FILE` sends the prompt and optional runbook
-  over SSH to that trusted host and starts a tmux agent. Set a host's
-  `agent_env_session` to require an existing session for its windows. For a
-  keychain inaccessible over SSH, an operator can explicitly pipe an authorized
-  credential to `agent-env HOST`; it initializes that tmux session in memory
-  without storing the credential in settings or logs. Only do this for a host
-  authorized to receive the credential. Closing the session drops its tmux
-  environment; already-running programs retain their own environment.
+  over SSH to that trusted host and starts the agent. On a POSIX host it runs in
+  tmux. Set a host's `agent_env_session` to require an existing session for its
+  windows. For a keychain inaccessible over SSH, an operator can explicitly
+  pipe an authorized credential to `agent-env HOST`; it initializes that tmux
+  session in memory without storing the credential in settings or logs. Only
+  do this for a host authorized to receive the credential. Closing the session
+  drops its tmux environment; already-running programs retain their own
+  environment.
+- **Remote implementers on Windows:** a host with `windows = true` and
+  `remote_agents = true` uses the same commands and keys. Each remote call
+  runs a small fixed bootstrap (`powershell -EncodedCommand`, well under the
+  cmd.exe line limit, so the OpenSSH default shell may be PowerShell or cmd)
+  that reads the script and every value as base64 JSON on stdin; no
+  configured or user value is spliced into script text. Windows PowerShell 5.1
+  and .NET Framework (both part of Windows) compile a small native helper with
+  `Add-Type` on each call.
+  - **Folders.** Agents live in `AGENT_ROOT\NAME` (host key `agent_root`,
+    default `CHECKOUT\out\agents`; a drive or `~\` path of ASCII letters,
+    digits, space, `_`, `.`, `-` and separators; the checkout must match the
+    same rule). The root, each agent folder and the environment folder are
+    created in one call already owned by the user, readable only by the user,
+    SYSTEM and Administrators, and labelled High integrity with no-write-up
+    and no-read-up, so non-elevated processes cannot read or change them. An
+    existing root or folder is used only if it is not a junction or link, is
+    owned by the user, SYSTEM or Administrators, grants nobody else access
+    and carries that label; otherwise the command refuses (`--list` shows it
+    as `untrusted`), and so is a root with a junction or link anywhere up its
+    parent chain. Point `agent_root` at a new folder under a path only this
+    user can change (e.g. under the user profile): an existing folder that
+    inherits broad access is refused, and the checks work on paths, so an
+    ancestor that other accounts can rename is a weak spot.
+  - **Files.** Each agent folder holds `prompt.md`, the runbook, `launch.json`,
+    a static wrapper `run.ps1`, `pid.json` (pid, process start time, start
+    date), `output.log` (the previous run's is kept as `output.1.log`),
+    `exit.code`, and `failed.json` or `stopped.json` when relevant. A UTF-8
+    BOM is removed from the prompt and runbook.
+  - **Running.** The wrapper is started through `Win32_Process.Create`, so it
+    outlives the SSH call (a `Start-Process` child is killed when the SSH
+    session ends). It puts itself in a Job Object that is killed when the
+    wrapper ends, then runs the agent in the host `checkout` through `cmd.exe`
+    with stdin from `prompt.md` and stdout and stderr in `output.log`, as the
+    agent writes them (Node-based runtimes write UTF-8; the wrapper's own
+    `EXIT N` line is UTF-8). Processes the agent leaves behind end with it.
+    The executable is looked up on PATH only (never in the checkout) and run
+    by full path. The prompt never appears on a command line: `-p` is
+    appended without an argument (Claude Code reads the prompt from stdin),
+    or an argument containing `{prompt_file}` gets the prompt's path and no
+    `-p` is added. A host's `agent_command` and `agent_report` override
+    `[remote_agents]` when the executables differ there. Both argv lists are
+    joined into command lines that cmd.exe may parse, so their arguments may
+    not contain `"%!^&|<>`; run a `.ps1` shim through its `.cmd` twin or
+    `powershell.exe -File`. The start report is not waited for; the end
+    report gets 30 seconds. `shell_prefix` does not apply.
+  - **One run per name.** A start holds `start.lock` in the agent folder and
+    the wrapper holds `run.lock` for its lifetime; a second start of a
+    running or starting agent is refused. A start that fails is listed as
+    `failed`.
+  - `remote-agent HOST --list` prints each agent with `running`,
+    `exited RC`, `stopped`, `lost` (its process is gone without an exit
+    code, e.g. after a reboot), `failed`, `starting` or `untrusted (...)`.
+  - `remote-agent HOST NAME --log [--lines N]` prints the end of its log.
+  - `remote-agent HOST NAME --stop` opens a handle to the recorded wrapper
+    pid, checks through that handle that it still has the recorded start
+    time, runs that agent's `run.ps1` and belongs to the user, and
+    terminates it through the same handle (Windows does not reuse a pid
+    while a handle is open). The wrapper's job then kills the rest of the
+    agent's tree, including orphans whose parent already exited. A missing,
+    zero or unverified pid is refused, and nothing is killed by name. On the
+    controller every kill goes through one function, `kill_tree`. Checks
+    that do not kill open processes with query rights only. A process the
+    agent starts outside its job (through WMI, `schtasks`, a service, or
+    `pr-coord remote-agent` itself) survives `--stop`.
+  - Names are limited to letters, digits, `_` and `-` (64 characters, not
+    a device name such as `CON`) and checked again on the host.
+  - `agent-env HOST` on Windows starts a detached holder process for the
+    host's `agent_env_session`. The controller reads the first line of its
+    stdin and passes it, without decoding or logging it, through SSH stdin to
+    the host, where it is handed to the holder over a named pipe. The client checks
+    that the pipe server is the recorded holder (pid, start time and user,
+    through one handle); the holder answers only clients of the same user at
+    High integrity on the same machine, judged from the client's own token by
+    impersonation (SMB clients are refused; the
+    NETWORK group cannot simply be denied, because OpenSSH key logons are
+    network logons). The holder keeps the
+    credential only in its own process environment as `GH_TOKEN` and
+    `COPILOT_GITHUB_TOKEN` and starts that host's agents, which inherit it.
+    It is never written to a file, the registry, a log or a command line. A
+    second `agent-env` reports that the holder is already running (it takes
+    a credential only once);
+    `agent-env HOST --stop` stops the holder (verified like an agent) and is
+    how to replace the credential. Running agents keep their environment.
+    With `agent_env_session` set, new agents need the holder.
+  - **Limits.** Remote logons (SSH, WMI) of an administrator get the full
+    administrator token, so agents run elevated; no interactive desktop
+    session is needed or used. Agents and the holder do not survive a
+    reboot or a sign-out of all sessions: they show as `lost`, and
+    `agent-env` must be piped again. Any elevated process of the same user,
+    and any administrator, can read the holder's and agents' memory and
+    environment, and memory can be paged to disk. Non-elevated processes of
+    the user cannot use the holder or change agent folders, but the High
+    label protects only those: it does not protect the agent and reporter
+    programs on PATH (e.g. a user npm folder or `~\.local\bin`) nor the
+    checkout's git hooks and build scripts. A non-elevated process that
+    changes those gets elevated execution, with the credential, at the next
+    agent start. UAC is not a formal security boundary. Host policy can still record things the tool
+    does not: PowerShell module logging or script block logging may capture
+    script text and command parameters (the credential is only ever an
+    argument of .NET method calls, which those do not record, but review such
+    policies on hosts that receive credentials); the same account can open named pipes over SMB
+    from another machine; the holder refuses such clients. A runtime that
+    keeps its own sign-in (e.g. Claude Code's credentials file in the
+    user's profile) needs no `agent-env`.
 - **Remote tests:** `rt HOST WORKTREE -- COMMAND ...` sends the current
   worktree, including uncommitted changes, to the configured SSH worker. Only
   point this at trusted machines. `remote_tests.prepare` must provision the

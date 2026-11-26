@@ -110,6 +110,22 @@ cert_worktrees = ["~/src/project/scratch/certify-*"]
 rt_worktrees = ["~/src/project/scratch/rt-*"]
 rt_xml = "out/**/*.xml"
 
+# A Windows host running implementers (remote-agent HOST NAME PROMPT_FILE,
+# --list, NAME --log, NAME --stop). Agents run detached in the checkout.
+# [hosts.winbox]
+# ssh = "winbox-alias"
+# checkout = 'D:\src\project'
+# platform = "windows-x64"
+# cores = 16
+# roles = ["implementers"]
+# windows = true
+# remote_agents = true
+# agent_root = 'D:\src\agents'   # a new folder; default: checkout\out\agents
+# agent_command = ["claude", "--model", "model-name"]   # prompt on stdin after -p
+# agent_command = ["copilot.cmd", "--prompt-file", "{prompt_file}"]
+# agent_report = ["coordinator-report.cmd"]
+# agent_env_session = "coordenv"   # agent-env holds a piped credential in memory
+
 [certification]
 default_targets = ["generic", "linux"]
 must_run = ["generic"]
