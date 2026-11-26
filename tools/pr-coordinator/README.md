@@ -128,8 +128,11 @@ that queue to dashboard readers but does not put it in the owner answer form.
     existing root or folder is used only if it is not a junction or link, is
     owned by the user, SYSTEM or Administrators, grants nobody else access
     and carries that label; otherwise the command refuses (`--list` shows it
-    as `untrusted`). Point `agent_root` at a new folder: an existing one that
-    inherits broad access is refused.
+    as `untrusted`), and so is a root with a junction or link anywhere up its
+    parent chain. Point `agent_root` at a new folder under a path only this
+    user can change (e.g. under the user profile): an existing folder that
+    inherits broad access is refused, and the checks work on paths, so an
+    ancestor that other accounts can rename is a weak spot.
   - **Files.** Each agent folder holds `prompt.md`, the runbook, `launch.json`,
     a static wrapper `run.ps1`, `pid.json` (pid, process start time, start
     date), `output.log` (the previous run's is kept as `output.1.log`),
@@ -167,15 +170,20 @@ that queue to dashboard readers but does not put it in the owner answer form.
     while a handle is open). The wrapper's job then kills the rest of the
     agent's tree, including orphans whose parent already exited. A missing,
     zero or unverified pid is refused, and nothing is killed by name. On the
-    controller every kill goes through one function, `kill_tree`.
+    controller every kill goes through one function, `kill_tree`. Checks
+    that do not kill open processes with query rights only. A process the
+    agent starts outside its job (through WMI, `schtasks`, a service, or
+    `pr-coord remote-agent` itself) survives `--stop`.
   - Names are limited to letters, digits, `_` and `-` (64 characters, not
     a device name such as `CON`) and checked again on the host.
   - `agent-env HOST` on Windows starts a detached holder process for the
-    host's `agent_env_session`. The credential is passed through SSH stdin
-    to the host and handed to the holder over a named pipe. The client checks
+    host's `agent_env_session`. The controller reads the first line of its
+    stdin and passes it, without decoding or logging it, through SSH stdin to
+    the host, where it is handed to the holder over a named pipe. The client checks
     that the pipe server is the recorded holder (pid, start time and user,
     through one handle); the holder answers only clients of the same user at
-    High integrity on the same machine (SMB clients are refused; the
+    High integrity on the same machine, judged from the client's own token by
+    impersonation (SMB clients are refused; the
     NETWORK group cannot simply be denied, because OpenSSH key logons are
     network logons). The holder keeps the
     credential only in its own process environment as `GH_TOKEN` and
@@ -193,8 +201,12 @@ that queue to dashboard readers but does not put it in the owner answer form.
     `agent-env` must be piped again. Any elevated process of the same user,
     and any administrator, can read the holder's and agents' memory and
     environment, and memory can be paged to disk. Non-elevated processes of
-    the user cannot use the holder or change agent folders, but UAC is not a
-    formal security boundary. Host policy can still record things the tool
+    the user cannot use the holder or change agent folders, but the High
+    label protects only those: it does not protect the agent and reporter
+    programs on PATH (e.g. a user npm folder or `~\.local\bin`) nor the
+    checkout's git hooks and build scripts. A non-elevated process that
+    changes those gets elevated execution, with the credential, at the next
+    agent start. UAC is not a formal security boundary. Host policy can still record things the tool
     does not: PowerShell module logging or script block logging may capture
     script text and command parameters (the credential is only ever an
     argument of .NET method calls, which those do not record, but review such

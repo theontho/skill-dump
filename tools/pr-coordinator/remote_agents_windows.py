@@ -60,20 +60,20 @@ public sealed class Proc : IDisposable {
     [DllImport("kernel32.dll")] static extern int GetCurrentProcessId();
     [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, IntPtr buf, int len, out int ret);
     [DllImport("advapi32.dll")] static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr token);
-    [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr buf, int len, out int ret);
-    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid, uint n);
-    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
     IntPtr handle;
     public readonly int Id;
     Proc(IntPtr h, int id) { handle = h; Id = id; }
     // QUERY_LIMITED_INFORMATION | TERMINATE | SYNCHRONIZE. While this handle is
     // open Windows does not reuse the pid, so checks and kill see one process.
-    public static Proc Open(int pid) {
+    public static Proc Open(int pid) { return OpenWith(pid, 0x1000 | 0x0001 | 0x00100000); }
+    // QUERY_LIMITED_INFORMATION | SYNCHRONIZE only, for checks that never kill.
+    public static Proc Query(int pid) { return OpenWith(pid, 0x1000 | 0x00100000); }
+    static Proc OpenWith(int pid, uint access) {
         if (pid <= 0) return null;
-        IntPtr h = OpenProcess(0x1000 | 0x0001 | 0x00100000, false, pid);
+        IntPtr h = OpenProcess(access, false, pid);
         return h == IntPtr.Zero ? null : new Proc(h, pid);
     }
-    public static Proc Self() { return Open(GetCurrentProcessId()); }
+    public static Proc Self() { return Query(GetCurrentProcessId()); }
     public long Created() {
         long c, e, k, u;
         return GetProcessTimes(handle, out c, out e, out k, out u) ? c : 0;
@@ -92,36 +92,44 @@ public sealed class Proc : IDisposable {
             return bytes == 0 ? "" : Marshal.PtrToStringUni(text, bytes / 2);
         } finally { Marshal.FreeHGlobal(buf); }
     }
-    IntPtr TokenInfo(int cls) {
+    public string User() { return WithToken(Token.User); }
+    public int Integrity() { string v = WithToken(t => Token.Integrity(t).ToString()); return v == null ? 0 : int.Parse(v); }
+    string WithToken(Func<IntPtr, string> read) {
         IntPtr token;
-        if (!OpenProcessToken(handle, 0x0008, out token)) return IntPtr.Zero;
-        try {
-            int need;
-            GetTokenInformation(token, cls, IntPtr.Zero, 0, out need);
-            if (need <= 0) return IntPtr.Zero;
-            IntPtr buf = Marshal.AllocHGlobal(need);
-            if (GetTokenInformation(token, cls, buf, need, out need)) return buf;
-            Marshal.FreeHGlobal(buf);
-            return IntPtr.Zero;
-        } finally { CloseHandle(token); }
+        if (!OpenProcessToken(handle, 0x0008, out token)) return null;
+        try { return read(token); } finally { CloseHandle(token); }
     }
-    public string User() {
-        IntPtr buf = TokenInfo(1);
+    public void Dispose() {
+        if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
+    }
+}
+public static class Token {
+    [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr buf, int len, out int ret);
+    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthority(IntPtr sid, uint n);
+    [DllImport("advapi32.dll")] static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+    static IntPtr Info(IntPtr token, int cls) {
+        int need;
+        GetTokenInformation(token, cls, IntPtr.Zero, 0, out need);
+        if (need <= 0) return IntPtr.Zero;
+        IntPtr buf = Marshal.AllocHGlobal(need);
+        if (GetTokenInformation(token, cls, buf, need, out need)) return buf;
+        Marshal.FreeHGlobal(buf);
+        return IntPtr.Zero;
+    }
+    public static string User(IntPtr token) {
+        IntPtr buf = Info(token, 1);
         if (buf == IntPtr.Zero) return null;
         try { return new SecurityIdentifier(Marshal.ReadIntPtr(buf)).Value; }
         finally { Marshal.FreeHGlobal(buf); }
     }
-    public int Integrity() {
-        IntPtr buf = TokenInfo(25);
+    public static int Integrity(IntPtr token) {
+        IntPtr buf = Info(token, 25);
         if (buf == IntPtr.Zero) return 0;
         try {
             IntPtr sid = Marshal.ReadIntPtr(buf);
             int n = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
             return Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(n - 1)));
         } finally { Marshal.FreeHGlobal(buf); }
-    }
-    public void Dispose() {
-        if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
     }
 }
 public static class Job {
@@ -157,6 +165,24 @@ public static class Pipe {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool GetNamedPipeClientComputerNameW(SafePipeHandle pipe, System.Text.StringBuilder name, uint len);
     // A local client has no computer name (ERROR_PIPE_LOCAL); an SMB client does.
     public static bool Remote(SafePipeHandle p) { return GetNamedPipeClientComputerNameW(p, new System.Text.StringBuilder(256), 512); }
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool ImpersonateNamedPipeClient(SafePipeHandle pipe);
+    [DllImport("advapi32.dll")] static extern bool RevertToSelf();
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenThreadToken(IntPtr thread, uint access, bool asSelf, out IntPtr token);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    // The connected client's own token (user and integrity), read by
+    // impersonating it after a message was read; no pid is involved.
+    public static bool ClientIs(SafePipeHandle p, string user, int minIntegrity) {
+        if (!ImpersonateNamedPipeClient(p)) return false;
+        IntPtr token = IntPtr.Zero;
+        try {
+            if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out token)) return false;
+        } finally {
+            if (!RevertToSelf()) Environment.FailFast("RevertToSelf failed");
+        }
+        try { return Token.User(token) == user && Token.Integrity(token) >= minIntegrity; }
+        finally { CloseHandle(token); }
+    }
 }
 public static class Dir {
     [StructLayout(LayoutKind.Sequential)] struct SA { public int Length; public IntPtr Descriptor; public bool Inherit; }
@@ -250,8 +276,20 @@ function Use-Private([string]$path, [string]$what) {
     if (-not (Test-Path -LiteralPath $path)) { [void][PrCoord.Dir]::Create($path, $me) }
     Assert-Private $path $what
 }
+# The root may not sit under a junction or link anywhere up its parent chain.
+function Assert-NoLinkAbove([string]$root) {
+    $p = Split-Path -Parent $root
+    while ($p) {
+        $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Fail ('agent root ' + $root + ' is under a junction or link (' + $p + '); refusing to use it')
+        }
+        $p = Split-Path -Parent $p
+    }
+}
 function Open-Root([string]$value, [bool]$create) {
     $root = Resolve-Root $value
+    Assert-NoLinkAbove $root
     if (-not (Test-Path -LiteralPath $root)) {
         if (-not $create) { return $null }
         $parent = Split-Path -Parent $root
@@ -279,7 +317,7 @@ function Get-Facts($rec, [string]$script) {
     $id = 0; $created = [int64]0
     if ($rec) { try { $id = [int]$rec.pid; $created = [int64]$rec.created } catch {} }
     $facts = [ordered]@{ pid = $id; created = $created; live_created = [int64]0; cmdline_match = $false; owner_match = $false }
-    $proc = [PrCoord.Proc]::Open($id)
+    $proc = [PrCoord.Proc]::Query($id)
     if ($proc) {
         try {
             if (-not $proc.Exited()) {
@@ -316,7 +354,7 @@ function Connect-Holder([string]$session, $holder) {
             Start-Sleep -Milliseconds 300
         }
     }
-    $server = [PrCoord.Proc]::Open([PrCoord.Pipe]::Server($client.SafePipeHandle))
+    $server = [PrCoord.Proc]::Query([PrCoord.Pipe]::Server($client.SafePipeHandle))
     if (-not $server) { $client.Dispose(); Fail 'environment pipe server is gone' }
     try {
         if ($server.Id -ne $holder.pid -or $server.Created() -ne $holder.created -or $server.User() -ne $me) {
@@ -466,13 +504,12 @@ function New-Server {
     try { New-Object IO.Pipes.NamedPipeServerStream($pipeName, 'InOut', 1, 'Byte', 'None', 4096, 4096, $sec) }
     catch { Fail ('pipe name unavailable: ' + $_.Exception.Message) }
 }
-# Only local clients of this user at High integrity (SSH logons are network
-# logons, so the NETWORK group cannot be denied; SMB clients are refused here).
+# Only local clients of this user at High integrity, judged by the client's
+# own token through impersonation (SSH logons are network logons, so the
+# NETWORK group cannot be denied; SMB clients are refused here).
 function Test-Client($server) {
     if ([PrCoord.Pipe]::Remote($server.SafePipeHandle)) { return $false }
-    $client = [PrCoord.Proc]::Open([PrCoord.Pipe]::Client($server.SafePipeHandle))
-    if (-not $client) { return $false }
-    try { $client.User() -eq $me -and $client.Integrity() -ge 0x3000 } finally { $client.Dispose() }
+    [PrCoord.Pipe]::ClientIs($server.SafePipeHandle, $me, 0x3000)
 }
 $server = New-Server
 $self = [PrCoord.Proc]::Self()
@@ -484,9 +521,9 @@ while ($true) {
     try {
         $server.WaitForConnection()
         $w = New-Object IO.StreamWriter($server, $utf8); $w.AutoFlush = $true
-        if (-not (Test-Client $server)) { $w.WriteLine('denied'); continue }
         $r = New-Object IO.StreamReader($server, $utf8)
-        $line = $r.ReadLine()
+        $line = $r.ReadLine()  # impersonation needs a message read first
+        if (-not (Test-Client $server)) { $line = $null; $w.WriteLine('denied'); continue }
         if ($line -cmatch '\Acredential ([A-Za-z0-9_-]+)\z') {
             if ($held) { $w.WriteLine('already-held') } else {
                 [Environment]::SetEnvironmentVariable('GH_TOKEN', $Matches[1], 'Process')

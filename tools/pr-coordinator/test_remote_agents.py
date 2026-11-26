@@ -552,7 +552,50 @@ class WindowsAgents(unittest.TestCase):
         )
         self.assertIn("0x2000", win.NATIVE)  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 
-    def test_host_guards_folders_starts_and_the_holder(self):
+    def test_only_the_kill_script_opens_processes_with_terminate_rights(self):
+        bodies = {
+            name: getattr(win, name).split(win.HELPERS, 1)[-1]
+            for name in (
+                "START",
+                "LIST",
+                "TAIL",
+                "ENV",
+                "ENV_PREPARE",
+                "HOLDER_FACTS",
+                "KILL",
+                "HOLDER",
+            )
+        }
+        for name, body in bodies.items():
+            if name != "KILL":
+                self.assertNotIn("[PrCoord.Proc]::Open(", body, name)
+        self.assertNotIn("[PrCoord.Proc]::Open(", win.HELPERS)
+        self.assertIn("$proc = [PrCoord.Proc]::Query($id)", win.HELPERS)  # Get-Facts
+        self.assertIn(
+            "public static Proc Query(int pid) { return OpenWith(pid, 0x1000 | 0x00100000); }",
+            win.NATIVE,
+        )
+
+    def test_holder_judges_clients_by_their_token_not_their_pid(self):
+        holder = win.HOLDER.split(win.HELPERS, 1)[1]
+        self.assertNotIn("Pipe]::Client(", holder)
+        self.assertIn(
+            "[PrCoord.Pipe]::ClientIs($server.SafePipeHandle, $me, 0x3000)", holder
+        )
+        # ImpersonateNamedPipeClient needs a message read first; nothing acts before the check.
+        read = holder.index("$line = $r.ReadLine()")
+        check = holder.index("if (-not (Test-Client $server))")
+        self.assertLess(read, check)
+        self.assertLess(check, holder.index("SetEnvironmentVariable"))
+        self.assertIn("RevertToSelf()) Environment.FailFast", win.NATIVE)
+
+    def test_root_may_not_sit_under_a_link(self):
+        self.assertIn("function Assert-NoLinkAbove", win.HELPERS)
+        root = win.HELPERS[win.HELPERS.index("function Open-Root") :]
+        self.assertLess(
+            root.index("Assert-NoLinkAbove $root"), root.index("CreateDirectory")
+        )
+
         helpers = win.HELPERS
         for why in (
             "is a junction or link",
@@ -566,7 +609,7 @@ class WindowsAgents(unittest.TestCase):
         self.assertIn("'run.lock'", win.START)
         self.assertIn("'run.lock'", win.RUN)
         self.assertIn("output.1.log", win.START)  # previous log kept
-        self.assertIn("$client.Integrity() -ge 0x3000", win.HOLDER)
+        self.assertIn("ClientIs($server.SafePipeHandle, $me, 0x3000)", win.HOLDER)
         self.assertIn("[PrCoord.Pipe]::Remote(", win.HOLDER)  # SMB clients refused
         self.assertIn("$server.User() -ne $me", win.HELPERS)  # pipe server's user
         self.assertIn("pipe name unavailable", win.HOLDER)
