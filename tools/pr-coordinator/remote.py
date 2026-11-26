@@ -30,7 +30,8 @@ def git(wt, *args):
 
 
 def record(*args):
-    run(cli(*args), timeout=90)
+    # Dashboard bookkeeping must never fail the work it describes.
+    run(cli(*args), timeout=90, check=False)
 
 
 def remote(host, argv, *, cwd=None, **kwargs):
@@ -162,7 +163,7 @@ def rt_main():
         if args.admit_now and not admitted():
             return declined()
         record(
-            "run",
+            "run-state",
             rid,
             "running",
             "--machine",
@@ -179,7 +180,7 @@ def rt_main():
             # Keep capacity denial distinguishable from a failed remote command.
             return 1 if args.admit_now and result == RT_NOT_ADMITTED else result
         finally:
-            record("run", rid, "done")
+            record("run-state", rid, "done")
 
 
 def cert_args(wt, pr, target, sha, base, host):

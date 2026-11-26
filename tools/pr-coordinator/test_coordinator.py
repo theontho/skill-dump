@@ -562,6 +562,17 @@ raise SystemExit(1)
         self.assertEqual(len(calls), 2)
         self.assertEqual(len(asked), 1)
 
+    def test_remote_test_status_uses_a_command_the_cli_accepts(self):
+        import remote
+
+        calls = []
+        with mock.patch.object(remote, "run", lambda argv, **k: calls.append(argv)):
+            remote.record("run-state", "rt-1", "done")
+        self.assertIn("run-state", calls[0])
+        result = self.command("run-state", "rt-1", "running", "--machine", "worker", check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('record("run",', (TOOL / "remote.py").read_text())
+
     def test_train_retries_cancellations_only_not_timeouts_or_test_failures(self):
         jobs = [
             {"name": "required", "conclusion": "failure"},
