@@ -1,4 +1,4 @@
-"""Launch configured POSIX implementers in tmux."""
+"""Launch configured implementers: tmux on POSIX hosts, WMI-detached wrappers on Windows."""
 
 import argparse
 import json
@@ -62,12 +62,37 @@ def main(command):
     parser = argparse.ArgumentParser()
     parser.add_argument("host", choices=list(P.hosts))
     if command == "remote-agent":
-        parser.add_argument("name")
-        parser.add_argument("prompt", type=Path)
+        parser.add_argument("name", nargs="?")
+        parser.add_argument("prompt", nargs="?", type=Path)
+        windows = parser.add_argument_group("Windows hosts only")
+        windows.add_argument(
+            "--list", action="store_true", help="list agents and their state"
+        )
+        windows.add_argument(
+            "--log", action="store_true", help="print the end of NAME's log"
+        )
+        windows.add_argument("--lines", type=int, default=40, help="lines for --log")
+        windows.add_argument(
+            "--stop", action="store_true", help="stop NAME's process tree"
+        )
+    else:
+        parser.add_argument(
+            "--stop", action="store_true", help="Windows: stop the environment holder"
+        )
     args = parser.parse_args()
     host = P.hosts[args.host]
+    if P.ssh(args.host) and host.get("windows") and host.get("remote_agents"):
+        from remote_agents_windows import main as windows_main
+
+        return windows_main(command, args, parser)
     if not P.ssh(args.host) or host.get("windows") or not host.get("remote_agents"):
-        parser.error("this host is not configured for POSIX remote agents")
+        parser.error("this host is not configured for remote agents")
+    if args.stop or getattr(args, "list", False) or getattr(args, "log", False):
+        parser.error(
+            "--list, --log and --stop are for Windows hosts; use tmux on POSIX"
+        )
+    if command == "remote-agent" and (not args.name or not args.prompt):
+        parser.error("provide NAME and PROMPT_FILE")
     session = host.get("agent_env_session", "")
     if session and not re.fullmatch(r"[A-Za-z0-9_-]+", session):
         parser.error("invalid tmux environment session name")

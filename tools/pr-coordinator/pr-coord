@@ -71,8 +71,8 @@ LOCAL = {
     "handoff": "submit an owner PR using its local branch worktree",
     "watch-draft": "wait for exact-head draft review and certification",
     "finish-draft": "adopt a reviewed and certified owner draft",
-    "remote-agent": "launch a configured POSIX implementer in tmux",
-    "agent-env": "initialize a configured POSIX tmux environment from stdin",
+    "remote-agent": "launch, list, tail or stop a configured remote implementer",
+    "agent-env": "hold a credential from stdin in memory for a host's agents",
 }
 
 DATASETS = {

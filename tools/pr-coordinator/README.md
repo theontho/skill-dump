@@ -3,7 +3,7 @@
 `pr-coord` coordinates a GitHub PR backlog across machines. The controller runs on
 Linux/macOS with Python 3.11+, Git and `gh`; remote features use SSH, `rt` also
 uses rsync, and resource probes and leases can use `agent-coord`. Windows can be
-a remote certification/JUnit worker. Installing the command does not start
+a remote certification/JUnit worker and run remote implementers. Installing the command does not start
 anything. No Python packages are needed for the tool.
 
 ## Set up a project
@@ -98,17 +98,72 @@ that queue to dashboard readers but does not put it in the owner answer form.
   `ATTENTION` means an operator must investigate; already-ready PRs can be
   submitted with `handoff PR`. It reuses the clean PR branch worktree or creates
   one and fast-forwards only; it does not discard local changes.
-- **Remote implementers:** opt a POSIX host in with `remote_agents = true`
-  and configure `[remote_agents]` with `command` (agent argv before `-p PROMPT`),
-  `report` (controller reporter argv), and an optional `runbook` file.
+- **Remote implementers:** opt a host in with `remote_agents = true` and
+  configure `[remote_agents]` with `command` (agent argv before `-p PROMPT`),
+  `report` (reporter argv, run on the host), and an optional `runbook` file.
   `remote-agent HOST NAME PROMPT_FILE` sends the prompt and optional runbook
-  over SSH to that trusted host and starts a tmux agent. Set a host's
-  `agent_env_session` to require an existing session for its windows. For a
-  keychain inaccessible over SSH, an operator can explicitly pipe an authorized
-  credential to `agent-env HOST`; it initializes that tmux session in memory
-  without storing the credential in settings or logs. Only do this for a host
-  authorized to receive the credential. Closing the session drops its tmux
-  environment; already-running programs retain their own environment.
+  over SSH to that trusted host and starts the agent. On a POSIX host it runs in
+  tmux. Set a host's `agent_env_session` to require an existing session for its
+  windows. For a keychain inaccessible over SSH, an operator can explicitly
+  pipe an authorized credential to `agent-env HOST`; it initializes that tmux
+  session in memory without storing the credential in settings or logs. Only
+  do this for a host authorized to receive the credential. Closing the session
+  drops its tmux environment; already-running programs retain their own
+  environment.
+- **Remote implementers on Windows:** a host with `windows = true` and
+  `remote_agents = true` uses the same commands and keys; the SSH shell may be
+  PowerShell or cmd. There is no tmux: each agent gets a directory
+  `AGENT_ROOT\NAME` (host key `agent_root`, default `CHECKOUT\out\agents`;
+  a drive or `~\` path) holding `prompt.md`, the runbook, `launch.json`, a
+  static wrapper `run.ps1`, `pid.json` (pid, process start time, start
+  date), `output.log` and `exit.code`. The directory is created readable only
+  by the user and SYSTEM. The wrapper is started through
+  `Win32_Process.Create`, so it outlives the SSH call (a `Start-Process` child
+  is killed when the SSH session ends), and runs the agent in the host
+  `checkout` with stdin from `prompt.md` and stdout and stderr in
+  `output.log`, as the agent writes them (Node-based runtimes write UTF-8; the
+  wrapper's own `EXIT N` line is UTF-8). The prompt never appears on a command
+  line: `-p` is appended without an argument (Claude Code reads the prompt from
+  stdin), or an argument containing `{prompt_file}` gets the prompt's path and
+  no `-p` is added. A host's `agent_command` and `agent_report` override
+  `[remote_agents]` when the executables differ there. The agent argv is
+  joined into one `cmd.exe` line for the redirections, so its arguments may not
+  contain `"%!^&|<>`; run a `.ps1` shim through its `.cmd` twin or
+  `powershell.exe -File`. Reporter arguments may not be empty or contain `"`.
+  `shell_prefix` does not apply.
+  - `remote-agent HOST --list` prints each agent with `running`,
+    `exited RC`, `stopped`, `lost` (its process is gone without an exit
+    code, e.g. after a reboot) or `starting`.
+  - `remote-agent HOST NAME --log [--lines N]` prints the end of its log.
+  - `remote-agent HOST NAME --stop` kills the process tree of the recorded
+    wrapper pid, only after checking on the host that the pid still has the
+    recorded start time and runs that agent's `run.ps1`; a missing, zero or
+    unverified pid is refused. Children are followed by parent pid only when
+    they started after their parent, so a reused pid is not followed. Nothing
+    is killed by name.
+  - Names are limited to letters, digits, `_` and `-` (64 characters, not
+    a device name such as `CON`) and checked again on the host. Names, the
+    root and the session are passed to the remote scripts as quoted arguments,
+    and file contents as base64 JSON on stdin; no value is spliced into script
+    text.
+  - `agent-env HOST` on Windows starts a detached holder process for the
+    host's `agent_env_session`. The credential is piped through SSH stdin to
+    the host (the controller does not read it) and handed to the holder over a
+    named pipe that only this user may open (the client checks the pipe's
+    server pid is the recorded holder). The holder keeps it only in its own
+    process environment as `GH_TOKEN` and `COPILOT_GITHUB_TOKEN`, and starts
+    that host's agents, which inherit it. It is never written to a file, the
+    registry, a log or a command line. Limits: any process of the same user
+    (and any administrator) can read the holder's and agents' memory and
+    environment, and memory can be paged to disk. `agent-env HOST --stop`
+    stops the holder (verified like an agent); running agents keep their
+    environment. With `agent_env_session` set, new agents need the holder.
+  - Remote logons (SSH, WMI) of an administrator get the full administrator
+    token, so agents run elevated; no interactive desktop session is needed
+    or used. Agents and the holder do not survive a reboot or a sign-out of
+    all sessions: they show as `lost`, and `agent-env` must be piped again.
+    A runtime that keeps its own sign-in (e.g. Claude Code's credentials file
+    in the user's profile) needs no `agent-env`.
 - **Remote tests:** `rt HOST WORKTREE -- COMMAND ...` sends the current
   worktree, including uncommitted changes, to the configured SSH worker. Only
   point this at trusted machines. `remote_tests.prepare` must provision the
