@@ -71,7 +71,7 @@ def main(command):
         windows.add_argument(
             "--log", action="store_true", help="print the end of NAME's log"
         )
-        windows.add_argument("--lines", type=int, default=40, help="lines for --log")
+        windows.add_argument("--lines", type=int, help="lines for --log (40)")
         windows.add_argument(
             "--stop", action="store_true", help="stop NAME's process tree"
         )
@@ -87,9 +87,14 @@ def main(command):
         return windows_main(command, args, parser)
     if not P.ssh(args.host) or host.get("windows") or not host.get("remote_agents"):
         parser.error("this host is not configured for remote agents")
-    if args.stop or getattr(args, "list", False) or getattr(args, "log", False):
+    if (
+        args.stop
+        or getattr(args, "list", False)
+        or getattr(args, "log", False)
+        or getattr(args, "lines", None) is not None
+    ):
         parser.error(
-            "--list, --log and --stop are for Windows hosts; use tmux on POSIX"
+            "--list, --log, --lines and --stop are for Windows hosts; use tmux on POSIX"
         )
     if command == "remote-agent" and (not args.name or not args.prompt):
         parser.error("provide NAME and PROMPT_FILE")
