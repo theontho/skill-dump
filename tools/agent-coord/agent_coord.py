@@ -22,11 +22,19 @@ import threading
 import time
 from pathlib import Path
 
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
+# Tests and throwaway trials only: AGENT_COORD_RUNTIME_DIR and
+# AGENT_COORD_STATE_DIR point an instance at its own socket, state and history.
+# Set for the shared service, it would start from an empty state.
+RUNTIME = Path(
+    os.environ.get("AGENT_COORD_RUNTIME_DIR")
+    or Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
+)
 SOCKET = RUNTIME / "sock"
 STATE_FILE = (
-    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    / "agent-coord"
+    Path(
+        os.environ.get("AGENT_COORD_STATE_DIR")
+        or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agent-coord"
+    )
     / "state.json"
 )
 # One JSON line per lease event, next to the state; rotated by size.
@@ -36,6 +44,7 @@ HISTORY_KEEP = 4  # rotated files kept: history.jsonl.1 .. .4
 # Left for the desktop, the agents themselves and unleased short commands.
 RESERVE_MEM = 4 * 1024**3
 TICK = 2.0
+BUSY_SMOOTHING = 0.2  # per tick, for host-wide and per-lease CPU use
 POLL = 3.0
 # Holders hear about a request that has waited this long (once per request).
 NUDGE_AFTER = 60
@@ -226,6 +235,10 @@ def _tree_pids(pid: int):
             pass  # exited, or no children file: counts as what was read so far
 
 
+def tree_pids(pid: int) -> set[int]:
+    return set(_tree_pids(pid))
+
+
 def tree_footprint(pid: int) -> int:
     """Resident plus swapped-out memory of pid and its descendants."""
     return sum(_footprint(current) for current in _tree_pids(pid))
@@ -322,7 +335,7 @@ class Coordinator:
 
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
                  history_file: Path | None = None, footprint=tree_footprint,
-                 cpu_seconds=tree_cpu_seconds):
+                 cpu_seconds=tree_cpu_seconds, tree_pids=tree_pids):
         self._saved = None
         self._samples = None
         self._footprints = None
@@ -331,6 +344,13 @@ class Coordinator:
         self.cpu_seconds = cpu_seconds
         self._cpu_sample: tuple[float, dict[str, float]] | None = None
         self._measured_cores: dict[str, float] = {}
+        # A lease's own CPU use, smoothed like self.busy (from zero, as the
+        # host-wide figure is for a new lease's load), to take it out of the
+        # host-wide measurement when the lease is counted at its full size;
+        # and each measured lease's process tree, to count nested ones once.
+        self._own_cores: dict[str, float] = {}
+        self._trees: dict[str, set[int]] = {}
+        self.tree_pids = tree_pids
         self._low_since: dict[tuple[str, str], float] = {}
         self.state_file = state_file
         self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
@@ -482,6 +502,45 @@ class Coordinator:
         return sum(x["cores"] for x in leases
                    if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")))
 
+    def _covered(self) -> set[str]:
+        """Measured leases whose process is inside another measured lease's
+        tree (a lease started from within a lease, or two leases on one
+        pid): their use is already in the outer one's measurement."""
+        measured = [x for x in self.state["leases"] if x["id"] in self._own_cores]
+        covered = set()
+        for i, x in enumerate(measured):
+            for j, outer in enumerate(measured):
+                if outer is x:
+                    continue
+                tree = self._trees.get(outer["id"], {outer["pid"]})
+                if x["pid"] in tree and (x["pid"] != outer["pid"] or j < i):
+                    covered.add(x["id"])
+                    break
+        return covered
+
+    def _counted_once(self) -> set[str]:
+        """Leases exclusive on a lock (timing runs), unless IO: reserved at
+        their full size all along, so their own measured use comes out of the
+        measured load. (Warming leases keep main's conservative double count.)"""
+        return {x["id"] for x in self.state["leases"]
+                if not x.get("io") and x.get("exclusive_locks")}
+
+    def _net_busy(self) -> float:
+        """Measured busy cores, less the own use of exclusive-lock leases, so
+        a timing run counts once, at its size, not at its size plus its
+        measured use. Only use up to its size comes off: use above it (a job
+        in its process tree but in a scope of its own, an uncapped hold,
+        noise) stays counted as load. Lease use is smoothed like the busy
+        figure, and counted once per process tree."""
+        once = self._counted_once()
+        covered = self._covered()
+        net = self.busy
+        for x in self.state["leases"]:
+            own = self._own_cores.get(x["id"])
+            if own is not None and x["id"] in once and x["id"] not in covered:
+                net -= min(own, x["cores"])
+        return max(0.0, net)
+
     def _warming(self) -> list[dict]:
         """Leases started in the last WARMUP seconds: not yet at full speed,
         so not yet fully in the measurement."""
@@ -496,10 +555,10 @@ class Coordinator:
         size until they ramp up. Memory counts every lease at its size, since
         running out of it means swapping or killing."""
         # Leases exclusive on a lock (timing runs) count in full all along, so
-        # their cores stay guaranteed. Conservative: their measured use is in
-        # self.busy too.
+        # their cores stay guaranteed; only the rest of the measured load
+        # counts beside them (their own measured use is taken out of it).
         leases = self.state["leases"]
-        cores = max(self.busy, sum(self._cpu_claim(x) for x in leases if x.get("io")))
+        cores = max(self._net_busy(), sum(self._cpu_claim(x) for x in leases if x.get("io")))
         cores += self._reserved_cpu(leases)
         vms = self._vms()
         mem = sum(self._mem_claim(x) for x in leases) + sum(g["mem"] for g in vms)
@@ -739,13 +798,16 @@ class Coordinator:
             return False
         io_used = sum(self._cpu_claim(x) for x in remaining if x.get("io"))
         outside = self._unleased() + sum(g["cores"] for g in self._vms())
+        once = self._counted_once()  # in _reserved_cpu, out of _net_busy
+        net = self._net_busy()
         if req is None:
             # Measured use finds the head's likely start, but subtracting a
             # full ending claim can undercount holders that remain.
-            used = self.busy - sum(self._cpu_claim(x) for x in ending)
+            used = net - sum(self._cpu_claim(x) for x in ending if x["id"] not in once)
         else:
-            used = outside + min(sum(self._cpu_claim(x) for x in remaining),
-                                 max(0, self.busy - outside))
+            used = outside + min(sum(self._cpu_claim(x) for x in remaining
+                                     if x["id"] not in once),
+                                 max(0, net - outside))
         used = max(outside + io_used, used) + self._reserved_cpu(remaining)
         if used + self._cpu_claim(head) + (self._cpu_claim(req) if req else 0) > cores:
             return False
@@ -908,12 +970,20 @@ class Coordinator:
         self._cpu_sample = now, samples
         self._measured_cores = {}
         if previous is None or now <= previous[0]:
+            self._own_cores = {}
             return
+        own = {}
         for x in self.state["leases"]:
             lease_id = x["id"]
             if lease_id in samples and lease_id in previous[1]:
                 delta = samples[lease_id] - previous[1][lease_id]
-                self._measured_cores[lease_id] = min(x["cores"], max(0, delta) / (now - previous[0]))
+                raw = max(0, delta) / (now - previous[0])
+                self._measured_cores[lease_id] = min(x["cores"], raw)
+                # Smoothed like self.busy, starting from 0 as the host-wide
+                # figure effectively does: never subtract more than it holds.
+                before = self._own_cores.get(lease_id, 0.0)
+                own[lease_id] = before + BUSY_SMOOTHING * (raw - before)
+        self._own_cores = own
 
     def _hint_io(self, now: float) -> bool:
         low_since = {}
@@ -951,16 +1021,20 @@ class Coordinator:
         sample = self.measure()
         with self.lock:
             targets = [(x["id"], x["pid"]) for x in self.state["leases"]
-                       if x.get("io") or (x["cores"] >= 2 and not x.get("io_hint"))]
+                       if x.get("io") or x.get("exclusive_locks")
+                       or (x["cores"] >= 2 and not x.get("io_hint"))]
         now = time.monotonic()
         by_pid = {pid: self.cpu_seconds(pid) for pid in {pid for _, pid in targets}}
         samples = {lease_id: by_pid[pid] for lease_id, pid in targets if by_pid[pid] is not None}
+        trees = ({pid: self.tree_pids(pid) for pid in by_pid if by_pid[pid] is not None}
+                 if len(targets) > 1 else {})  # fmt: skip
         with self.lock:
+            self._trees = {lease_id: trees[pid] for lease_id, pid in targets if pid in trees}
             self._sample_lease_cpu(now, samples)
             self.vms = sample["vms"]
             self.available = sample["available"]
             # Smoothed over ~10 s: a moment's burst shouldn't hold the line.
-            self.busy += 0.2 * (sample["busy"] - self.busy)
+            self.busy += BUSY_SMOOTHING * (sample["busy"] - self.busy)
             changed = self._prune()
             changed |= self._hint_io(now)
             changed |= self._admit()

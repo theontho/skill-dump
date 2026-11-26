@@ -39,6 +39,9 @@ class CoordinatorTest(unittest.TestCase):
             measure=lambda: {"vms": list(self.vms), "busy": self.busy,
                              "available": self.available},
             cap=lambda: (8.0, 16 * GIB),
+            # No real CPU readings (the test process's own CPU time would leak
+            # into admission): tests that need lease use inject it.
+            cpu_seconds=lambda pid: None,
         )
 
     def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=(),
@@ -768,6 +771,134 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(3, agent="c")["state"], "granted")
         self.assertEqual(self.ask(1, agent="d")["state"], "waiting")  # c warms up
 
+    def measure_leases(self, usage, busy=None, trees=None):
+        """Tick until the smoothed measurements settle, with each lease pid
+        using usage[pid] cores and the host busy (default: their sum). No
+        process is signalled: CPU time and trees are looked up in dicts."""
+        cpu = {pid: 0.0 for pid in usage}
+        self.c.cpu_seconds = cpu.get
+        self.c.tree_pids = lambda pid: (trees or {}).get(pid, {pid})
+        self.busy = self.c.busy = sum(usage.values()) if busy is None else busy
+        with patch.object(ac.time, "monotonic", return_value=1000) as clock:
+            self.c.tick()
+            for _ in range(80):
+                clock.return_value += 4
+                for pid, cores in usage.items():
+                    cpu[pid] += cores * 4
+                self.c.tick()
+
+    def free_cores(self):
+        return self.c.handle({"op": "status"})["free"]["cores"]
+
+    def fits(self, cores):
+        return self.c.handle({"op": "check", "cores": cores, "mem": GIB})["ok"]
+
+    def timed(self, size=8, headroom=1, pid=None, **extra):
+        self.configure(cores=12, mem=58)
+        lease = self.ask(size, agent="perf", exclusive_locks=["gpu"], headroom=headroom,
+                         pid=pid or os.getpid(), **extra)
+        self.age(lease, ac.WARMUP + 1, "granted")
+        return lease
+
+    def admissible(self):
+        """The largest request (in tenths of a core) a check admits."""
+        return max([0.0] + [n / 10 for n in range(1, 121) if self.fits(n / 10)])
+
+    def assertAdmissible(self, expected):
+        # Smoothed measurements settle a hair off whole cores: within a step.
+        got = self.admissible()
+        self.assertTrue(expected - 0.1 - 1e-9 <= got <= expected, (got, expected))
+
+    def test_exclusive_lock_lease_is_not_counted_twice(self):
+        # The stall: an 8-core GPU timing run (headroom 1) measured at 8.5 of
+        # 12 cores was counted at 8.5 measured + 8 reserved = 16.5, so nothing
+        # (not even 2 cores) was admitted beside it for the whole run. Its use
+        # up to its size comes off the measured load; the 0.5 above it is
+        # other work and still counts.
+        self.timed()
+        self.measure_leases({os.getpid(): 8.5})
+        self.assertAlmostEqual(self.free_cores(), 3.5, places=1)  # 12 - 8 - 0.5, not -4.5
+        self.assertAdmissible(2.5)  # less 1 of headroom
+        waiting = self.ask(4, agent="cpu4")
+        self.assertEqual(waiting["state"], "waiting")
+        self.release(waiting)
+        self.assertEqual(self.ask(2, agent="cpu2")["state"], "granted")
+
+    def test_use_above_an_exclusive_lock_leases_size_counts_as_load(self):
+        self.timed()
+        self.measure_leases({os.getpid(): 9.5})  # 1.5 above its quota: noise or other work
+        self.assertAdmissible(1.5)
+
+    def test_uncapped_held_exclusive_lock_lease_above_its_size(self):
+        self.timed(running=True)  # hold: no scope caps it
+        self.measure_leases({os.getpid(): 11.0})
+        self.assertAdmissible(0.0)
+
+    def test_exclusive_lock_lease_below_its_size_keeps_its_cores(self):
+        self.timed(headroom=0)
+        self.measure_leases({os.getpid(): 3.0})
+        self.assertAlmostEqual(self.free_cores(), 4.0, places=1)  # its unused 5 stay reserved
+        self.assertAdmissible(4.0)
+
+    def test_two_exclusive_lock_leases_count_once_each(self):
+        self.configure(cores=12, mem=58)
+        gpu = self.ask(4, agent="gpu", exclusive_locks=["gpu"], pid=os.getpid())
+        nas = self.ask(3, agent="nas", exclusive_locks=["nas"], pid=os.getppid())
+        for lease in (gpu, nas):
+            self.age(lease, ac.WARMUP + 1, "granted")
+        self.measure_leases({os.getpid(): 4.0, os.getppid(): 3.0})
+        self.assertAlmostEqual(self.free_cores(), 5.0, places=1)
+        self.assertAdmissible(5.0)
+
+    def test_exclusive_lock_lease_plus_unleased_load(self):
+        self.timed(headroom=0)
+        self.measure_leases({os.getpid(): 8.0}, busy=10.0)  # 2 cores of other work
+        self.assertAlmostEqual(self.free_cores(), 2.0, places=1)
+        self.assertAdmissible(2.0)
+
+    def test_ordinary_lease_inside_an_exclusive_lock_leases_tree(self):
+        # agent-coord run inside a timing run: the inner job is in its own
+        # scope (outside the outer quota) but in the outer process tree, so
+        # the outer tree measures both. Only the outer lease's size comes
+        # off; the inner job's 2 cores stay counted.
+        outer = os.getpid()
+        self.timed(headroom=0, pid=outer)
+        inner = self.ask(2, agent="inner", pid=os.getppid())
+        self.age(inner, ac.WARMUP + 1, "granted")
+        self.measure_leases({outer: 10.0, os.getppid(): 2.0}, busy=10.0,
+                            trees={outer: {outer, os.getppid()}})
+        self.assertAlmostEqual(self.free_cores(), 2.0, places=1)
+        self.assertAdmissible(2.0)
+
+    def test_nested_exclusive_lock_leases_are_measured_once(self):
+        # Two timing leases, the inner one in the outer's tree (whose
+        # measurement includes it): neither is subtracted twice.
+        outer = os.getpid()
+        self.timed(size=6, headroom=0, pid=outer)
+        inner = self.ask(2, agent="perf", exclusive_locks=["nas"], pid=os.getppid())
+        self.age(inner, ac.WARMUP + 1, "granted")
+        self.measure_leases({outer: 6.0, os.getppid(): 2.0}, busy=7.0,
+                            trees={outer: {outer, os.getppid()}})
+        # 6 + 2 reserved; 7 busy less the outer tree's 6: 1 of other work.
+        self.assertAlmostEqual(self.free_cores(), 3.0, places=1)
+
+    def test_a_ramping_exclusive_lock_lease_is_not_over_subtracted(self):
+        # Its own use is smoothed from zero like the host figure, so while it
+        # ramps up it never takes more out of the busy figure than that holds.
+        self.timed(headroom=0)
+        self.measure_leases({os.getpid(): 2.0})
+        with patch.object(ac.time, "monotonic", return_value=9000) as clock:
+            cpu = {os.getpid(): 0.0}
+            self.c.cpu_seconds = cpu.get
+            self.c.tick()
+            clock.return_value += 4
+            cpu[os.getpid()] += 8 * 4  # jumps to 8
+            self.busy = 8.0
+            self.c.tick()
+        self.assertLessEqual(self.c._own_cores[self.c.state["leases"][0]["id"]], self.c.busy + 1e-9)
+        self.assertLessEqual(self.free_cores(), 4.0 + 0.01)
+
+
     def test_exclusive_lock_and_exclusive_together_are_refused(self):
         self.assertIn("error", self.ask(1, exclusive=True, exclusive_locks=["gpu"]))
 
@@ -1145,6 +1276,81 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.c.handle({"op": "poll", "id": held["id"]})["state"],
                          "granted")  # fmt: skip
         self.assertEqual(len(self.c.handle({"op": "inbox", "agent": "b"})["messages"]), 1)
+
+
+class SameAsMainWithoutExclusiveLeasesTest(unittest.TestCase):
+    """Without exclusive-lock leases, admission decides exactly as main's
+    code (the merge base with origin/main) on the same random workloads."""
+
+    @classmethod
+    def setUpClass(cls):
+        here = Path(__file__).resolve().parent
+        try:
+            base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=here,
+                                  capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+            top = subprocess.run(["git", "rev-parse", "--show-prefix"], cwd=here,
+                                 capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+            source = subprocess.run(["git", "show", f"{base}:{top}agent_coord.py"], cwd=here,
+                                    capture_output=True, text=True, check=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            raise unittest.SkipTest(f"main's agent_coord.py is not available: {e}")
+        cls.tmp = tempfile.TemporaryDirectory()
+        path = Path(cls.tmp.name, "main_agent_coord.py")
+        path.write_text(source)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("main_agent_coord", path)
+        cls.main = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.main)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_random_workloads_decide_as_on_main(self):
+        import random
+        pids = [os.getpid(), os.getppid()]
+        for seed in range(60):
+            rng = random.Random(seed)
+            env = {"busy": 0.0, "now": 100000.0, "mono": 1000.0, "cpu": {pid: 0.0 for pid in pids}}
+            with tempfile.TemporaryDirectory() as tmp, \
+                    patch("time.time", side_effect=lambda: env["now"]), \
+                    patch("time.monotonic", side_effect=lambda: env["mono"]):
+                coordinators = [
+                    module.Coordinator(
+                        Path(tmp, name, "state.json"),
+                        measure=lambda: {"vms": [], "busy": env["busy"], "available": 64 * GIB},
+                        cap=lambda: (12.0, 58 * GIB), footprint=lambda pid: 0,
+                        cpu_seconds=lambda pid: env["cpu"].get(pid))
+                    for module, name in ((self.main, "main"), (ac, "branch"))]
+                for step in range(40):
+                    op = rng.random()
+                    if op < 0.45:
+                        request = {"op": "acquire", "agent": f"a{rng.randrange(3)}",
+                                   "pid": rng.choice(pids), "cores": rng.choice([1, 2, 3, 4, 6]),
+                                   "mem": rng.choice([1, 2, 4, 8]) * GIB, "label": "job",
+                                   "expect": rng.choice([60, 600, 3600]),
+                                   "headroom": rng.choice([0, 0, 0, 1, 2]),
+                                   "locks": rng.choice([[], [], ["nas"]]),
+                                   "io": rng.random() < 0.1}
+                        replies = [c.handle(dict(request)) for c in coordinators]
+                    elif op < 0.65:
+                        ids = [x["id"] for x in coordinators[0].state["leases"]
+                               + coordinators[0].state["queue"]]
+                        if ids:
+                            victim = rng.choice(ids)
+                            replies = [c.handle({"op": "release", "id": victim}) for c in coordinators]
+                    else:
+                        dt = rng.choice([2, 4, 15, 40])
+                        env["now"] += dt
+                        env["mono"] += dt
+                        for pid in pids:
+                            env["cpu"][pid] += rng.uniform(0, 6) * dt
+                        env["busy"] = rng.uniform(0, 12)
+                        for c in coordinators:
+                            c.tick()
+                    states = [([x["id"] for x in c.state["leases"]], [x["id"] for x in c.state["queue"]])
+                              for c in coordinators]
+                    self.assertEqual(states[0], states[1], f"seed {seed} step {step}")
 
 
 class FootprintTest(unittest.TestCase):
