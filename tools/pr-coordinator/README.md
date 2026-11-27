@@ -42,8 +42,10 @@ pr-coord --project project events --wait
 pr-coord --project project events --wait --consumer audit --json
 ```
 
-`--wait` reads local data only. It blocks for the next unseen batch, prints it,
-commits the cursor, and exits. Invoke it again when ready for the next batch;
+`--wait` normally reads the local journal. If no collector holds the project
+lock, it logs the missing watcher and collects local and GitHub events itself
+until the service takes over or a batch is available. It prints the next unseen
+batch, commits the cursor, and exits. Invoke it again when ready for the next batch;
 events accumulate in the meantime. Use the default `supervisor` cursor on
 handoff. A second waiter for the same name is refused; a different name reads
 the same journal from its own cursor. A crash before stdout is flushed does
@@ -143,7 +145,10 @@ applied) and the action parked with `--blocks`.
   opt-in commands. Quick tests absent in the refreshed worktree are omitted.
   `quick_host` uses `rt --admit-now` and falls back to `quick_local_prefix`
   when the remote host cannot admit the job immediately. Remote test failures
-  still fail the gate; they are not retried locally.
+  still fail the gate; they are not retried locally. The train rechecks a
+  transient enqueue rejection once after `landing.enqueue_retry_seconds`
+  (default 15), using the same head and fresh review and CI evidence. A launch
+  hold, head change or known failed merge-group check is not a reason to retry.
 - **Hosts:** entries have a key, display text, SSH alias (omitted for local),
   platform, core count, roles, checkout, `windows` and `agent_coord`. Use
   `cert_priority` for a host's preferred layer and `slots` for its concurrency.
@@ -175,19 +180,33 @@ applied) and the action parked with `--blocks`.
   with `$args`. Project hooks own lockfile validation, worker input caches,
   limits and teardown. `cert-pr` uses an existing clean worktree on the PR
   branch or prepares a dedicated one, then waits for the configured targets;
-  run it in a managed background shell if needed.
-- **Draft handoff:** `watch-draft PR` waits for a submitted bot review and
-  terminal successful certification statuses on the exact head, with no
-  certification still running. Configure `drafts.required_statuses` to require
-  particular status contexts and `drafts.reviewer_pattern` to override the
-  default Copilot bot login regex. `finish-draft PR` additionally checks review
-  threads and ownership, runs `landing.ci_capacity` (plus optional
+  run it in a managed background shell if needed. `cert-pr PR --head SHA`
+  declines if the published head has already changed.
+- **Draft handoff:** `watch-draft PR` requests missing certification and Copilot
+  review once per published head, and waits for terminal certification and a
+  submitted bot review on that exact head. Configure `drafts.required_statuses`
+  to require particular status contexts, `drafts.status_targets` to map a
+  custom context to its certification target, and `drafts.reviewer` or
+  `drafts.reviewer_pattern` to change who gets requested or recognized.
+  `finish-draft PR` additionally checks review threads and ownership, runs
+  `landing.ci_capacity` (plus optional
   `drafts.capacity_args`), retries exit 3, marks the PR ready and submits it to
   the train. If `drafts.ready_workflow` is set, the next adoption waits for the
   previous admission's run with `drafts.ready_run_suffix` (default `/ ready`).
-  `ATTENTION` means an operator must investigate; already-ready PRs can be
-  submitted with `handoff PR`. It reuses the clean PR branch worktree or creates
-  one and fast-forwards only; it does not discard local changes.
+  If interrupted after readiness, rerun `finish-draft PR` to recover train
+  registration, or use `handoff PR` for an already-ready PR. `train add PR`
+  also prepares a missing checkout and keeps an existing active registration.
+  Worktree preparation reuses the clean PR branch worktree or creates one and
+  fast-forwards only; it does not discard local changes. `ATTENTION` means an
+  operator must investigate.
+- **Retry limit:** certification, remote tests and train actions record failures
+  by command, inputs and failure class in the project's `retries/` directory.
+  After two matching failures the coordinator refuses another unchanged
+  attempt and prints both `logs/retry-*.log` paths. Change the relevant input
+  (for example the head, test command, or cert host) after diagnosing the logs.
+  A cert controller's busy response can trigger at most one automatic retry
+  on the same inputs. Optional hosts that are offline or reserved and
+  `rt --admit-now` capacity declines are not failed executions.
 - **Remote implementers:** opt a host in with `remote_agents = true` and
   configure `[remote_agents]` with `command` (agent argv before `-p PROMPT`),
   `report` (reporter argv, run on the host), and an optional `runbook` file.

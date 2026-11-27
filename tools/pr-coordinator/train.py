@@ -10,10 +10,11 @@ import time
 from pathlib import Path
 
 from landing import (
+    EnqueueResult,
     assert_owner,
     checks,
     eligible,
-    enqueue,
+    enqueue_result,
     paused,
     pull,
     queued,
@@ -21,6 +22,7 @@ from landing import (
 )
 from lane import acquire, touches
 from remote import RT_NOT_ADMITTED
+from retries import ACTION_ERRORS, Retry, RetryLimit, error_class
 from runtime import P, cli, gh_argv, load, locked, questions, save, uuid4
 
 HERE = P.data
@@ -78,6 +80,100 @@ def need_agent(n, why):
     status(n, "blocked", why[:200])
 
 
+def registered(pr, head):
+    return any(
+        row["pr"] == pr
+        and row.get("head", head) == head
+        and row.get("stage") not in {"closed", "merged"}
+        for row in load(TRAIN, [])
+    )
+
+
+def register(pr, wt, head, *, readd=False):
+    wt = str(Path(wt).resolve())
+    added = False
+
+    def update(rows):
+        nonlocal added
+        for row in rows:
+            if row["pr"] == pr and row.get("head", head) == head:
+                stage = row.get("stage")
+                if stage not in {"closed", "merged"} and not (
+                    readd and (stage == "blocked" or row["worktree"] != wt)
+                ):
+                    row.setdefault("head", head)
+                    return rows
+        added = True
+        return [row for row in rows if row["pr"] != pr] + [
+            {
+                "pr": pr,
+                "head": head,
+                "worktree": wt,
+                "stage": "new",
+                "added": time.strftime("%Y-%m-%d %H:%M"),
+                "token": uuid4().hex,
+            }
+        ]
+
+    locked_json(TRAIN, update, [])
+    if added:
+        sh(
+            [
+                *cli(),
+                "log",
+                f"#{pr}: registered {head[:9]} with the landing train ({wt})",
+            ]
+        )
+        print(f"#{pr} handed to the landing train ({wt}); you can stop now.")
+    else:
+        print(f"#{pr} already registered with the landing train at {head[:9]}.")
+
+
+def train_retry(n, head, step, **inputs):
+    return Retry(
+        P.data,
+        f"train-{step}",
+        pr=n,
+        head=head,
+        settings=P.settings.get("landing"),
+        **inputs,
+    )
+
+
+def enqueue_checked(n, head, active=lambda: True):
+    action = train_retry(n, head, "enqueue")
+    dropped = train_retry(n, head, "merge-group").previous("queue-failed_checks")
+    if dropped:
+        raise RetryLimit(
+            f"Merge group failed at {head[:9]}; diagnose before re-enqueueing. Log: {dropped[-1]}"
+        )
+    for attempt in range(2):
+        if not active() or paused():
+            return False
+        action.check()
+        try:
+            outcome, kind, detail = enqueue_result(n, head)
+        except ACTION_ERRORS as exc:
+            action.failed(error_class(exc), exc)
+            raise
+        if outcome is EnqueueResult.QUEUED:
+            return True
+        if outcome is EnqueueResult.STOPPED:
+            return False
+        log = action.failed(kind, detail)
+        if attempt == 0:
+            action.check()
+            if not active() or paused():
+                return False
+            current = review(n)
+            if not eligible(current) or current["headRefOid"] != head:
+                return False
+            sh([*cli(), "log", f"train #{n}: re-checking enqueue gate once; log {log}"])
+            time.sleep(P.get("landing", "enqueue_retry_seconds", 15))
+    action.check()
+    return False
+
+
 def gh_json(args):
     code, out = sh(gh_argv(*args))
     return json.loads(out) if code == 0 and out.strip().startswith(("{", "[")) else None
@@ -90,7 +186,7 @@ def pr_info(n):
             "view",
             str(n),
             "--json",
-            "state,isDraft,headRefName,headRefOid,mergeStateStatus",
+            "state,isDraft,headRefName,headRefOid,baseRefOid,mergeStateStatus",
         ]
     )
 
@@ -110,9 +206,6 @@ def last_removal(n):
 
 def checks_ready(n):
     return checks(n)
-
-
-retried: dict[tuple[str, int] | tuple[str, int, str], bool] = {}
 
 
 def only_cancelled_run(run_id):
@@ -158,7 +251,7 @@ def only_cancelled(n):
 
 
 def wait_merged_or_removed(n, head, since, active=lambda: True):
-    retry_key = ("merge-group", n, head)
+    action = train_retry(n, head, "merge-group")
     while active():
         info = pr_info(n)
         if info and info["state"] == "MERGED":
@@ -170,21 +263,23 @@ def wait_merged_or_removed(n, head, since, active=lambda: True):
                 if paused():
                     time.sleep(120)
                     continue
-                if (
-                    reason == "failed_checks"
-                    and only_cancelled(n)
-                    and not retried.get(retry_key)
-                ):
+                cancelled = reason == "failed_checks" and only_cancelled(n)
+                if cancelled and (not info or info["headRefOid"] != head):
+                    need_agent(n, f"#{n}: cancellation-only retry could not safely enqueue; head changed.")
+                    return False
+                if cancelled and not action.previous("queue-cancelled"):
                     # The merge-group run was cancelled (queue rebuilt), not failed: re-enqueue once.
                     if not active():
                         return False
-                    if not info or info["headRefOid"] != head or not enqueue(n, head):
+                    action.failed(
+                        "queue-cancelled", f"Merge-group cancellation at {at}."
+                    )
+                    if not enqueue_checked(n, head, active):
                         need_agent(
                             n,
                             f"#{n}: cancellation-only retry could not safely enqueue.",
                         )
                         return False
-                    retried[retry_key] = True
                     status(
                         n,
                         "queued",
@@ -193,10 +288,9 @@ def wait_merged_or_removed(n, head, since, active=lambda: True):
                     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     time.sleep(120)
                     continue
-                need_agent(
-                    n,
-                    f"#{n} was removed from the merge queue ({reason} at {at}); look at the merge-group run.",
-                )
+                why = f"#{n} was removed from the merge queue ({reason} at {at}); look at the merge-group run."
+                log = action.failed(f"queue-{reason}", why)
+                need_agent(n, f"{why} Log: {log}")
                 return False
         time.sleep(180)
 
@@ -303,10 +397,11 @@ def refresh(n, wt, branch, *, active=lambda: True):
     for step in ("provision", "regenerate"):
         command = P.command("landing", step, worktree=wt, pr=n)
         if command:
-            code, out = sh(command, cwd=wt, timeout=1800)
+            code, out, log = run_step(n, wt, step, command, timeout=1800)
             if code:
                 need_agent(
-                    n, f"#{n}: {step} failed after merging the base:\n{out[-1500:]}"
+                    n,
+                    f"#{n}: {step} failed after merging the base; log {log}\n{out[-1500:]}",
                 )
                 return None
     _, changed = sh(["git", "status", "--porcelain"], cwd=wt)
@@ -327,15 +422,24 @@ def refresh(n, wt, branch, *, active=lambda: True):
     if gate and (quick or not QUICK_TESTS):
         host = P.get("landing", "quick_host")
         if host:
-            code, out = sh(
-                cli("rt", host, wt, "--admit-now", "--", *gate, *quick), timeout=5400
+            code, out, log = run_step(
+                n,
+                wt,
+                "quick-gate",
+                cli("rt", host, wt, "--admit-now", "--", *gate, *quick),
+                timeout=5400,
+                declined=RT_NOT_ADMITTED,
             )
         if not host or code == RT_NOT_ADMITTED:
             command = P.command("landing", "quick_local_prefix", pr=n)
-            code, out = sh([*command, *gate, *quick], cwd=wt, timeout=5400)
+            code, out, log = run_step(
+                n, wt, "quick-gate", [*command, *gate, *quick], timeout=5400
+            )
     if code != 0:
         tail = "\n".join(l for l in out.splitlines() if "agent-coord:" not in l)[-1500:]
-        need_agent(n, f"#{n}: quick gate failed after merging main + regen:\n{tail}")
+        need_agent(
+            n, f"#{n}: quick gate failed after merging main + regen; log {log}\n{tail}"
+        )
         return None
     if not active():
         return None
@@ -350,13 +454,15 @@ def refresh(n, wt, branch, *, active=lambda: True):
         return None
     if not active():
         return None
-    code, out = sh(
+    code, out, log = run_step(
+        n,
+        wt,
+        "push",
         ["git", "push", "-q", P.remote, f"HEAD:refs/heads/{branch}"],
-        cwd=wt,
         timeout=180,
     )
     if code != 0:
-        need_agent(n, f"#{n}: push failed: {out[-500:]}")
+        need_agent(n, f"#{n}: push failed; log {log}: {out[-500:]}")
         return None
     return True
 
@@ -372,42 +478,98 @@ def existing_tests(wt):
     return [test for test in QUICK_TESTS if (Path(wt) / test).is_file()]
 
 
+def run_step(n, wt, step, command, *, timeout, declined=None):
+    head = git_step(wt, "rev-parse", "HEAD").strip()
+    action = train_retry(n, head, step, argv=command)
+    with action.observe():
+        code, out = sh(command, cwd=wt, timeout=timeout)
+    log = (
+        action.failed(f"exit-{code}", out[-16000:]) if code and code != declined else ""
+    )
+    return code, out, log
+
+
+def assigned(entry):
+    token = entry.get("token", entry.get("added"))
+    return any(
+        row["pr"] == entry["pr"] and row.get("token", row.get("added")) == token
+        for row in load(TRAIN, [])
+    )
+
+
 def land_safely(entry, attempts=3, pause=120):
     """Land a PR; retry transient failures (GitHub API, network) before asking for help.
 
     land() resumes from the PR's current state, so a retry repeats no completed step.
     """
-    for attempt in range(1, attempts + 1):
-        try:
-            with locked(f"land-pr-{entry['pr']}.lock", wait=False):
-                land(entry)
-            return
-        except BlockingIOError:
-            return
-        except (
-            OSError,
-            RuntimeError,
-            ValueError,
-            KeyError,
-            subprocess.SubprocessError,
-        ) as exc:
-            if attempt == attempts:
-                need_agent(entry["pr"], f"Train stopped safely: {exc}")
-                return
-            sh([*cli(), "log", f"train #{entry['pr']}: retrying after: {exc}"])
-            time.sleep(pause * attempt)
+    n = entry["pr"]
+    entry = entry.copy()
+    try:
+        with locked(f"land-pr-{n}.lock", wait=False):
+            for attempt in range(1, attempts + 1):
+                if entry.get("added") and not assigned(entry):
+                    return
+                try:
+                    info = pr_info(n)
+                    if not info:
+                        raise RuntimeError("could not read PR state")
+                    entry["head"] = info["headRefOid"]
+                    entry["base"] = info.get("baseRefOid")
+                    train_retry(n, entry["head"], "land", base=entry["base"]).check()
+                    land(entry)
+                    return
+                except RetryLimit as exc:
+                    if not entry.get("added") or assigned(entry):
+                        need_agent(n, str(exc))
+                    return
+                except ACTION_ERRORS as exc:
+                    if isinstance(exc, BlockingIOError) or (
+                        entry.get("added") and not assigned(entry)
+                    ):
+                        return
+                    action = train_retry(
+                        n, entry.get("head"), "land", base=entry.get("base")
+                    )
+                    log = action.failed(error_class(exc), exc)
+                    try:
+                        action.check()
+                    except RetryLimit as limit:
+                        need_agent(n, str(limit))
+                        return
+                    if attempt == attempts:
+                        need_agent(n, f"Train stopped safely: {exc}; log {log}")
+                        return
+                    sh([*cli(), "log", f"train #{n}: retrying after: {exc}; log {log}"])
+                    time.sleep(pause * attempt)
+    except BlockingIOError:
+        return
 
 
 def land(entry):
     n, wt = entry["pr"], entry["worktree"]
 
     def active():
-        return any(
-            e["pr"] == n
-            and e.get("token", e.get("added")) == entry.get("token", entry.get("added"))
-            for e in load(TRAIN, [])
-        )
+        return assigned(entry)
 
+    if not active():
+        return
+    if not Path(wt).exists() and not Path(wt).is_symlink():
+        from drafts import handoff_worktree
+
+        wt, _ = handoff_worktree(n, entry.get("head"))
+        wt = str(wt)
+        locked_json(
+            TRAIN,
+            lambda rows: [
+                dict(row, worktree=wt)
+                if row.get("token", row.get("added"))
+                == entry.get("token", entry.get("added"))
+                and row["pr"] == n
+                else row
+                for row in rows
+            ],
+            [],
+        )
     if git_step(
         wt, "rev-parse", "--path-format=absolute", "--git-common-dir"
     ) != git_step(MAIN, "rev-parse", "--path-format=absolute", "--git-common-dir"):
@@ -417,9 +579,14 @@ def land(entry):
         return
     while active():
         info = pr_info(n)
-        if not info or info["state"] != "OPEN":
-            status(n, (info or {}).get("state", "closed").lower(), "no longer open")
+        if not info:
+            raise RuntimeError("could not read PR state")
+        if info["state"] != "OPEN":
+            status(n, info["state"].lower(), "no longer open")
             return
+        entry["head"] = info["headRefOid"]
+        entry["base"] = info.get("baseRefOid")
+        train_retry(n, entry["head"], "land", base=entry["base"]).check()
         if not eligible(review(n)):
             need_agent(
                 n,
@@ -483,8 +650,9 @@ def land(entry):
                     f"#{n}: conflicts with main in source files {source}; needs an agent to resolve.",
                 )
                 return
+        needs_lane = touches(n)
         status(n, "waiting", "waiting for a conflict-free lane slot")
-        while paused() or (touches(n) and not acquire(n)):
+        while paused() or (needs_lane and not acquire(n)):
             if not active():
                 return
             time.sleep(120)
@@ -501,7 +669,10 @@ def land(entry):
                 "enqueued elsewhere during refresh; local commits preserved, watching",
             )
             wait_merged_or_removed(
-                n, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), active
+                n,
+                pr_info(n)["headRefOid"],
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                active,
             )
             return
         status(n, "waiting", "waiting for PR checks")
@@ -511,6 +682,10 @@ def land(entry):
             if pushed is True
             else pr_info(n)["headRefOid"]
         )
+        entry["head"] = checked_head
+        checks_action = train_retry(n, checked_head, "checks")
+        checks_action.check()
+        rerun_action = train_retry(n, checked_head, "cancelled-checks")
         deadline = time.time() + 3 * 3600
         time.sleep(120 if pushed else 0)
         while active():
@@ -527,22 +702,25 @@ def land(entry):
                 }
                 if (
                     failed_runs
-                    and not retried.get(("checks", n))
+                    and not rerun_action.previous("cancelled")
                     and all(only_cancelled_run(r) for r in failed_runs)
                 ):
-                    retried[("checks", n)] = True
+                    rerun_action.failed(
+                        "cancelled", f"Cancelled workflows: {sorted(failed_runs)}"
+                    )
                     for r in failed_runs:
                         sh(gh_argv("run", "rerun", r, "--failed"))
                     status(n, "waiting", "reran cancelled jobs; waiting for PR checks")
                     time.sleep(180)
                     continue
-                need_agent(
-                    n,
-                    f"#{n}: PR checks failed on the refreshed head; see `gh pr checks {n}`.",
-                )
+                why = f"#{n}: PR checks failed on the refreshed head; see `gh pr checks {n}`."
+                log = checks_action.failed("failed-checks", why)
+                need_agent(n, f"{why} Log: {log}")
                 return
             if time.time() > deadline:
-                need_agent(n, f"#{n}: PR checks still pending after 3 h.")
+                why = f"#{n}: PR checks still pending after 3 h."
+                log = checks_action.failed("checks-timeout", why)
+                need_agent(n, f"{why} Log: {log}")
                 return
             time.sleep(180)
         if not active():
@@ -592,10 +770,11 @@ def land(entry):
             time.sleep(120)
         if not active():
             return
-        if not enqueue(n, head):
-            need_agent(
-                n, f"#{n}: enqueue gate rejected the current head; no automatic retry."
-            )
+        if not enqueue_checked(n, head, active):
+            if paused():
+                continue
+            if active():
+                need_agent(n, f"#{n}: enqueue gate rejected the current head; parked.")
             return
         status(n, "queued", f"enqueued at {head[:9]}")
         wait_merged_or_removed(n, head, since, active)
@@ -611,23 +790,14 @@ def main():
     if a.cmd in {"add", "remove"} and (a.pr is None or a.pr < 1):
         p.error("add/remove requires a positive PR number")
     if a.cmd == "add":
-        wt = str(Path(a.worktree or P.worktree(a.pr)).expanduser().resolve())
+        from drafts import handoff_worktree, owner_pr
 
-        def upd(t):
-            t = [e for e in (t or []) if e["pr"] != a.pr]
-            t.append(
-                {
-                    "pr": a.pr,
-                    "worktree": wt,
-                    "stage": "new",
-                    "added": time.strftime("%Y-%m-%d %H:%M"),
-                    "token": uuid4().hex,
-                }
-            )
-            return t
-
-        locked_json(TRAIN, upd, [])
-        print(f"#{a.pr} handed to the landing train ({wt}); you can stop now.")
+        assert_owner()
+        head = owner_pr(a.pr, draft=False)["headRefOid"]
+        wt = Path(a.worktree).expanduser() if a.worktree else P.worktree(a.pr)
+        if not wt.exists() and not wt.is_symlink():
+            wt, _ = handoff_worktree(a.pr, head)
+        register(a.pr, wt, head, readd=True)
     elif a.cmd == "remove":
         locked_json(TRAIN, lambda t: [e for e in (t or []) if e["pr"] != a.pr], [])
         print(f"#{a.pr} removed from the landing train")

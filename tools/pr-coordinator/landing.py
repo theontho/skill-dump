@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from enum import Enum, auto
 
 from runtime import P, gh
 
@@ -145,26 +146,56 @@ def paused():
     return any((P.data / "locks" / name).exists() for name in ("yield", "hold"))
 
 
+class EnqueueResult(Enum):
+    QUEUED = auto()
+    RECHECK = auto()
+    STOPPED = auto()
+
+
 def enqueue(number, head, *, priority=False):
+    outcome, _, _ = enqueue_result(number, head, priority=priority)
+    return outcome is EnqueueResult.QUEUED
+
+
+def enqueue_result(number, head, *, priority=False):
     # Check before and after the CI gate: never apply an old verdict to a new head.
     before = review(number)
     if not eligible(before, owned=not priority) or before["headRefOid"] != head:
-        return False
-    if not checks(number)[0]:
-        return False
+        return EnqueueResult.STOPPED, "", "PR head or eligibility changed"
+    if not priority and paused():
+        return EnqueueResult.STOPPED, "", "landing paused"
+    ready, _, rows = checks(number)
+    if not ready:
+        summary = ", ".join(f"{row.get('name')}: {row.get('bucket')}" for row in rows)
+        return (
+            EnqueueResult.RECHECK,
+            "readiness-gate",
+            f"PR readiness gate rejected {head}: {summary or 'no checks'}",
+        )
     info = review(number)
     if (
         not eligible(info, owned=not priority)
         or not reviewed(info)
-        or not mergeable(info)
         or info["headRefOid"] != head
     ):
-        return False
+        return EnqueueResult.STOPPED, "", "PR head, eligibility or review changed"
     if info["mergeQueueEntry"]:
-        return True
+        return EnqueueResult.QUEUED, "", ""
+    if not mergeable(info):
+        # GitHub can still be computing mergeability just after a head update.
+        outcome = (
+            EnqueueResult.RECHECK
+            if info["mergeable"] == "UNKNOWN"
+            else EnqueueResult.STOPPED
+        )
+        return (
+            outcome,
+            "mergeability",
+            f"PR mergeability: {info['mergeable']} ({info['mergeStateStatus']})",
+        )
     if priority:
         if P.land_asap not in labels(info):
-            return False
+            return EnqueueResult.STOPPED, "", "priority label removed"
         result = gh(
             "api",
             "graphql",
@@ -179,35 +210,43 @@ def enqueue(number, head, *, priority=False):
             text=True,
             timeout=90,
         )
-        if not result.returncode:
-            return bool(
-                json.loads(result.stdout)
-                .get("data", {})
-                .get("enqueuePullRequest", {})
-                .get("mergeQueueEntry")
-            )
-        return False
+        if not result.returncode and (
+            json.loads(result.stdout)
+            .get("data", {})
+            .get("enqueuePullRequest", {})
+            .get("mergeQueueEntry")
+        ):
+            return EnqueueResult.QUEUED, "", ""
+        return (
+            EnqueueResult.RECHECK,
+            "priority-enqueue",
+            result.stderr.strip() or "priority enqueue rejected",
+        )
     if paused():
-        return False
+        return EnqueueResult.STOPPED, "", "landing paused"
     flags = P.command("landing", "merge_flags", default=["--squash", "--auto"])
     if "--auto" not in flags or "--admin" in flags or "--disable-auto" in flags:
         raise ValueError(
             "landing.merge_flags must enable auto-merge without bypassing protections"
         )
-    return (
-        gh(
-            "pr",
-            "merge",
-            str(number),
-            *flags,
-            "--match-head-commit",
-            head,
-            capture_output=True,
-            text=True,
-            timeout=90,
-        ).returncode
-        == 0
+    result = gh(
+        "pr",
+        "merge",
+        str(number),
+        *flags,
+        "--match-head-commit",
+        head,
+        capture_output=True,
+        text=True,
+        timeout=90,
     )
+    if result.returncode:
+        return (
+            EnqueueResult.RECHECK,
+            f"merge-exit-{result.returncode}",
+            result.stderr.strip() or f"gh merge exited {result.returncode}",
+        )
+    return EnqueueResult.QUEUED, "", ""
 
 
 def assert_owner():

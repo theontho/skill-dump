@@ -115,6 +115,7 @@ def acquire(number):
                 return False
         holders[number] = now
         atomic_text(HOLDERS, "".join(f"{n} {since}\n" for n, since in holders.items()))
+        print(f"PR #{number}: reserved a generated-files lane slot", flush=True)
         return True
 
 

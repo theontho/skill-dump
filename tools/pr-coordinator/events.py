@@ -387,9 +387,10 @@ def deliver(consumer, *, as_json):
     return True
 
 
-def wait_for_events(consumer, *, as_json, standalone_interval=None):
+def wait_for_events(consumer, *, as_json, interval, legacy_baseline):
     poll_at = 0
     previous = None
+    announced = False
     while True:
         try:
             stat = (HERE / JOURNAL).stat()
@@ -402,15 +403,22 @@ def wait_for_events(consumer, *, as_json, standalone_interval=None):
                     return
                 previous = revision
         now = time.monotonic()
-        if standalone_interval is not None and now >= poll_at:
+        if now >= poll_at:
             try:
                 with locked(PRODUCER_LOCK, wait=False):
-                    collect(legacy_baseline=True)
+                    if not announced and not legacy_baseline:
+                        print(
+                            "events: no collector is running; collecting while waiting",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        announced = True
+                    collect(legacy_baseline=legacy_baseline)
             except BlockingIOError:
                 # The run service (or another legacy waiter) owns detection.
                 pass
             else:
-                poll_at = time.monotonic() + standalone_interval
+                poll_at = time.monotonic() + interval
                 continue
         time.sleep(1)
 
@@ -418,7 +426,9 @@ def wait_for_events(consumer, *, as_json, standalone_interval=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("interval", nargs="?", type=int, help="legacy poll interval")
-    parser.add_argument("--wait", action="store_true", help="read events collected by run")
+    parser.add_argument(
+        "--wait", action="store_true", help="read the journal, collecting if no service is running"
+    )
     parser.add_argument(
         "--consumer", default=DEFAULT_CONSUMER, help="cursor name (default: supervisor)"
     )
@@ -445,7 +455,8 @@ def main():
         wait_for_events(
             args.consumer,
             as_json=args.json,
-            standalone_interval=None if args.wait else interval,
+            interval=interval,
+            legacy_baseline=not args.wait,
         )
 
 

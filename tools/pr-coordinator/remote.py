@@ -16,6 +16,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from landing import assert_owner, json_gh
+from retries import ACTION_ERRORS, Retry, RetryLimit, error_class
 from runtime import P, agent_coord_status, cli, load, locked
 
 RT_NOT_ADMITTED = 75
@@ -114,6 +115,20 @@ def rt_main():
     admission = P.expand(
         spec.get("rt_admission", []), label=f"hosts.{host}.rt_admission", **context
     )
+    prefix = P.command(
+        "remote_tests", "prefix", default=spec.get("rt_prefix", []), **context
+    )
+    retry = Retry(
+        P.data,
+        "rt",
+        head=sha,
+        host=host,
+        worktree=wt,
+        envs=context["envs"],
+        command_line=[*prefix, *gate],
+        settings=P.settings.get("remote_tests"),
+        spec=spec,
+    )
 
     def admitted():
         try:
@@ -140,7 +155,6 @@ def rt_main():
             raise ValueError(
                 "remote_tests.prepare must provision the configured remote worktree"
             )
-        remote(host, prep, timeout=1800)
         excludes = P.get(
             "remote_tests",
             "excludes",
@@ -152,16 +166,28 @@ def rt_main():
         argv += [arg for path in excludes for arg in ("--exclude", path)]
         if ".git" not in excludes:
             raise ValueError("remote_tests.excludes must keep .git")
-        run(
-            [*argv, f"{wt}/", f"{spec['ssh']}:{dest.removeprefix('~/')}/"], timeout=1800
-        )
         provision = P.command("remote_tests", "provision", **context)
-        if provision:
-            remote(host, provision, cwd=dest, timeout=1800)
+        retry.check()
+        step = "prepare"
+        try:
+            print(
+                f"Remote tests: preparing {host}:{dest} at {sha[:9]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            remote(host, prep, timeout=1800)
+            step = "synchronize"
+            run(
+                [*argv, f"{wt}/", f"{spec['ssh']}:{dest.removeprefix('~/')}/"],
+                timeout=1800,
+            )
+            step = "provision"
+            if provision:
+                remote(host, provision, cwd=dest, timeout=1800)
+        except ACTION_ERRORS as exc:
+            retry.failed(f"{step}-{error_class(exc)}", exc)
+            raise
         rid = f"rt-{uuid4().hex[:12]}"
-        prefix = P.command(
-            "remote_tests", "prefix", default=spec.get("rt_prefix", []), **context
-        )
         if args.admit_now and not admitted():
             return declined()
         record(
@@ -176,9 +202,15 @@ def rt_main():
             wt.name,
         )
         try:
-            result = remote(
-                host, [*prefix, *gate], cwd=dest, timeout=5400, check=False
-            ).returncode
+            try:
+                result = remote(
+                    host, [*prefix, *gate], cwd=dest, timeout=5400, check=False
+                ).returncode
+            except ACTION_ERRORS as exc:
+                retry.failed(f"test-{error_class(exc)}", exc)
+                raise
+            if result:
+                retry.failed(f"test-exit-{result}", f"{rid} on {host} exited {result}")
             # Keep capacity denial distinguishable from a failed remote command.
             return 1 if args.admit_now and result == RT_NOT_ADMITTED else result
         finally:
@@ -297,8 +329,15 @@ def certify(wt, pr, target, sha, base, _attempt=0):
             return 0
         status("queued")
         required = target in P.get("certification", "must_run", [])
+        retries = {key: cert_retry(pr, target, sha, base, key) for key in slots}
         deadline = time.monotonic() + P.get("certification", "slot_timeout", 2700)
         while host == "pending":
+            blocked = blocked_hosts(retries)
+            if len(blocked) == len(retries):
+                status("error")
+                raise RetryLimit(
+                    "; ".join(f"{key}: {exc}" for key, exc in blocked.items())
+                )
             waiting = {
                 c.get("target")
                 for c in load(P.data / "state.json", {}).get("certs", [])
@@ -306,6 +345,9 @@ def certify(wt, pr, target, sha, base, _attempt=0):
             }
             unavailable = []
             for key, state in cert_host_states(slots):
+                if key in blocked:
+                    unavailable.append(f"{key} (retry limit)")
+                    continue
                 if state in {"offline", "reserved"}:
                     unavailable.append(f"{key} ({state})")
                     continue
@@ -327,6 +369,11 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     break
             if host == "pending":
                 if not required and len(unavailable) == len(slots):
+                    if blocked:
+                        status("error")
+                        raise RetryLimit(
+                            f"No alternative host available; {next(iter(blocked.values()))}"
+                        )
                     status("skipped")
                     record(
                         "log",
@@ -338,28 +385,39 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     status("skipped")
                     return 0
                 time.sleep(30)
-        info = json_gh("pr", "view", str(pr), "--json", "headRefOid")
+        try:
+            with retries[host].observe("head-check"):
+                info = json_gh("pr", "view", str(pr), "--json", "headRefOid")
+        except ACTION_ERRORS:
+            status("error")
+            raise
         if info["headRefOid"] != sha:
             status("superseded")
             return 0
         status("running")
-        ctx = cert_args(wt, pr, target, sha, base, host)
-        is_remote = bool(P.ssh(host))
-        kind = "remote" if is_remote else "local"
-        command = P.command(
-            "certification",
-            f"{kind}_command",
-            **ctx,
-            default=["just", "certify"] if not is_remote else [],
-        )
-        if not command:
-            raise ValueError(f"certification.{kind}_command is required")
-        command += P.command("certification", target + "_args", **ctx)
-        command += P.expand(P.hosts[host].get("cert_args", []), **ctx)
+        try:
+            with retries[host].observe("configuration"):
+                ctx = cert_args(wt, pr, target, sha, base, host)
+                is_remote = bool(P.ssh(host))
+                kind = "remote" if is_remote else "local"
+                command = P.command(
+                    "certification",
+                    f"{kind}_command",
+                    **ctx,
+                    default=["just", "certify"] if not is_remote else [],
+                )
+                if not command:
+                    raise ValueError(f"certification.{kind}_command is required")
+                command += P.command("certification", target + "_args", **ctx)
+                command += P.expand(P.hosts[host].get("cert_args", []), **ctx)
+        except ACTION_ERRORS:
+            status("error")
+            raise
         log_path = path / f"cert-{pr}-{target}-{short}.log"
         previous = log_path.stat() if log_path.exists() else None
         start = previous.st_size if previous else 0
         code = 1
+        failure_class = None
         with log_path.open("a", encoding="utf-8") as log:
             started = datetime.now(timezone.utc).isoformat()
             print(
@@ -390,6 +448,7 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     command, cwd=wt, timeout=6 * 3600, check=False, **output
                 ).returncode
             except (OSError, subprocess.SubprocessError) as exc:
+                failure_class = error_class(exc)
                 print(exc, file=log, flush=True)
             finally:
                 cleanup = (
@@ -406,38 +465,76 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     except (OSError, subprocess.SubprocessError) as exc:
                         print(f"Cleanup failed: {exc}", file=log, flush=True)
                         code = code or 1
+                        failure_class = failure_class or f"cleanup-{error_class(exc)}"
                 ended = datetime.now(timezone.utc).isoformat()
                 print(f"\nCERT END {ended}\nEXIT {code}", file=log)
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        with log_path.open("rb") as log:
+            log.seek(start)
+            text = log.read().decode("utf-8", errors="replace")
         # The project's controller may refuse a host it finds busy (e.g. a lock taken outside these slots):
         # wait for it instead of reporting an error.
         busy = code != 0 and any(
-            marker in text[start:]
-            for marker in P.get("certification", "busy_markers", [])
+            marker in text for marker in P.get("certification", "busy_markers", [])
         )
-        if busy and _attempt < P.get("certification", "busy_retries", 20):
-            status("queued")
-            record("log", f"PR #{pr}: {target} cert host {host} busy; retrying")
-            retry = True
-        else:
-            retry = False
-    if retry:
-        time.sleep(P.get("certification", "busy_retry_seconds", 120))
-        return certify(wt, pr, target, sha, base, _attempt + 1)
-    with ExitStack():
         failure = any(
             marker in text
             for marker in P.get("certification", "test_failure_markers", [])
         )
-        status("pass" if code == 0 else "fail" if failure else "error")
-        message = (
-            f"PR #{pr}: {target} cert exit {code} on {short} ({host}); log {log_path}"
-        )
-        record("log", message)
-        notify = P.command("certification", "notify", message=message, **ctx)
-        if notify:
-            run(notify, check=False, timeout=30)
-        return code
+        if code:
+            retries[host].failed(
+                "busy"
+                if busy
+                else "tests"
+                if failure
+                else failure_class or f"exit-{code}",
+                f"{host} exited {code}; output: {log_path} (byte offset {start})",
+            )
+        retry = busy and _attempt < min(1, P.get("certification", "busy_retries", 1))
+        if retry:
+            try:
+                retries[host].check()
+            except RetryLimit as exc:
+                record("log", str(exc))
+                print(exc, file=sys.stderr, flush=True)
+                retry = False
+        if retry:
+            status("queued")
+            record("log", f"PR #{pr}: {target} cert host {host} busy; retrying")
+        else:
+            status("pass" if code == 0 else "fail" if failure else "error")
+    if retry:
+        time.sleep(P.get("certification", "busy_retry_seconds", 120))
+        return certify(wt, pr, target, sha, base, _attempt + 1)
+    message = f"PR #{pr}: {target} cert exit {code} on {short} ({host}); log {log_path}"
+    record("log", message)
+    notify = P.command("certification", "notify", message=message, **ctx)
+    if notify:
+        run(notify, check=False, timeout=30)
+    return code
+
+
+def cert_retry(pr, target, sha, base, host):
+    return Retry(
+        P.data,
+        "cert",
+        pr=pr,
+        head=sha,
+        target=target,
+        base=base,
+        host=host,
+        settings=getattr(P, "settings", {}).get("certification"),
+        spec=P.hosts[host],
+    )
+
+
+def blocked_hosts(retries):
+    blocked = {}
+    for host, action in retries.items():
+        try:
+            action.check()
+        except RetryLimit as exc:
+            blocked[host] = exc
+    return blocked
 
 
 def cert_main():
@@ -466,36 +563,77 @@ def cert_pr_main():
     )
     parser.add_argument("pr", type=int)
     parser.add_argument("targets", nargs="*")
+    parser.add_argument("--head", help="require an exact published PR head")
     args = parser.parse_args()
     assert_owner()
-    targets = args.targets or P.get("certification", "default_targets", [])
-    if not targets or set(targets) - P.get("certification", "slots", {}).keys():
+    targets = list(
+        dict.fromkeys(args.targets or P.get("certification", "default_targets", []))
+    )
+    slots = P.get("certification", "slots", {})
+    if not targets or set(targets) - slots.keys():
         parser.error("provide configured certification targets")
     pr = json_gh(
-        "pr", "view", str(args.pr), "--json", "headRefName,headRefOid,isCrossRepository"
+        "pr",
+        "view",
+        str(args.pr),
+        "--json",
+        "headRefName,headRefOid,baseRefOid,isCrossRepository",
     )
     if pr["isCrossRepository"]:
         raise ValueError("cert-pr needs a branch in the configured repository")
     from worktrees import prepare
 
     sha = pr["headRefOid"]
+    if args.head and sha != args.head:
+        raise ValueError("head changed before certification was requested")
     # Per head: a push while an older head certifies must start the new head (the old run is superseded).
-    with locked(f"cert-pr-{args.pr}-{sha}.lock", wait=False):
-        with locked(f"worktree-pr-{args.pr}.lock"):
-            wt = prepare(args.pr, pr, "cert")
-        prep = P.command(
-            "certification", "controller_prepare", pr=args.pr, sha=sha, worktree=wt
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(locked(f"cert-pr-{args.pr}-{sha}.lock", wait=False))
+        except BlockingIOError:
+            print(f"PR #{args.pr} head {sha[:9]}: certification already running")
+            return 0
+        runnable = []
+        for target in targets:
+            blocked = blocked_hosts(
+                {
+                    host: cert_retry(args.pr, target, sha, pr["baseRefOid"], host)
+                    for host in slots[target]
+                }
+            )
+            if blocked and len(blocked) == len(slots[target]):
+                for host, exc in blocked.items():
+                    print(f"PR #{args.pr} {target} on {host}: {exc}", file=sys.stderr)
+            else:
+                runnable.append(target)
+        declined = int(len(runnable) != len(targets))
+        if not runnable:
+            return declined
+        retry = Retry(
+            P.data,
+            "cert-pr",
+            pr=args.pr,
+            head=sha,
+            targets=sorted(runnable),
+            settings=P.settings.get("certification"),
         )
-        if prep:
-            run(prep, cwd=wt, timeout=1800)
-        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        with retry.observe("prepare"):
+            with locked(f"worktree-pr-{args.pr}.lock"):
+                wt = prepare(args.pr, pr, "cert")
+            prep = P.command(
+                "certification", "controller_prepare", pr=args.pr, sha=sha, worktree=wt
+            )
+            if prep:
+                run(prep, cwd=wt, timeout=1800)
+        with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
             return max(
-                pool.map(
+                declined,
+                *pool.map(
                     lambda target: (
                         run(
                             cli("cert", wt, target, "--pr", args.pr), check=False
                         ).returncode
                     ),
-                    targets,
-                )
+                    runnable,
+                ),
             )

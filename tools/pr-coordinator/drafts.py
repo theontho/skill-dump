@@ -28,15 +28,24 @@ def owner_pr(pr, *, draft):
 
 
 def handoff(pr, head=None):
-    owner_pr(pr, draft=False)
+    row = owner_pr(pr, draft=False)
+    head = head or row["headRefOid"]
+    if row["headRefOid"] != head:
+        raise ValueError("head changed before handoff")
+    from train import registered
+
+    if registered(pr, head):
+        print(f"#{pr} already registered with the landing train at {head[:9]}.")
+        return 0
     wt, _ = handoff_worktree(pr, head)
-    return submit(pr, wt)
+    return submit(pr, wt, head)
 
 
-def submit(pr, wt):
-    return subprocess.run(
-        cli("train", "add", pr, "--worktree", wt), check=True
-    ).returncode
+def submit(pr, wt, head):
+    from train import register
+
+    register(pr, wt, head)
+    return 0
 
 
 def handoff_worktree(pr, head):
@@ -123,13 +132,12 @@ def complete(result):
     )
 
 
-def request_certification(pr):
-    """Start cert-pr in the background; it certifies the PR's current head."""
-    log = P.data / "logs" / f"cert-pr-{pr}-auto.log"
+def request_certification(pr, head, targets):
+    log = P.data / "logs" / f"cert-pr-{pr}-{head[:9]}-auto.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a") as out:
         subprocess.Popen(
-            cli("cert-pr", pr),
+            cli("cert-pr", pr, *targets, "--head", head),
             stdout=out,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -137,12 +145,80 @@ def request_certification(pr):
         )
 
 
-def watch(pr, *, certify=False):
+def request_missing(pr, head, result):
+    accepted, statuses, running = result
+    mapping = P.get("drafts", "status_targets", {})
+    missing = set(P.get("drafts", "required_statuses", [])) - statuses.keys()
+    slots = P.get("certification", "slots", {})
+    layers = P.get("certification", "layers", {})
+    missing_targets = set()
+    for target, hosts in slots.items():
+        layer = layers.get(target, target)
+        contexts = (
+            {P.cert_prefix + P.hosts[host].get("platform", "") for host in hosts}
+            if layer == "platform"
+            else {P.cert_prefix + layer}
+        )
+        if any(
+            mapping.get(key) == target or key not in mapping and key in contexts
+            for key in missing
+        ):
+            missing_targets.add(target)
+    if accepted and (running or statuses and not missing_targets):
+        return False
+    with locked(f"draft-prerequisites-{pr}.lock"):
+        path = P.data / f"draft-prerequisites-{pr}.json"
+        marker = load(path, {})
+        if marker.get("head") != head:
+            marker = {"head": head}
+        request_review = not accepted and not marker.get("review")
+        requested = marker.get("cert", [])
+        targets = sorted(missing_targets - set(requested))
+        request_default = not statuses and not requested
+        request_cert = not running and (
+            request_default or targets and "*" not in requested
+        )
+        if not (request_review or request_cert):
+            return False
+        if owner_pr(pr, draft=True)["headRefOid"] != head:
+            return False
+
+        changed = False
+        if request_review:
+            reviewer = P.get("drafts", "reviewer", "@copilot")
+            gh(
+                "pr",
+                "edit",
+                str(pr),
+                "--add-reviewer",
+                reviewer,
+                check=True,
+                timeout=90,
+            )
+            print(f"PR #{pr} head {head[:9]}: requested {reviewer} review", flush=True)
+            marker["review"] = True
+            save(path, marker)
+            changed = True
+
+        if request_cert and not running_certs(pr, head):
+            targets = [] if request_default else targets
+            print(
+                f"PR #{pr} head {head[:9]}: requesting certification"
+                + (f" ({', '.join(targets)})" if targets else ""),
+                flush=True,
+            )
+            request_certification(pr, head, targets)
+            marker["cert"] = requested + (targets or ["*"])
+            save(path, marker)
+            changed = True
+        return changed
+
+
+def watch(pr):
     interval = P.get("drafts", "poll_seconds", 120)
     grace = P.get("drafts", "idle_seconds", 480)
     idle_since = None
     previous_head = None
-    requested = set()
     while True:
         head = owner_pr(pr, draft=True)["headRefOid"]
         result = evidence(pr, head)
@@ -155,17 +231,13 @@ def watch(pr, *, certify=False):
             )
             return head
         accepted, statuses, running = result
+        if not running and blocking(statuses):
+            raise ValueError(f"certification failed on {head[:9]}: {statuses}")
+        if request_missing(pr, head, result):
+            idle_since = None
+            time.sleep(interval)
+            continue
         if not running:
-            if blocking(statuses):
-                raise ValueError(f"certification failed on {head[:9]}: {statuses}")
-            if certify and not statuses and head not in requested:
-                # The implementer handed over without queuing certification.
-                print(f"PR {pr} head {head[:9]}: requesting certification", flush=True)
-                request_certification(pr)
-                requested.add(head)
-                idle_since = None
-                time.sleep(interval)
-                continue
             if idle_since is None:
                 idle_since = time.monotonic()
             if time.monotonic() - idle_since >= grace:
@@ -223,7 +295,15 @@ def wait_registered():
 
 def finish(pr):
     with locked(f"finish-draft-{pr}.lock", wait=False):
-        head = watch(pr, certify=True)
+        if not review(pr)["isDraft"]:
+            with locked("draft-admission.lock"):
+                marker = load(P.data / "ready-admission.json", {})
+                same_pr = marker.get("pr") == pr
+                result = handoff(pr, marker["head"] if same_pr else None)
+                if same_pr:
+                    wait_registered()
+            return result
+        head = watch(pr)
         with locked("draft-admission.lock"):
             wait_registered()
             capacity = P.command("landing", "ci_capacity", pr=pr)
@@ -273,7 +353,7 @@ def finish(pr):
                     raise ValueError(
                         "head changed at readiness; not submitted to train"
                     )
-                result = submit(pr, wt)
+                result = submit(pr, wt, head)
                 wait_registered()
                 return result
 
@@ -285,10 +365,10 @@ def main(command):
     if args.pr < 1:
         parser.error("provide a positive PR number")
     try:
+        assert_owner()
         if command == "watch-draft":
             watch(args.pr)
             return 0
-        assert_owner()
         return (finish if command == "finish-draft" else handoff)(args.pr)
     except (
         OSError,

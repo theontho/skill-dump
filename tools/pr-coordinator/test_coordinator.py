@@ -542,6 +542,15 @@ fi
         with mock.patch.object(dashboard, "P", project):
             self.assertIn("Owner-resume incidents: 1", dashboard.events_panel())
 
+    def test_event_wait_collects_if_the_service_watcher_is_missing(self):
+        self.fake_gh()
+        self.command("ask", "handoff without a watcher", "--machine", "worker")
+        result = self.command("events", "--wait", "--json", timeout=5)
+        self.assertIn("no collector is running", result.stderr)
+        self.assertIn(
+            "handoff without a watcher", json.loads(result.stdout)[0]["message"]
+        )
+
     def idle_project(self, *, threshold_override=None):
         with self.config.open("a") as config:
             config.write("""
@@ -688,6 +697,8 @@ idle_alert = false
         import remote
 
         calls, states = [], []
+        (self.root / "locks").mkdir()
+        always_busy = False
 
         class FakeProject:
             data = self.root
@@ -714,7 +725,7 @@ idle_alert = false
 
         def fake_run(argv, *, stdout=None, **kwargs):
             calls.append(argv)
-            busy = len(calls) == 1
+            busy = always_busy or len(calls) == 1
             stdout.write("No available certification host\n" if busy else "ok\n")
             stdout.flush()
             return subprocess.CompletedProcess(argv, 1 if busy else 0)
@@ -723,22 +734,39 @@ idle_alert = false
             if kind == "cert-state":
                 states.append(args[1])
 
-        with mock.patch.object(remote, "P", FakeProject()), mock.patch.object(
-            remote, "locked", lambda *a, **k: contextlib.nullcontext()
-        ), mock.patch.object(remote, "run", fake_run), mock.patch.object(
-            remote, "record", fake_record
-        ), mock.patch.object(
-            remote, "json_gh", lambda *a: {"headRefOid": "a" * 40}
-        ), mock.patch.object(
-            remote, "cert_args", lambda *a: {}
-        ), mock.patch.object(
-            remote, "agent_coord_status", return_value={}
-        ), mock.patch.object(remote.time, "sleep"):
+        with (
+            mock.patch.object(remote, "P", FakeProject()),
+            mock.patch.object(
+                remote, "locked", lambda *a, **k: contextlib.nullcontext()
+            ),
+            mock.patch.object(remote, "run", fake_run),
+            mock.patch.object(remote, "record", fake_record),
+            mock.patch.object(remote, "json_gh", lambda *a: {"headRefOid": "a" * 40}),
+            mock.patch.object(remote, "cert_args", lambda *a: {}),
+            mock.patch.object(remote, "agent_coord_status", return_value={}),
+            mock.patch.object(remote.time, "sleep"),
+        ):
             code = remote.certify(self.root, 7, "generic", "a" * 40, "b" * 40)
-        self.assertEqual(code, 0)
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn("error", states)
-        self.assertEqual(states[-1], "pass")
+            self.assertEqual(code, 0)
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn("error", states)
+            self.assertEqual(states[-1], "pass")
+
+            # #27: a controller that reports busy repeatedly must not provision a third time.
+            always_busy = True
+            self.assertEqual(
+                remote.certify(self.root, 7, "generic", "a" * 40, "b" * 40), 1
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "third identical attempt refused"
+            ) as refused:
+                remote.certify(self.root, 7, "generic", "a" * 40, "b" * 40)
+            self.assertEqual(len(calls), 3)
+            logs = sorted((self.root / "logs").glob("retry-cert-*.log"))
+            self.assertEqual(len(logs), 2)
+            for log in logs:
+                self.assertIn(str(log), str(refused.exception))
+                self.assertIn("busy:", log.read_text())
 
     def test_certification_skips_at_once_when_no_host_is_online(self):
         import contextlib
@@ -865,27 +893,41 @@ ssh = "spare"
 
         ok = {"local-ci/generic": "success"}
         with mock.patch.object(drafts, "P", Drafts()):
-            self.assertTrue(drafts.complete((True, {**ok, "local-ci/macos-arm64": "error"}, False)))
-            self.assertFalse(drafts.complete((True, {**ok, "local-ci/macos-arm64": "failure"}, False)))
-            self.assertFalse(drafts.complete((True, {"local-ci/generic": "error"}, False)))
-            self.assertFalse(drafts.complete((True, {**ok, "local-ci/windows-x64": "pending"}, False)))
+            self.assertTrue(
+                drafts.complete((True, {**ok, "local-ci/macos-arm64": "error"}, False))
+            )
+            self.assertFalse(
+                drafts.complete(
+                    (True, {**ok, "local-ci/macos-arm64": "failure"}, False)
+                )
+            )
+            self.assertFalse(
+                drafts.complete((True, {"local-ci/generic": "error"}, False))
+            )
+            self.assertFalse(
+                drafts.complete(
+                    (True, {**ok, "local-ci/windows-x64": "pending"}, False)
+                )
+            )
 
     def test_finish_draft_requests_missing_certification_once_per_head(self):
         import drafts
 
-        class Drafts:
-            def get(self, section, key, default=None):
-                return 0 if key in {"poll_seconds", "idle_seconds"} else default
-
+        self.draft_config()
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        project.prepare()
         head = "a" * 40
-        with mock.patch.object(drafts, "P", Drafts()), mock.patch.object(
-            drafts, "owner_pr", return_value={"headRefOid": head}
-        ), mock.patch.object(
-            drafts, "evidence", return_value=(True, {}, False)
-        ), mock.patch.object(drafts, "request_certification") as request:
+        with (
+            mock.patch.object(drafts, "P", project),
+            mock.patch("runtime.P", project),
+            mock.patch.object(drafts, "owner_pr", return_value={"headRefOid": head}),
+            mock.patch.object(drafts, "evidence", return_value=(True, {}, False)),
+            mock.patch.object(drafts, "request_certification") as request,
+            mock.patch.object(drafts.time, "sleep"),
+        ):
             with self.assertRaisesRegex(ValueError, "no running certification"):
-                drafts.watch(7, certify=True)
-            request.assert_called_once_with(7)
+                drafts.watch(7)
+            request.assert_called_once_with(7, head, [])
             request.reset_mock()
             with self.assertRaisesRegex(ValueError, "no running certification"):
                 drafts.watch(7)
@@ -903,15 +945,18 @@ ssh = "spare"
             data = self.root
 
         old, new = "a" * 40, "b" * 40
-        with (locks / f"cert-pr-7-{old}.lock").open("a") as held, mock.patch.object(
-            drafts, "P", Data()
-        ), mock.patch("runtime.P", Data()):
+        with (
+            (locks / f"cert-pr-7-{old}.lock").open("a") as held,
+            mock.patch.object(drafts, "P", Data()),
+            mock.patch("runtime.P", Data()),
+        ):
             fcntl.flock(held, fcntl.LOCK_EX)
             self.assertTrue(drafts.running_certs(7, old))
             self.assertFalse(drafts.running_certs(7, new))
 
     def fake_draft(self, head, *, statuses, review_head=None):
         state = self.root / "ready"
+        requests = self.root / "review-requests"
         review = {
             "state": "OPEN",
             "baseRefName": "trunk",
@@ -936,9 +981,13 @@ elif args[:2] == ["api", "graphql"]:
     row["isDraft"] = not state.exists()
     print(json.dumps({{"data": {{"repository": {{"pullRequest": row}}}}}}))
 elif args[:2] == ["pr", "view"]:
-    print(json.dumps({{"headRefName": "feature", "headRefOid": {head!r}}}))
+    print(json.dumps({{"number": 7, "headRefName": "feature", "headRefOid": {head!r},
+        "baseRefOid": "base", "isCrossRepository": False}}))
 elif args[:2] == ["pr", "ready"]:
     state.touch()
+elif args[:2] == ["pr", "edit"] and "@copilot" in args:
+    with Path({str(requests)!r}).open("a") as log:
+        log.write({head!r} + "\\n")
 elif args[1].endswith("/reviews"):
     print(json.dumps([[{{"commit_id": {(review_head or head)!r},
         "state": "COMMENTED", "user": {{"login": "copilot-pull-request-reviewer[bot]", "type": "Bot"}}}}]]))
@@ -971,7 +1020,7 @@ else:
             f.write(
                 f'\nci_capacity = [{json.dumps(sys.executable)}, {json.dumps(str(gate))}, "{{pr}}"]\n'
                 '[drafts]\nrequired_statuses = ["local-ci/generic", "local-ci/macos"]\n'
-                "idle_seconds = 0\ncapacity_retry_seconds = 0\n"
+                "idle_seconds = 0\npoll_seconds = 0\ncapacity_retry_seconds = 0\n"
                 'ready_workflow = "pull_request.yml"\nready_run_timeout = 0\n'
             )
 
@@ -1011,6 +1060,95 @@ else:
             self.assertIn("ATTENTION", result.stdout)
             self.assertFalse(state.exists())
             self.assertFalse((self.data / "train.json").exists())
+
+    def test_watch_draft_requests_copilot_once_for_each_unreviewed_head(self):
+        self.draft_config()
+        requests = self.root / "review-requests"
+        statuses = [
+            {"context": "local-ci/generic", "state": "success"},
+            {"context": "local-ci/macos", "state": "success"},
+        ]
+        for head in ("a" * 40, "b" * 40):
+            self.fake_draft(head, statuses=statuses, review_head="c" * 40)
+            for _ in range(2):
+                result = self.command("watch-draft", "7", check=False, timeout=5)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("exact-head review=False", result.stdout)
+        self.assertEqual(requests.read_text().splitlines(), ["a" * 40, "b" * 40])
+
+    def test_watch_draft_requests_only_the_missing_required_certification_target(self):
+        import drafts
+
+        self.draft_config()
+        with self.config.open("a") as config:
+            config.write("""
+[certification.slots]
+generic = ["worker"]
+macos = ["worker"]
+[hosts.worker]
+platform = "macos-arm64"
+""")
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        project.prepare()
+        head = "a" * 40
+        with (
+            mock.patch("runtime.P", project),
+            mock.patch.object(drafts, "P", project),
+            mock.patch.object(drafts, "owner_pr", return_value={"headRefOid": head}),
+            mock.patch.object(
+                drafts,
+                "evidence",
+                return_value=(True, {"local-ci/generic": "success"}, False),
+            ),
+            mock.patch.object(drafts, "request_certification") as request,
+        ):
+            with self.assertRaisesRegex(ValueError, "local-ci/generic"):
+                drafts.watch(7)
+            request.assert_called_once_with(7, head, ["macos"])
+
+    def test_finish_draft_recovers_missing_train_registration_for_ready_pr(self):
+        _, head = self.create_git()
+        self.git("switch", "trunk")
+        self.fake_draft(head, statuses=[]).touch()
+        result = self.command("finish-draft", "7")
+        self.assertIn("prepared train worktree", result.stdout)
+        self.assertIn("handed to the landing train", result.stdout)
+        train = self.data / "train.json"
+        row = json.loads(train.read_text())[0]
+        self.assertEqual(row["head"], head)
+        self.assertTrue(Path(row["worktree"]).is_dir())
+        self.command("finish-draft", "7")
+        self.command("train", "add", "7")
+        self.assertEqual(json.loads(train.read_text()), [row])
+        train.unlink()
+        self.command("train", "add", "7")
+        self.assertEqual(json.loads(train.read_text())[0]["worktree"], row["worktree"])
+
+    def test_cert_pr_prepares_only_the_requested_published_head(self):
+        _, head = self.create_git("feature.txt")
+        self.git("switch", "trunk")
+        self.fake_draft(head, statuses=[])
+        coord = self.root / "agent-coord"
+        coord.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+        coord.chmod(0o700)
+        with self.config.open("a") as config:
+            config.write(f"""
+[certification]
+default_targets = ["generic"]
+local_command = [{json.dumps(sys.executable)}, "-c", "from pathlib import Path; assert Path('feature.txt').exists()"]
+[certification.slots]
+generic = ["local"]
+[hosts.local]
+""")
+        stale = self.command("cert-pr", "7", "--head", "c" * 40, check=False)
+        self.assertIn("head changed", stale.stderr)
+        self.assertFalse((self.root / "wt-cert7").exists())
+        result = self.command("cert-pr", "7", "--head", head, check=False, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("prepared cert worktree", result.stdout)
+        self.assertTrue((self.root / "wt-cert7" / "feature.txt").is_file())
+        cert = json.loads((self.data / "state.json").read_text())["certs"][0]
+        self.assertEqual(cert["status"], "pass")
 
     def git(self, *args, cwd=None):
         return subprocess.run(
@@ -1161,47 +1299,155 @@ raise SystemExit(1)
             self.git("--git-dir", str(remote), "rev-parse", "feature"), head
         )
 
+    def test_rt_refuses_third_identical_failure_before_preparing_the_worker(self):
+        self.create_git()
+        self.fake_gh()
+        calls = self.root / "remote-calls"
+        with self.config.open("a") as config:
+            config.write("""
+[hosts.worker]
+ssh = "worker"
+rt = true
+checkout = "~/src/gadgets"
+[remote_tests]
+prepare = ["prepare-worker"]
+""")
+        for executable, body in {
+            "rsync": "exit 0",
+            "ssh": f"""printf '%s\\n' "$*" >> {str(calls)!r}
+case "$*" in *failing-command) exit 42 ;; *) exit 0 ;; esac""",
+        }.items():
+            path = self.root / executable
+            path.write_text(f"#!/bin/sh\n{body}\n")
+            path.chmod(0o700)
+        args = ("rt", "worker", str(self.checkout), "--")
+        for _ in range(2):
+            result = self.command(*args, "failing-command", check=False)
+            self.assertEqual(result.returncode, 42, result.stderr)
+        before = calls.read_text()
+        self.assertEqual(before.count("prepare-worker"), 2)
+        result = self.command(*args, "failing-command", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("third identical attempt refused", result.stderr)
+        self.assertEqual(calls.read_text(), before)
+        logs = sorted((self.data / "logs").glob("retry-rt-*.log"))
+        self.assertEqual(len(logs), 2)
+        for log in logs:
+            self.assertIn(str(log), result.stderr)
+        self.command(*args, "different-command")
+        self.assertIn("different-command", calls.read_text())
+
+    def test_train_rechecks_transient_enqueue_rejection_and_parks_after_two(self):
+        import landing
+        import train
+
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        project.prepare()
+        head = "a" * 40
+        row = {
+            "state": "OPEN",
+            "isDraft": False,
+            "headRefOid": head,
+            "baseRefName": "trunk",
+            "author": {"login": "owner"},
+            "isCrossRepository": False,
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewDecision": None,
+            "mergeQueueEntry": None,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        with (
+            mock.patch("runtime.P", project),
+            mock.patch.object(train, "P", project),
+            mock.patch.object(landing, "P", project),
+            mock.patch.object(landing, "review", return_value=row) as read,
+            mock.patch.object(train, "review", return_value=row),
+            mock.patch.object(
+                landing, "checks", side_effect=[(False, False, []), (True, False, [])]
+            ) as checks,
+            mock.patch.object(
+                landing, "gh", return_value=subprocess.CompletedProcess([], 0)
+            ) as merge,
+            mock.patch.object(train, "sh", return_value=(0, "")),
+            mock.patch.object(train.time, "sleep") as delay,
+        ):
+            self.assertTrue(train.enqueue_checked(7, head))
+            merge.assert_called_once()
+            delay.assert_called_once()
+
+            checks.side_effect = None
+            checks.return_value = (False, False, [])
+            with self.assertRaisesRegex(
+                RuntimeError, "third identical attempt refused"
+            ):
+                train.enqueue_checked(8, head)
+            reads = checks.call_count
+            with self.assertRaisesRegex(RuntimeError, "Previous logs:"):
+                train.enqueue_checked(8, head)
+            self.assertEqual(checks.call_count, reads)
+
+            checks.side_effect = [(False, False, []), (True, False, [])]
+            read.side_effect = [row, dict(row, headRefOid="b" * 40)]
+            self.assertFalse(train.enqueue_checked(9, head))
+            self.assertEqual(merge.call_count, 1)
+
     def test_train_waits_for_github_to_report_its_own_push(self):
         import train
 
         reported = iter(["old", "old", "pushed"])
-        with mock.patch.object(
-            train, "pr_info", lambda n: {"headRefOid": next(reported)}
-        ), mock.patch.object(train.time, "sleep"):
+        with (
+            mock.patch.object(
+                train, "pr_info", lambda n: {"headRefOid": next(reported)}
+            ),
+            mock.patch.object(train.time, "sleep"),
+        ):
             self.assertEqual(train.settled_head(7, "pushed"), "pushed")
-        with mock.patch.object(
-            train, "pr_info", lambda n: {"headRefOid": "someone-else"}
-        ), mock.patch.object(train.time, "sleep"):
+        with (
+            mock.patch.object(
+                train, "pr_info", lambda n: {"headRefOid": "someone-else"}
+            ),
+            mock.patch.object(train.time, "sleep"),
+        ):
             self.assertEqual(train.settled_head(7, "pushed"), "someone-else")
 
-    def test_train_retries_a_transient_failure_before_asking_for_help(self):
-        import contextlib
-
+    def test_train_stops_after_two_identical_failures_across_handoffs(self):
         import train
 
         calls, asked = [], []
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        project.prepare()
 
         def flaky(entry):
-            calls.append(entry["pr"])
-            if len(calls) < 3:
+            calls.append(entry["head"])
+            if entry["head"] == "old":
                 raise subprocess.CalledProcessError(1, ["gh", "pr", "diff"])
 
-        patches = (
+        with (
+            mock.patch.object(train, "P", project),
+            mock.patch("runtime.P", project),
             mock.patch.object(train, "land", flaky),
-            mock.patch.object(train, "locked", lambda *a, **k: contextlib.nullcontext()),
             mock.patch.object(train, "need_agent", lambda n, why: asked.append(why)),
-            mock.patch.object(train, "sh", lambda *a, **k: (0, "")),
+            mock.patch.object(train, "sh", return_value=(0, "")),
             mock.patch.object(train.time, "sleep"),
-        )
-        with contextlib.ExitStack() as stack:
-            for patch in patches:
-                stack.enter_context(patch)
-            train.land_safely({"pr": 7, "worktree": "wt"})
-            self.assertEqual((len(calls), asked), (3, []))
-            calls.clear()
-            train.land_safely({"pr": 7, "worktree": "wt"}, attempts=2)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(len(asked), 1)
+            mock.patch.object(
+                train, "pr_info", return_value={"headRefOid": "old"}
+            ) as info,
+        ):
+            entry = {"pr": 7, "worktree": "wt"}
+            train.land_safely(entry, attempts=1)
+            train.land_safely(entry, attempts=1)
+            train.land_safely(entry)
+            self.assertEqual(calls, ["old", "old"])
+            self.assertIn("third identical attempt refused", asked[-1])
+            logs = sorted((self.data / "logs").glob("retry-train-land-*.log"))
+            self.assertEqual(len(logs), 2)
+            for log in logs:
+                self.assertIn(str(log), asked[-1])
+            info.return_value = {"headRefOid": "new"}
+            train.land_safely(entry)
+            self.assertEqual(calls[-1], "new")
 
     def test_remote_test_status_uses_a_command_the_cli_accepts(self):
         import remote
@@ -1210,7 +1456,9 @@ raise SystemExit(1)
         with mock.patch.object(remote, "run", lambda argv, **k: calls.append(argv)):
             remote.record("run-state", "rt-1", "done")
         self.assertIn("run-state", calls[0])
-        result = self.command("run-state", "rt-1", "running", "--machine", "worker", check=False)
+        result = self.command(
+            "run-state", "rt-1", "running", "--machine", "worker", check=False
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('record("run",', (TOOL / "remote.py").read_text())
 

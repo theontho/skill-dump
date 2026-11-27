@@ -192,6 +192,7 @@ def refresh_triage():
 
 def supervise_cycle():
     from lane import acquire, touches
+    from train import enqueue_checked
 
     triage = refresh_triage()
     record("reconcile")
@@ -267,7 +268,7 @@ def supervise_cycle():
                     for row in load(P.data / "train.json", [])
                 ):
                     continue
-                if enqueue(n, current["headRefOid"]):
+                if enqueue_checked(n, current["headRefOid"]):
                     record(
                         "log",
                         f"supervisor: enqueue #{n} at {current['headRefOid'][:9]}",

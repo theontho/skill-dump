@@ -47,6 +47,7 @@ def prepare(pr, info, kind):
                 str(wt),
                 remote_ref,
             )
+        print(f"PR #{pr}: prepared {kind} worktree {wt} at {sha[:9]}", flush=True)
     if wt == P.checkout or git(wt, "status", "--porcelain"):
         raise ValueError(f"refusing to use primary checkout or dirty worktree: {wt}")
     if git(wt, "rev-parse", "HEAD") != sha:

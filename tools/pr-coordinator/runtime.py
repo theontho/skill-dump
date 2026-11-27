@@ -257,8 +257,8 @@ def save(path, data):
 
 
 @contextmanager
-def locked(name, *, wait=True):
-    with (P.data / "locks" / name).open("a") as file:
+def locked(name, *, wait=True, data=None):
+    with ((data if data is not None else P.data) / "locks" / name).open("a") as file:
         fcntl.flock(file, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         yield
 

@@ -45,6 +45,7 @@ yield_grace_minutes = 3
 # ready transitions, and the current head; zero means ready.
 # pr_checks_ready = ["python3", "scripts/pr_checks_ready.py", "--pr", "{pr}"]
 # ci_capacity = ["python3", "scripts/ci_capacity.py", "--wait"]
+enqueue_retry_seconds = 15
 quick_tests = ["tests/test_interface.py"]
 quick_gate = ["python3", "-m", "pytest", "-q"]
 # quick_host = "worker"
@@ -54,6 +55,8 @@ quick_gate = ["python3", "-m", "pytest", "-q"]
 
 [drafts]
 required_statuses = ["local-ci/generic", "local-ci/linux-x64"]
+# reviewer = "@copilot"
+# status_targets = {"local-ci/custom" = "linux"}
 # capacity_args = ["--pr", "{pr}"]
 # ready_workflow = "pull_request.yml"
 # ready_run_suffix = "/ ready"
@@ -155,9 +158,9 @@ slot_timeout = 2700
 # Certification holds with more time remaining are treated as reservations.
 long_hold_seconds = 3600
 # Controller output meaning "host busy, try later" (e.g. a lock acquired after preflight):
-# retry up to busy_retries times, busy_retry_seconds apart, instead of recording an error.
+# Retry once after busy_retry_seconds. Set busy_retries to 0 to disable.
 busy_markers = ["No available certification host"]
-busy_retries = 20
+busy_retries = 1
 busy_retry_seconds = 120
 status_prefix = "local-ci/"
 local_command = ["just", "certify"]
