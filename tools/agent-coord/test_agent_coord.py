@@ -1,6 +1,7 @@
 """Tests for agent-coord: python3 -m unittest -v test_agent_coord"""
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -41,7 +42,7 @@ class CoordinatorTest(unittest.TestCase):
             cap=lambda: (8.0, 16 * GIB),
             # No real CPU readings (the test process's own CPU time would leak
             # into admission): tests that need lease use inject it.
-            cpu_seconds=lambda pid: None,
+            cpu_seconds=lambda pid: None, scope_memory=lambda pid: None,
         )
 
     def ask(self, cores, mem=GIB, agent="a", pid=None, exclusive=False, locks=(),
@@ -1320,7 +1321,9 @@ class SameAsMainWithoutExclusiveLeasesTest(unittest.TestCase):
                         Path(tmp, name, "state.json"),
                         measure=lambda: {"vms": [], "busy": env["busy"], "available": 64 * GIB},
                         cap=lambda: (12.0, 58 * GIB), footprint=lambda pid: 0,
-                        cpu_seconds=lambda pid: env["cpu"].get(pid))
+                        cpu_seconds=lambda pid: env["cpu"].get(pid),
+                        **({"measured_mem": False, "scope_memory": lambda pid: None}
+                           if module is ac else {}))
                     for module, name in ((self.main, "main"), (ac, "branch"))]
                 for step in range(40):
                     op = rng.random()
@@ -1351,6 +1354,371 @@ class SameAsMainWithoutExclusiveLeasesTest(unittest.TestCase):
                     states = [([x["id"] for x in c.state["leases"]], [x["id"] for x in c.state["queue"]])
                               for c in coordinators]
                     self.assertEqual(states[0], states[1], f"seed {seed} step {step}")
+
+
+RAM = 62 * GIB  # a 62 GB machine, as the owner's Linux one
+FLOOR = ac.RESERVE_MEM + int(ac.MEM_MARGIN * RAM)
+
+
+def growth_model(size, use, peak, ramping, expected=None):
+    """Independent restatement of the growth allowance, for the simulations."""
+    use, peak = min(use, size), min(max(peak, use), size)
+    left = size - peak
+    if expected is not None and peak <= expected:
+        return peak - use + max(min(left, ac.MEM_GROWTH_FLOOR), min(expected, size) - peak)
+    share = left if ramping else max(min(left, ac.MEM_GROWTH_FLOOR), int(ac.MEM_GROWTH * left))
+    return peak - use + share
+
+
+class MeasuredMemoryTest(unittest.TestCase):
+    """Memory admission by measured use, with simulated measurements."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Leases and requests need live pids; each stands for one job.
+        cls.procs = [subprocess.Popen(["sleep", "3600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     for _ in range(32)]
+
+    @classmethod
+    def tearDownClass(cls):
+        for proc in cls.procs:
+            proc.kill()
+            proc.wait()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = {"now": 100000.0, "mono": 1000.0, "base": 8 * GIB, "use": {}, "busy": 0.0}
+        for name, key in (("time", "now"), ("monotonic", "mono")):
+            patcher = patch(f"time.{name}", new=lambda key=key: self.env[key])
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.c = self.make()
+
+    def make(self, measured=True, state="state.json"):
+        env = self.env
+        return ac.Coordinator(
+            Path(self.tmp.name, state), history_file=Path(self.tmp.name, f"{state}.history"),
+            measure=lambda: {"vms": [], "busy": env["busy"],
+                             "available": RAM - env["base"] - sum(env["use"].values())},
+            cap=lambda: (64.0, RAM - ac.RESERVE_MEM),
+            footprint=lambda pid: env["use"].get(pid, 0), cpu_seconds=lambda pid: None,
+            tree_pids=lambda pid: {pid}, scope_memory=lambda pid: None, measured_mem=measured,
+        )  # fmt: skip
+
+    def pid(self, n):
+        return self.procs[n].pid
+
+    def ask(self, n, mem, held=False, label=None, c=None, **extra):
+        return (c or self.c).handle({
+            "op": "acquire", "agent": f"a{n}", "pid": self.pid(n), "cores": 1, "mem": mem,
+            "label": label or f"job {n}", "expect": 3600, **({"running": True} if held else {}),
+            **extra})  # fmt: skip
+
+    def advance(self, seconds, step=30, c=None):
+        for _ in range(int(seconds // step)):
+            self.env["now"] += step
+            self.env["mono"] += step
+            (c or self.c).tick()
+
+    def owner_case(self, c):
+        """Three settled leases reserving 16G each and using 5G: by
+        reservation 10G of the 58G lease capacity is free."""
+        for n in range(3):
+            self.ask(n, 16 * GIB, held=True, c=c)
+            self.env["use"][self.pid(n)] = 5 * GIB
+        self.advance(ac.MEM_RAMP + 60, c=c)
+
+    def test_settled_oversized_leases_let_more_start(self):
+        self.owner_case(self.c)
+        # 62 - 8 - 15 = 39G available; allowances 3 x 5.5G; less the 4G
+        # reserve and a 6.2G margin: 12.3G by measured use, 10G by reservation.
+        reserved_only = self.make(measured=False, state="other.json")
+        self.owner_case(reserved_only)
+        self.assertEqual(self.ask(3, 12 * GIB, c=reserved_only)["state"], "waiting")
+        self.assertEqual(self.ask(3, 12 * GIB)["state"], "granted")
+        reply = self.ask(4, GIB)  # the new lease counts at its full size
+        self.assertEqual(reply["state"], "waiting")
+        self.assertIn("by measured use", reply["reason"])
+
+    def test_young_and_ramping_leases_count_in_full(self):
+        for n in range(3):
+            self.ask(n, 16 * GIB, held=True)
+            self.env["use"][self.pid(n)] = 5 * GIB
+        self.advance(60)  # young: whole remaining size reserved
+        self.assertEqual(self.ask(3, 12 * GIB)["state"], "waiting")
+        self.c.handle({"op": "release", "id": self.c.state["queue"][0]["id"]})
+        self.advance(ac.MEM_RAMP)
+        self.assertEqual(self.ask(3, 12 * GIB)["state"], "granted")
+        self.c.handle({"op": "release", "id": self.c.state["leases"][-1]["id"]})
+        self.env["use"][self.pid(0)] = 8 * GIB  # ramping again: its peak rose
+        self.advance(60)
+        self.assertEqual(self.ask(3, 11 * GIB)["state"], "waiting")
+        self.c.handle({"op": "release", "id": self.c.state["queue"][0]["id"]})
+        self.env["use"][self.pid(0)] = 6 * GIB
+        self.advance(ac.MEM_RAMP + 60)  # settled again (its peak stays 8G)
+        self.assertEqual(self.c._growth(self.c.state["leases"][0], self.env["now"]),
+                         2 * GIB + 4 * GIB)  # back to its peak, then half the rest
+
+    def owner_snapshot(self, history):
+        """The owner's report: 56.8G of 57.6G reserved (three gate runs at
+        18.9G), each using 8G, 21G actually available."""
+        size = int(18.9 * GIB)
+        if history:
+            past = {"id": "old", "agent": "a0", "label": "gate", "cores": 1, "mem": size}
+            for peak in (8.5, 9.0, 8.8):
+                self.c._log("ended", past, run=900, code=0, mem_peak=int(peak * GIB))
+        for n in range(3):
+            self.ask(n, size, held=True, label="gate")
+            self.env["use"][self.pid(n)] = 8 * GIB
+        self.env["base"] = RAM - 21 * GIB - 24 * GIB
+        self.advance(60)
+
+    def test_label_history_counts_growth_to_its_peak(self):
+        self.owner_snapshot(history=True)
+        # Each may grow to 9G x 1.15 = 10.35G: 2.35G; 21 - 7.05 - 4 - 6.2 = 3.75G,
+        # even though the leases are young.
+        room = self.c._mem_room()[0]
+        self.assertAlmostEqual(room / GIB, 21 - 3 * 2.35 - 4 - 6.2, delta=0.01)
+        self.assertEqual(self.ask(3, 3 * GIB)["state"], "granted")
+        # A lease that goes past its label's peaks loses the history credit.
+        self.env["use"][self.pid(0)] = 11 * GIB
+        self.advance(30)
+        lease = self.c.state["leases"][0]
+        self.assertEqual(self.c._growth(lease, self.env["now"]), int(18.9 * GIB) - 11 * GIB)
+
+    def test_without_history_the_snapshot_gains_nothing(self):
+        self.owner_snapshot(history=False)
+        self.advance(ac.MEM_RAMP)  # settled: half of the 10.9G left each
+        self.assertLess(self.c._mem_room()[0], 0)
+        self.assertEqual(self.ask(3, 2 * GIB)["state"], "waiting")
+
+    def test_hard_cap_unchanged(self):
+        with patch.object(ac.shutil, "which", return_value="/usr/bin/systemd-run"), \
+                patch.object(ac.Path, "exists", return_value=True):
+            cmd = ac.limited(["true"], 2, 3 * GIB, unit="agent-coord-L7-42")
+        self.assertIn(f"MemoryMax={3 * GIB}", cmd)
+        self.assertIn("--unit=agent-coord-L7-42", cmd)
+
+    def test_overcommit_limit(self):
+        # Leases sized far above their use: measured room is large, but all
+        # sizes together stay within MEM_OVERCOMMIT times the lease capacity.
+        self.env["base"] = 4 * GIB
+        for n in range(4):
+            self.ask(n, 14 * GIB, held=True)
+            self.env["use"][self.pid(n)] = GIB // 2
+        self.advance(ac.MEM_RAMP + 60)
+        cap = RAM - ac.RESERVE_MEM
+        granted = 0
+        for n in range(4, 20):
+            if self.ask(n, 4 * GIB)["state"] == "granted":
+                granted += 1
+        total = sum(x["mem"] for x in self.c.state["leases"])
+        self.assertLessEqual(total, ac.MEM_OVERCOMMIT * cap)
+        self.assertGreater(total, cap)
+        self.assertGreater(granted, 0)
+
+    def test_reservation_only_switch_decides_as_before(self):
+        c = self.make(measured=False, state="off.json")
+        self.owner_case(c)
+        self.assertIsNone(c._mem_room())
+        self.assertEqual(c.handle({"op": "status"})["measured_mem"], None)
+
+    def test_status_shows_reserved_and_measured(self):
+        self.owner_case(self.c)
+        status = self.c.handle({"op": "status"})
+        self.assertEqual(status["free"]["mem"], 10 * GIB)
+        m = status["measured_mem"]
+        self.assertEqual(m["used"], 15 * GIB)
+        self.assertEqual(m["growth"], int(16.5 * GIB))
+        self.assertAlmostEqual(m["free"] / GIB, 12.3, delta=0.01)
+        self.assertEqual(status["leases"][0]["mem_used"], 5 * GIB)
+        self.assertEqual(status["leases"][0]["mem_peak"], 5 * GIB)
+
+    def test_nested_lease_is_taken_out_of_the_outer_one(self):
+        outer, inner = self.pid(0), self.pid(1)
+        self.c.tree_pids = lambda pid: {outer, inner} if pid == outer else {pid}
+        self.ask(0, 16 * GIB, held=True)
+        self.ask(1, 8 * GIB, held=True)
+        self.env["use"] = {outer: 7 * GIB, inner: 6 * GIB}  # outer's tree includes inner
+        self.c.tick()
+        uses = [self.c._mem_use[x["id"]] for x in self.c.state["leases"]]
+        self.assertEqual(uses, [GIB, 6 * GIB])
+
+    def test_ended_event_records_peaks_and_peaks_query(self):
+        cpu = {"t": 0.0}
+        self.c.cpu_seconds = lambda pid: cpu["t"]
+        for run, peak in enumerate((6, 9, 8)):
+            lease = self.ask(0, 16 * GIB, label="gate: tests")
+            for use in (2, peak, 3):
+                self.env["use"][self.pid(0)] = use * GIB
+                cpu["t"] += 3 * 30
+                self.advance(30)
+            self.c.handle({"op": "release", "id": lease["id"], "code": 0})
+            self.env["use"].clear()
+        ended = [e for e in ac.read_history(0, self.c.history_file) if e["event"] == "ended"]
+        self.assertEqual([e["mem_peak"] for e in ended], [6 * GIB, 9 * GIB, 8 * GIB])
+        self.assertTrue(all(0 < e["cores_peak"] <= 3 for e in ended))
+        found = ac.peaks(ac.read_history(0, self.c.history_file), "gate:")
+        self.assertEqual(found["gate: tests"]["mem_peak_max"], 9 * GIB)
+        self.assertEqual(found["gate: tests"]["suggest_mem"], math.ceil(9 * GIB * 1.15))
+        self.assertEqual(found["gate: tests"]["runs"], 3)
+        self.assertEqual(ac.peaks(ac.read_history(0, self.c.history_file), "other"), {})
+
+    def test_scope_memory_reads_unreclaimable_use(self):
+        with tempfile.TemporaryDirectory() as root:
+            scope = Path(root, "user.slice/app.slice/agent-coord-L3-99.scope")
+            scope.mkdir(parents=True)
+            (scope / "memory.current").write_text(f"{10 * GIB}\n")
+            (scope / "memory.stat").write_text(
+                f"anon {6 * GIB}\nfile {4 * GIB}\nshmem {GIB}\nslab_reclaimable {GIB // 2}\n")
+            (scope / "memory.swap.current").write_text("0\n")
+            (scope / "memory.peak").write_text(f"{12 * GIB}\n")
+            groups = {1: "/user.slice/app.slice/agent-shell.scope",
+                      2: "/user.slice/app.slice/agent-coord-L3-99.scope"}
+            with patch.object(ac, "CGROUP_ROOT", Path(root)), \
+                    patch.object(ac, "_tree_pids", lambda pid: iter([1, 2])), \
+                    patch.object(ac, "_cgroup_of", groups.get):
+                use, peak = ac.scope_memory(1)
+        self.assertEqual(use, 10 * GIB - 3 * GIB - GIB // 2)
+        self.assertEqual(peak, 12 * GIB)
+
+    # -- random workloads
+
+    # Job kinds for the simulations: (label, size GiB, true peak as a share
+    # of the size). Most ask for 1.4-3x their peak, as agents' leases do; one
+    # kind ramps to its full size.
+    KINDS = (("unit tests", 8, 0.4), ("gate", 16, 0.55), ("build", 12, 0.35),
+             ("align", 24, 0.6), ("to cap", 8, 1.0), ("big gate", 24, 0.4))
+
+    ARRIVAL = float(os.environ.get("AGENT_COORD_SIM_ARRIVAL", 0.12))  # per 30 s step
+
+    def simulate(self, seed, measured, in_model=True, steps=480, step=30):
+        """A random stream of jobs on the 62 GB machine. Each job's peak
+        varies around its kind's (0.9-1.05x, capped at its size); it ramps up
+        linearly for 30 s - 8 min, holds just below its peak and ends after
+        5-40 min. in_model: after every admission, each running lease grows
+        by at most its growth allowance at that moment (a lease that would
+        grow further is held there and counted as clipped, a misprediction).
+        Returns statistics; the bounds are checked at every admission and
+        step."""
+        import random
+        rng = random.Random(seed)
+        self.env.update(now=100000.0, mono=1000.0, use={}, base=rng.choice([4, 6, 8, 10, 12]) * GIB)
+        c = self.make(measured=measured, state=f"sim-{seed}-{measured}-{in_model}.json")
+        free_pids = list(range(len(self.procs)))
+        jobs, stats = {}, {"done": 0, "wait": 0.0, "started": 0, "clipped": 0,
+                           "min_free": RAM, "over_cap": 0, "asked": 0}  # fmt: skip
+        ceiling: dict[str, int] = {}
+
+        def call(fn):
+            before = {x["id"] for x in c.state["leases"]}
+            result = fn()
+            new = {x["id"] for x in c.state["leases"]} - before
+            if new:
+                admitted(new)
+            return result
+
+        def admitted(new):
+            now = self.env["now"]
+            sizes = sum(x["mem"] for x in c.state["leases"])
+            free = RAM - self.env["base"] - sum(self.env["use"].values())
+            allow = 0
+            for x in c.state["leases"]:
+                if x["id"] in new:
+                    ceiling[x["id"]] = x["mem"]
+                    stats["started"] += 1
+                    stats["wait"] += now - x["asked"]
+                    continue
+                rose = c._mem_step.get(x["id"], (0, -math.inf))[1]
+                ramping = (x["id"] not in c._mem_use or now - x["granted"] < ac.MEM_RAMP
+                           or now - rose < ac.MEM_RAMP)  # fmt: skip
+                g = growth_model(x["mem"], c._mem_use.get(x["id"], 0),
+                                 c._mem_peak.get(x["id"], 0), ramping,
+                                 c._label_ceiling(x) if x["id"] in c._mem_use else None)
+                allow += g
+                ceiling[x["id"]] = self.env["use"].get(x["pid"], 0) + g
+            added = sum(x["mem"] for x in c.state["leases"] if x["id"] in new)
+            reserved_ok = sizes <= RAM - ac.RESERVE_MEM
+            measured_ok = (free - allow - added >= FLOOR
+                           and sizes <= ac.MEM_OVERCOMMIT * (RAM - ac.RESERVE_MEM))
+            self.assertTrue(reserved_ok or (measured and measured_ok),
+                            f"seed {seed} measured={measured}: admitted past the bound: "
+                            f"sizes {sizes / GIB:.2f} free {free / GIB:.2f} allow {allow / GIB:.2f} "
+                            f"added {added / GIB:.2f} new {new}")
+
+        for _ in range(steps):
+            if free_pids and rng.random() < self.ARRIVAL:
+                n = free_pids.pop(rng.randrange(len(free_pids)))
+                label, size, share = rng.choice(self.KINDS)
+                job = {"n": n, "size": size * GIB, "ramp": rng.uniform(30, 480),
+                       "peak": min(size * GIB, int(size * GIB * share * rng.uniform(0.9, 1.05))),
+                       "run": rng.uniform(300, 2400)}  # fmt: skip
+                jobs[self.procs[n].pid] = job
+                stats["asked"] += 1
+                call(lambda: self.ask(n, job["size"], c=c, label=label, expect=job["run"]))
+            self.env["now"] += step
+            self.env["mono"] += step
+            held = {x["pid"]: x for x in c.state["leases"]}
+            for pid, job in list(jobs.items()):
+                lease = held.get(pid)
+                if lease is None:
+                    continue
+                age = self.env["now"] - lease["granted"]
+                if age >= job["run"]:
+                    self.env["use"].pop(pid, None)
+                    ceiling.pop(lease["id"], None)
+                    call(lambda: c.handle({"op": "release", "id": lease["id"], "code": 0}))
+                    free_pids.append(job["n"])
+                    del jobs[pid]
+                    stats["done"] += 1
+                    continue
+                want = int(job["peak"] * min(1.0, age / job["ramp"]) * (1 - rng.uniform(0, 0.03)))
+                if in_model and want > ceiling.get(lease["id"], job["size"]):
+                    stats["clipped"] += 1
+                    want = ceiling[lease["id"]]
+                self.env["use"][pid] = want
+            call(c.tick)
+            free = RAM - self.env["base"] - sum(self.env["use"].values())
+            stats["min_free"] = min(stats["min_free"], free)
+            if sum(x["mem"] for x in c.state["leases"]) > RAM - ac.RESERVE_MEM:
+                stats["over_cap"] += 1
+                if in_model:
+                    # Overcommitted: the last admission was by measured use.
+                    self.assertGreaterEqual(free, FLOOR, f"seed {seed}: below the floor")
+        return stats
+
+    def sim_totals(self, in_model):
+        totals = {}
+        for seed in range(int(os.environ.get("AGENT_COORD_SIM_SEEDS", 12))):
+            for measured in (False, True):
+                agg = totals.setdefault(measured, {})
+                for key, value in self.simulate(seed, measured, in_model).items():
+                    agg[key] = (min(agg.get(key, value), value) if key == "min_free"
+                                else agg.get(key, 0) + value)  # fmt: skip
+        report = {("measured" if m else "reservation"): {
+            "asked": t["asked"], "started": t["started"], "done": t["done"],
+            "mean_wait_min": round(t["wait"] / max(t["started"], 1) / 60, 2),
+            "min_free_gib": round(t["min_free"] / GIB, 2),
+            "overcommitted_steps": t["over_cap"], "clipped": t["clipped"]}
+            for m, t in totals.items()}  # fmt: skip
+        if os.environ.get("AGENT_COORD_SIM_REPORT"):
+            print(f"\nin_model={in_model}\n" + json.dumps(report, indent=2), file=sys.stderr)
+        return totals[False], totals[True]
+
+    def test_random_workloads_keep_the_floor_and_start_more(self):
+        off, on = self.sim_totals(in_model=True)
+        self.assertGreater(on["started"], off["started"])
+        self.assertGreater(on["done"], off["done"])
+        self.assertGreater(on["over_cap"], 0)  # some admissions were by measured use
+
+    def test_random_workloads_beyond_the_model(self):
+        """Jobs grow as they like up to their caps (no clipping, so a job
+        whose peak varies past its label's history is not held back): on
+        these workloads free memory still never reaches the reserve."""
+        off, on = self.sim_totals(in_model=False)
+        self.assertGreater(on["done"], off["done"])
+        self.assertGreater(on["min_free"], ac.RESERVE_MEM)
 
 
 class FootprintTest(unittest.TestCase):
@@ -1385,7 +1753,7 @@ class FootprintTest(unittest.TestCase):
             child.communicate("\n", timeout=5)
         reaped = ac.tree_cpu_seconds(pid)
         self.assertGreater(active - before, 0.07)
-        self.assertGreaterEqual(reaped, active)
+        self.assertGreaterEqual(reaped + 1e-6, active)  # sums in another order
 
 
 class ArchiveTest(unittest.TestCase):

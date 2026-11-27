@@ -78,11 +78,65 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   both are still caps for `run`. Use `--lock wan` if large transfers should
   take turns; `--io` does not take a lock on its own. `status --json` shows
   `io`, `measured_cores`, and `claimed_mem` for running IO leases.
-- **Memory is admitted on reservations**: every lease at its requested size (or
-  its measured tree footprint if larger for `--io`), plus
-  running QEMU guests (resident + swapped) that no lease holds. A request also
-  needs its memory *actually available* now (MemAvailable minus the 4 GB), so
-  nothing is admitted into swap.
+- **Memory is admitted on reservations, or on measured use when they are
+  full.** A request starts if either rule lets it:
+  - *By reservation* (as always): every lease at its requested size (or its
+    measured tree footprint if larger for `--io`), plus running QEMU guests
+    (resident + swapped) that no lease holds, fits the lease capacity, and the
+    request's memory is *actually available* now (MemAvailable minus the 4 GB),
+    so nothing is admitted into swap.
+  - *By measured use*: memory actually available (at most RAM), less the 4 GB
+    reserve, less a margin of 10% of RAM, less a **growth allowance** for every
+    running lease, covers the request at its full size; and all leases' sizes
+    together (plus unleased VMs) stay within 1.5 times the lease capacity.
+    A lease's allowance is what it may still take beyond its use at the last
+    sample: back up to its peak so far in full, then, of the rest of its size,
+    all of it while the lease is young (under 10 minutes), unsampled, or still
+    ramping up (its peak rose by 5% of its size, at least 256 MB, in the last
+    10 minutes), and otherwise half of it but at least 1 GB. Never more than
+    its size less its use: the hard cap stops it there.
+    **Label history:** once a lease has been sampled, if its label has at
+    least 3 successful runs with measured peaks (this agent's, else any
+    agent's), it is expected to grow to at most the largest of the last 10
+    peaks plus 15%, young or not, while it stays at or below that; a lease
+    that goes past it is counted as above. `AGENT_COORD_MEM_HISTORY=0` turns
+    this off. Without it, leases sized at twice their use gain little: half
+    of every settled lease's unused size is still held back.
+  Each lease keeps its hard cap either way (`MemoryMax` of its scope), so a
+  lease never gets more than it declared; only the line moves faster when
+  leases are sized well above what they use.
+  A lease's use is its process tree's resident plus swapped memory, or, when
+  larger, the unreclaimable use (memory.current less reclaimable page cache
+  and slab, plus swap) of the `agent-coord-*` scopes `run` puts it in; a lease
+  started inside another's tree is taken out of the outer one, and leases on
+  one process count it once. Samples come every 2 s, beside the
+  MemAvailable sample they are set against.
+
+  **Safety bound and trade-off.** An admission by measured use leaves at least
+  the reserve plus 10% of RAM free (10.2 GB on a 62 GB machine) as long as
+  every running lease grows by no more than its allowance at that moment;
+  leases that end only add to it. Admissions by reservation keep today's
+  guarantee (every lease at its cap fits the lease capacity), and a machine
+  is only ever overcommitted (sizes above the capacity) after an admission by
+  measured use, so while it is, the bound above holds. What it does not
+  cover: a lease that has held steady for 10 minutes and then grows by more
+  than its allowance (a late phase that needs much more memory), all at once
+  across leases, eats into the margin first, then the reserve, and past that
+  the kernel reclaims, swaps, and on Linux systemd-oomd may kill the
+  largest cgroup under pressure, which can be a long-running service. The
+  worst case is bounded by the hard caps and the 1.5x limit: all leases at
+  their caps can need at most 1.5 times the lease capacity. Lower
+  `AGENT_COORD_MEM_OVERCOMMIT` (1.0 is reservation-only in effect) or raise
+  `AGENT_COORD_MEM_GROWTH` (fraction, default 0.5; 1.0 counts every settled
+  lease's whole remaining size) or `AGENT_COORD_MEM_MARGIN` (fraction of RAM,
+  default 0.10) for more safety, at the cost of throughput;
+  `AGENT_COORD_MEASURED_MEM=0` turns measured admission off. The service
+  reads them at start (set them with `Environment=` in its unit). Sizing
+  leases from measured peaks (`history --peaks`, below) makes reservations
+  honest, which helps both rules.
+  On Windows (once agent-coord runs there) the same rule applies with a
+  lease's use measured as its job's commit (private bytes), since commit is
+  what fails there.
 - `hold` registers work that is already running: it counts at once, without
   waiting. Holding a VM's qemu PID replaces its measured memory with the lease.
 - Docker containers run outside `run`'s caps (they live in dockerd's cgroup):
@@ -105,7 +159,8 @@ Agents are named after their git worktree's folder (`worktree-ultima`), or
   - **EASY backfill past a capacity wait**: a later job that fits now may start
     if its expected end precedes the head's projected start, or if it leaves
     enough cores, memory and headroom for the head at that time. Remaining
-    memory claims count in full; CPU follows measured admission, with warmup
+    memory claims count in full (or by measured use, as above, when that
+    lets both start); CPU follows measured admission, with warmup
     and scoped exclusive guarantees. Outside load stays. Ending leases return
     only measured memory (at most their reservation), and non-ending leases'
     unmeasured memory growth is reserved against available memory.
@@ -183,6 +238,21 @@ carries the lease id, agent, label, cores, mem, IO flag, locks, expected seconds
 estimate source, and exclusive mode
 (`machine`, `lock` or null); never commands, paths or environment.
 `agent-coord history [--since 6h] [--json]` prints it (default: last 24 h).
+
+`ended` events also carry the lease's measured peaks: `mem_peak` (bytes, the
+largest sampled use as admission measures it), `mem_peak_scope` (the scope's
+kernel `memory.peak`, which includes page cache, when `run` made the scope)
+and `cores_peak` (CPU use smoothed over ~10 s). Samples come every 2 s, so a
+shorter spike can be missed by `mem_peak`. To size `--mem` from them:
+
+```sh
+agent-coord history --peaks "gate:"          # labels starting with "gate:"
+agent-coord history --peaks "gate:" --json   # {label: {runs, ok, mem_peak_max, mem_peak_last,
+                                             #   mem_asked_last, suggest_mem, cores_peak_max, ...}}
+```
+
+It looks at each label's last 10 measured runs (`--last N`) in the last 30
+days (`--since`), and suggests `--mem` as the largest memory peak plus 15%.
 
 `run` enforces the lease: the command runs in a systemd user scope with
 `CPUQuota` (N cores) and `MemoryMax` (exceeding it kills the command, exit 137),

@@ -73,6 +73,46 @@ STUCK_AFTER = 120
 DISK_MARGIN = 20 * 1024**3
 MAX_MESSAGES = 1000
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Measured memory admission. A request that does not fit by reservation (every
+# lease at its full size) may still start when the memory actually available,
+# less the kept-back reserve, a safety margin, and a growth allowance for every
+# running lease, covers it; and when all leases' sizes together stay within
+# MEM_OVERCOMMIT times the lease capacity. Each lease keeps its hard cap
+# (MemoryMax). The service reads these once at start (set them in the unit's
+# Environment=); AGENT_COORD_MEASURED_MEM=0 restores reservation-only admission.
+MEASURED_MEM = os.environ.get("AGENT_COORD_MEASURED_MEM", "1") != "0"
+# Allowance for growth beyond a settled lease's peak, as a fraction of what it
+# could still grow to its size. Leases that are young or whose peak rose in the
+# last MEM_RAMP seconds count their whole remaining size.
+MEM_GROWTH = min(1.0, max(0.0, _env_float("AGENT_COORD_MEM_GROWTH", 0.5)))
+MEM_GROWTH_FLOOR = 1024**3  # never less (unless less is left to its size)
+MEM_RAMP = 10 * 60
+# A peak rise of this fraction of the lease's size (at least MEM_RAMP_MIN)
+# counts as still ramping up.
+MEM_RAMP_STEP, MEM_RAMP_MIN = 0.05, 256 * 1024**2
+# Kept free beyond the reserve, as a fraction of RAM, with every running lease
+# grown by its allowance and the new one at its full size.
+MEM_MARGIN = min(0.5, max(0.0, _env_float("AGENT_COORD_MEM_MARGIN", 0.10)))
+# All leases' sizes (their hard caps) together, plus unleased VMs, may reach
+# this multiple of the lease capacity under measured admission.
+MEM_OVERCOMMIT = max(1.0, _env_float("AGENT_COORD_MEM_OVERCOMMIT", 1.5))
+# `history --peaks` suggests --mem as the largest recent peak plus this.
+PEAK_SIZING_MARGIN = 0.15
+# A label with at least MEM_HISTORY_RUNS successful measured runs is expected
+# to grow to at most its largest recent peak plus PEAK_SIZING_MARGIN (while
+# it stays below that), even while young; AGENT_COORD_MEM_HISTORY=0 turns this
+# off. The last MEM_HISTORY_KEEP runs count.
+MEM_HISTORY = os.environ.get("AGENT_COORD_MEM_HISTORY", "1") != "0"
+MEM_HISTORY_RUNS, MEM_HISTORY_KEEP = 3, 10
+
 HELP = """\
 agent-coord - share this computer's CPU and RAM between agents, and message them
 
@@ -134,7 +174,11 @@ MESSAGES
   agent-coord status [--json]              Leases, line, VMs, free capacity.
   agent-coord history [--since D] [--json] Lease events (requested, waiting,
                                            started, ended, cancelled) with
-                                           wait/run times; default last 24h.
+                                           wait/run times and measured peaks
+                                           (memory, cores); default last 24h.
+  agent-coord history --peaks [PREFIX] [--last N] [--since D] [--json]
+      Per label starting with PREFIX: measured memory and CPU peaks of its
+      last N (10) runs in D (30 days), and --mem suggested as peak + 15%.
 
 Lease anything using more than 2 cores or 2 GB for more than a few minutes.
 Running QEMU guests and other unleased load are measured and counted. --as NAME sets who you are
@@ -244,6 +288,60 @@ def tree_footprint(pid: int) -> int:
     return sum(_footprint(current) for current in _tree_pids(pid))
 
 
+SCOPE_PREFIX = "agent-coord-"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+def _cgroup_of(pid: int) -> str | None:
+    try:
+        for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                return line[3:]
+    except OSError:
+        pass
+    return None
+
+
+def _cgroup_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def scope_memory(pid: int) -> tuple[int, int | None] | None:
+    """(in use, kernel peak) of the agent-coord run scopes (cgroups v2) holding
+    pid's process tree, or None when there are none (hold, no systemd).
+
+    In use is what reclaim cannot take back: memory.current less reclaimable
+    page cache and slab (as MemAvailable counts them as available), plus swap.
+    The kernel peak (memory.peak) includes page cache, so it is an upper bound."""
+    groups = set()
+    for current in _tree_pids(pid):
+        group = _cgroup_of(current)
+        if group and Path(group).name.startswith(SCOPE_PREFIX) and group.endswith(".scope"):
+            groups.add(group)
+    use, peak, found = 0, None, False
+    for group in groups:
+        base = CGROUP_ROOT / group.lstrip("/")
+        current = _cgroup_int(base / "memory.current")
+        if current is None:
+            continue
+        found = True
+        stat = {}
+        try:
+            for line in (base / "memory.stat").read_text().splitlines():
+                key, _, value = line.partition(" ")
+                stat[key] = int(value)
+        except (OSError, ValueError):
+            pass
+        cache = max(0, stat.get("file", 0) - stat.get("shmem", 0)) + stat.get("slab_reclaimable", 0)
+        use += max(0, current - cache) + (_cgroup_int(base / "memory.swap.current") or 0)
+        if (high := _cgroup_int(base / "memory.peak")) is not None:
+            peak = (peak or 0) + high
+    return (use, peak) if found else None
+
+
 def tree_cpu_seconds(pid: int) -> float | None:
     """Cumulative CPU time of live and already reaped processes in the tree."""
     pids = _tree_pids(pid)
@@ -335,8 +433,23 @@ class Coordinator:
 
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
                  history_file: Path | None = None, footprint=tree_footprint,
-                 cpu_seconds=tree_cpu_seconds, tree_pids=tree_pids):
+                 cpu_seconds=tree_cpu_seconds, tree_pids=tree_pids,
+                 scope_memory=scope_memory, measured_mem: bool | None = None):
         self._saved = None
+        self._peak_samples: dict[tuple, list[int]] = {}
+        self.scope_memory = scope_memory
+        self.measured_mem = MEASURED_MEM if measured_mem is None else measured_mem
+        # Per lease, sampled each tick beside the available-memory sample:
+        # memory in use (attributed once per process, nested leases taken out
+        # of the outer one), its peak, when the peak last rose by a ramp step,
+        # the kernel's scope peak, and peak CPU use (cores, smoothed).
+        self._mem_use: dict[str, int] = {}
+        self._mem_peak: dict[str, int] = {}
+        self._mem_step: dict[str, tuple[int, float]] = {}
+        self._scope_peak: dict[str, int] = {}
+        self._cores_peak: dict[str, float] = {}
+        self._peak_cpu: tuple[float, dict[str, float]] | None = None
+        self._peak_own: dict[str, float] = {}
         self._samples = None
         self._footprints = None
         self.disk_free = disk_free
@@ -416,9 +529,23 @@ class Coordinator:
         if held:
             granted = x.get("granted", now)
             self._log("ended", x, wait=round(granted - x["asked"], 1),
-                      run=round(now - granted, 1), held=bool(x.get("running")), **extra)  # fmt: skip
+                      run=round(now - granted, 1), held=bool(x.get("running")),
+                      **self._peaks(x["id"]), **extra)  # fmt: skip
         else:
             self._log("cancelled", x, wait=round(now - x["asked"], 1), **extra)
+
+    def _peaks(self, lease_id: str) -> dict:
+        """A lease's measured peaks so far, for its 'ended' event (sampled
+        every tick, so a spike shorter than a tick can be missed; the scope's
+        kernel peak catches it but includes page cache)."""
+        peaks = {}
+        if lease_id in self._mem_peak:
+            peaks["mem_peak"] = self._mem_peak[lease_id]
+        if lease_id in self._scope_peak:
+            peaks["mem_peak_scope"] = self._scope_peak[lease_id]
+        if lease_id in self._cores_peak:
+            peaks["cores_peak"] = round(self._cores_peak[lease_id], 2)
+        return peaks
 
     def _prune(self) -> bool:
         changed = False
@@ -496,6 +623,75 @@ class Coordinator:
             footprints[x["id"]] = min(self._mem_claim(x), budget)
             remaining[pid] -= footprints[x["id"]]
         return footprints
+
+    # -- measured memory admission
+
+    def _mem_total(self) -> int:
+        return self.capacity()[1] + RESERVE_MEM
+
+    def _growth(self, x: dict, now: float) -> int:
+        """Memory lease x may still take beyond its use at the last sample
+        (the one beside the available-memory sample): back up to its peak in
+        full, then a share of the rest of its size: all of it while the lease
+        is young, unsampled or still ramping up (its peak rose in the last
+        MEM_RAMP), else MEM_GROWTH of it but at least MEM_GROWTH_FLOOR. Never
+        more than its size less its use: the hard cap stops it there."""
+        size = self._mem_claim(x)
+        use = min(self._mem_use.get(x["id"], 0), size)
+        peak = min(max(self._mem_peak.get(x["id"], 0), use), size)
+        left = size - peak
+        expected = self._label_ceiling(x) if x["id"] in self._mem_use else None
+        if expected is not None and peak <= expected:
+            # Runs of this label peaked below expected: once sampled, count
+            # growth to it (at least the floor), young or not. A lease that
+            # goes past it loses this and counts as below.
+            return (peak - use) + max(min(left, MEM_GROWTH_FLOOR), min(expected, size) - peak)
+        rose_at = self._mem_step.get(x["id"], (0, -math.inf))[1]
+        ramping = (x["id"] not in self._mem_use or now - x.get("granted", now) < MEM_RAMP
+                   or now - rose_at < MEM_RAMP)  # fmt: skip
+        share = left if ramping else max(min(left, MEM_GROWTH_FLOOR), int(MEM_GROWTH * left))
+        return (peak - use) + share
+
+    def _label_ceiling(self, x: dict) -> int | None:
+        """Largest measured peak of the lease's label's last runs (this
+        agent's, else any agent's) plus PEAK_SIZING_MARGIN, once it has
+        MEM_HISTORY_RUNS successful measured runs; else None."""
+        if not MEM_HISTORY or x.get("io"):
+            return None
+        self._runs(x["agent"], x["label"])  # loads the history once
+        peaks = self._peak_samples.get((x["agent"], x["label"]), [])
+        if len(peaks) < MEM_HISTORY_RUNS:
+            peaks = self._peak_samples.get((None, x["label"]), [])
+        if len(peaks) < MEM_HISTORY_RUNS:
+            return None
+        return math.ceil(max(peaks) * (1 + PEAK_SIZING_MARGIN))
+
+    def _mem_room(self, ending=()) -> tuple[int, int] | None:
+        """(room, overcommit room) for new leases under measured admission,
+        with the leases in ending gone (they return what they use), or None
+        when it is off or nothing has been measured yet.
+
+        room: memory actually available (at most RAM), less every remaining
+        lease's growth allowance, the reserve and MEM_MARGIN of RAM.
+        overcommit room: what MEM_OVERCOMMIT times the lease capacity leaves
+        beside the remaining leases' sizes and unleased VMs."""
+        if not self.measured_mem or self.available is None:
+            return None
+        now = time.time()
+        total = self._mem_total()
+        gone = {x["id"] for x in ending}
+        remaining = [x for x in self.state["leases"] if x["id"] not in gone]
+        freed = sum(min(self._mem_use.get(x["id"], 0), self._mem_claim(x)) for x in ending)
+        growth = sum(self._growth(x, now) for x in remaining)
+        room = (min(self.available, total) + freed - growth - RESERVE_MEM
+                - int(MEM_MARGIN * total))  # fmt: skip
+        sizes = sum(self._mem_claim(x) for x in remaining) + sum(g["mem"] for g in self._vms())
+        return room, int(MEM_OVERCOMMIT * self.capacity()[1]) - sizes
+
+    def _mem_fits(self, need: int, ending=()) -> bool:
+        """Whether need (new leases at their full size) fits by measured use."""
+        room = self._mem_room(ending)
+        return room is not None and need <= min(room)
 
     def _reserved_cpu(self, leases: list[dict]) -> float:
         warming = {x["id"] for x in self._warming()}
@@ -601,17 +797,25 @@ class Coordinator:
         req_cores = self._cpu_claim(req)
         if used_cores + req_cores > cores:
             return "cores", f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
+        # Memory: by reservation (every lease at its size, as always), or by
+        # measured use (see _mem_room) when that does not fit.
+        why = None
         if used_mem + req["mem"] > mem:
-            return "mem", f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
-        if self.available is not None:
+            why = "mem", f"{human(max(mem - used_mem, 0))} of {human(mem)} free"
+        elif self.available is not None:
             # The sample does not yet include warming leases' full claims,
             # including jobs granted earlier in this admission pass.
             growth = sum(max(0, x["mem"] - self._footprint(x["pid"]))
                          for x in self._warming())
             available = self.available - RESERVE_MEM - growth
             if req["mem"] > available:
-                return "available", (f"only {human(max(available, 0))} "
-                                     "of memory actually available")  # fmt: skip
+                why = "available", (f"only {human(max(available, 0))} "
+                                    "of memory actually available")  # fmt: skip
+        if why and not self._mem_fits(req["mem"]):
+            if room := self._mem_room():
+                why = why[0], (f"{why[1]} by reservation; {human(max(min(room), 0))} "
+                               "by measured use (after growth allowances and a safety margin)")
+            return why
         keeper = max([req, *leases], key=lambda x: x.get("headroom", 0))
         if need := keeper.get("headroom", 0):
             claimed = self._claimed()
@@ -735,15 +939,15 @@ class Coordinator:
         need_cores = self._cpu_claim(req) + self._cpu_claim(head)
         if used_cores - freed_cores + need_cores > cores:
             return False
-        if used_mem - freed_mem + req["mem"] + head["mem"] > mem:
+        need = req["mem"] + head["mem"]
+        reserved = used_mem - freed_mem + need <= mem
+        if reserved and self.available is not None:
+            freed_available = sum(self._measured_mem(ending).values())
+            reserved = need <= self.available + freed_available - RESERVE_MEM
+        if not reserved and not self._mem_fits(need, ending):
             return False
-        if head.get("headroom") and (self._claimed() - freed_cores + need_cores
-                                     + head["headroom"] > cores):  # fmt: skip
-            return False
-        if self.available is None:
-            return True
-        freed_available = sum(self._measured_mem(ending).values())
-        return req["mem"] + head["mem"] <= self.available + freed_available - RESERVE_MEM
+        return not (head.get("headroom") and (self._claimed() - freed_cores + need_cores
+                                              + head["headroom"] > cores))  # fmt: skip
 
     def _remember(self, entry: dict) -> None:
         run = entry.get("run")
@@ -755,10 +959,15 @@ class Coordinator:
             samples = self._samples.setdefault(key, [])
             samples.append(run)
             del samples[:-20]
+            if type(entry.get("mem_peak")) is int:
+                peaks = self._peak_samples.setdefault(key, [])
+                peaks.append(entry["mem_peak"])
+                del peaks[:-MEM_HISTORY_KEEP]
 
     def _runs(self, agent: str, label: str) -> list[float]:
         if self._samples is None:
             self._samples = {}
+            self._peak_samples = {}
             for entry in read_history(0, self.history_file):
                 self._remember(entry)
         return self._samples.get((agent, label)) or self._samples.get((None, label), [])
@@ -794,7 +1003,14 @@ class Coordinator:
         remaining = [x for x in self.state["leases"] if x not in ending]
         jobs = [*remaining, head, *([req] if req else [])]
         cores, mem = self.capacity()
-        if sum(self._mem_claim(x) for x in jobs) + sum(g["mem"] for g in self._vms()) > mem:
+        need = head["mem"] + (req["mem"] if req else 0)
+        reserved = sum(self._mem_claim(x) for x in jobs) + sum(g["mem"] for g in self._vms()) <= mem
+        if reserved and self.available is not None:
+            footprints = self._measured_mem(self.state["leases"])
+            freed = sum(footprints[x["id"]] for x in ending)
+            growth = sum(self._mem_claim(x) - footprints[x["id"]] for x in remaining)
+            reserved = need <= self.available + freed - growth - RESERVE_MEM
+        if not reserved and not self._mem_fits(need, ending):
             return False
         io_used = sum(self._cpu_claim(x) for x in remaining if x.get("io"))
         outside = self._unleased() + sum(g["cores"] for g in self._vms())
@@ -814,13 +1030,6 @@ class Coordinator:
         headroom = max(x.get("headroom", 0) for x in jobs)
         if headroom and sum(self._cpu_claim(x) for x in jobs) + outside + headroom > cores:
             return False
-        if self.available is not None:
-            footprints = self._measured_mem(self.state["leases"])
-            freed = sum(footprints[x["id"]] for x in ending)
-            growth = sum(self._mem_claim(x) - footprints[x["id"]] for x in remaining)
-            need = head["mem"] + (req["mem"] if req else 0)
-            if need > self.available + freed - growth - RESERVE_MEM:
-                return False
         return True
 
     def _projection(self, head: dict) -> tuple[float | None, list[dict]]:
@@ -1017,20 +1226,84 @@ class Coordinator:
         self._low_since = low_since
         return changed
 
+    def _lease_memory(self, pid: int) -> tuple[int, int | None]:
+        """(in use, kernel scope peak) of pid's process tree: the larger of its
+        resident-plus-swapped footprint and its run scopes' unreclaimable use."""
+        use = self.footprint(pid)
+        scope = self.scope_memory(pid)
+        if scope is None:
+            return use, None
+        return max(use, scope[0]), scope[1]
+
+    def _sample_peaks(self, wall: float, mono: float, cpu: dict[str, float],
+                      memory: dict[int, tuple[int, int | None]],
+                      trees: dict[int, set[int]]) -> None:
+        """Each lease's memory use (beside the available sample), its peaks
+        and when its peak last rose by a ramp step, and its peak CPU use."""
+        leases = self.state["leases"]
+        pids = {x["pid"] for x in leases}
+        raw = {pid: memory.get(pid, (0, None))[0] for pid in pids}
+        own = {}
+        for pid in pids:
+            # A lease started inside another's tree is measured on its own:
+            # take the outermost such trees out of the outer lease's use.
+            inner = [q for q in pids if q != pid and q in trees.get(pid, ())]
+            top = [q for q in inner if not any(r != q and q in trees.get(r, ()) for r in inner)]
+            own[pid] = max(0, raw[pid] - sum(raw[q] for q in top))
+        use: dict[str, int] = {}
+        sharing: dict[int, list[dict]] = {}
+        for x in leases:
+            sharing.setdefault(x["pid"], []).append(x)
+        for pid, group in sharing.items():
+            budget = own[pid]  # leases on one process count its use once
+            for i, x in enumerate(group):
+                take = budget if i == len(group) - 1 else min(x["mem"], budget)
+                use[x["id"]] = take
+                budget -= take
+        ids = set(use)
+        for table in (self._mem_use, self._mem_peak, self._mem_step,
+                      self._scope_peak, self._cores_peak, self._peak_own):
+            for gone in set(table) - ids:
+                del table[gone]
+        for x in leases:
+            lease_id = x["id"]
+            self._mem_use[lease_id] = use[lease_id]
+            peak = self._mem_peak[lease_id] = max(self._mem_peak.get(lease_id, 0), use[lease_id])
+            step = self._mem_step.get(lease_id)
+            if step is None or peak - step[0] > max(MEM_RAMP_STEP * x["mem"], MEM_RAMP_MIN):
+                self._mem_step[lease_id] = (peak, wall)
+            scope_peak = memory.get(x["pid"], (0, None))[1]
+            if scope_peak is not None:
+                self._scope_peak[lease_id] = max(self._scope_peak.get(lease_id, 0), scope_peak)
+        previous, self._peak_cpu = self._peak_cpu, (mono, cpu)
+        if previous is None or mono <= previous[0]:
+            return
+        for lease_id, seconds in cpu.items():
+            if lease_id in previous[1] and lease_id in ids:
+                rate = max(0.0, seconds - previous[1][lease_id]) / (mono - previous[0])
+                before = self._peak_own.get(lease_id, 0.0)
+                smoothed = self._peak_own[lease_id] = before + BUSY_SMOOTHING * (rate - before)
+                self._cores_peak[lease_id] = max(self._cores_peak.get(lease_id, 0.0), smoothed)
+
     def tick(self) -> None:
         sample = self.measure()
         with self.lock:
+            leases = [(x["id"], x["pid"]) for x in self.state["leases"]]
             targets = [(x["id"], x["pid"]) for x in self.state["leases"]
                        if x.get("io") or x.get("exclusive_locks")
                        or (x["cores"] >= 2 and not x.get("io_hint"))]
         now = time.monotonic()
-        by_pid = {pid: self.cpu_seconds(pid) for pid in {pid for _, pid in targets}}
+        pids = {pid for _, pid in leases}
+        by_pid = {pid: self.cpu_seconds(pid) for pid in pids}
         samples = {lease_id: by_pid[pid] for lease_id, pid in targets if by_pid[pid] is not None}
-        trees = ({pid: self.tree_pids(pid) for pid in by_pid if by_pid[pid] is not None}
-                 if len(targets) > 1 else {})  # fmt: skip
+        every = {lease_id: by_pid[pid] for lease_id, pid in leases if by_pid[pid] is not None}
+        trees = {pid: self.tree_pids(pid) for pid in pids} if len(pids) > 1 else {}
+        memory = {pid: self._lease_memory(pid) for pid in pids}
         with self.lock:
-            self._trees = {lease_id: trees[pid] for lease_id, pid in targets if pid in trees}
+            self._trees = {lease_id: trees[pid] for lease_id, pid in targets
+                           if pid in trees and by_pid[pid] is not None}  # fmt: skip
             self._sample_lease_cpu(now, samples)
+            self._sample_peaks(time.time(), now, every, memory, trees)
             self.vms = sample["vms"]
             self.available = sample["available"]
             # Smoothed over ~10 s: a moment's burst shouldn't hold the line.
@@ -1209,11 +1482,27 @@ class Coordinator:
     def op_status(self, _req: dict, _agent: str) -> dict:
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
+        now = time.time()
+
+        def measured(x: dict) -> dict:
+            if x["id"] not in self._mem_use:
+                return {}
+            return {"mem_used": self._mem_use[x["id"]], "mem_peak": self._mem_peak[x["id"]],
+                    "mem_growth": self._growth(x, now)}  # fmt: skip
+
+        room = self._mem_room()
         return {
             "capacity": {"cores": cores, "mem": mem, "reserve": RESERVE_MEM},
             "free": {"cores": cores - used_cores, "mem": mem - used_mem},
+            "measured_mem": None if room is None else {
+                "used": sum(self._mem_use.get(x["id"], 0) for x in self.state["leases"]),
+                "growth": sum(self._growth(x, now) for x in self.state["leases"]),
+                "margin": int(MEM_MARGIN * self._mem_total()),
+                "free": max(min(room), 0), "overcommit": MEM_OVERCOMMIT,
+            },
             "leases": [{**x, "measured_cores": round(self._cpu_claim(x), 2),
-                        "claimed_mem": self._mem_claim(x)} if x.get("io") else x
+                        "claimed_mem": self._mem_claim(x), **measured(x)} if x.get("io")
+                       else {**x, **measured(x)}
                        for x in self.state["leases"]],
             "queue": [{**x, "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
                       for x in self.state["queue"]],
@@ -1399,8 +1688,9 @@ def archive_writes(cmd: list[str], cwd: str, mounts: list[str]) -> list[str]:
     return found
 
 
-def limited(cmd: list[str], cores: float, mem: int) -> list[str]:
-    """cmd in a systemd user scope capped at cores and mem, at low priority."""
+def limited(cmd: list[str], cores: float, mem: int, unit: str | None = None) -> list[str]:
+    """cmd in a systemd user scope capped at cores and mem, at low priority.
+    unit names the scope (agent-coord-...), so the service can measure it."""
     low = ["nice", "-n", "19", "ionice", "-c", "3", *cmd]
     bus = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "bus")
     if not shutil.which("systemd-run") or not bus.exists():
@@ -1409,6 +1699,7 @@ def limited(cmd: list[str], cores: float, mem: int) -> list[str]:
         return low
     return [
         "systemd-run", "--user", "--scope", "--quiet", "--collect",
+        *([f"--unit={unit}"] if unit else []),
         "-p", f"CPUQuota={max(int(cores * 100), 1)}%", "-p", f"MemoryMax={mem}",
         "-p", "MemorySwapMax=0", "--", *low,
     ]  # fmt: skip
@@ -1463,7 +1754,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         # get killed at it: tell them the lease's memory (heap up to 60% of it).
         java = f"-XX:MaxRAM={args.mem} -XX:MaxRAMPercentage=60"
         env["JAVA_TOOL_OPTIONS"] = f"{env.get('JAVA_TOOL_OPTIONS', '')} {java}".strip()
-        child = subprocess.Popen(limited(command, args.cores, args.mem), env=env)
+        child = subprocess.Popen(limited(command, args.cores, args.mem,
+                                         unit=f"{SCOPE_PREFIX}{lease_id}-{os.getpid()}"), env=env)
         code = child.wait()
         if code == -signal.SIGKILL:
             print(f"agent-coord: {lease_id} was killed; if it used more than "
@@ -1511,6 +1803,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if s.get("available") is not None:
         print(f"memory actually available now: {human(s['available'])} "
               f"(leases need theirs plus {human(cap['reserve'])} of it)")
+    if m := s.get("measured_mem"):
+        print(f"memory by measured use: leases use {human(m['used'])} of "
+              f"{human(cap['mem'] - free['mem'])} reserved, may grow {human(m['growth'])}; "
+              f"free {human(m['free'])} after that, the reserve and a "
+              f"{human(m['margin'])} margin (sizes may total {m['overcommit']:g}x)")
     rows = [("held", x) for x in s["leases"]] + [("waiting", x) for x in s["queue"]]
     for state, x in rows:
         since = (time.time() - x.get("granted", x["asked"])) / 60
@@ -1527,6 +1824,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         why = f" -- {detail}" if detail else ""
         cpu = f"{x['cores']:>4g} cores"
         mem = x.get("claimed_mem", x["mem"])
+        if "mem_used" in x:
+            flag += f" using {human(x['mem_used'])} (peak {human(x['mem_peak'])})"
         if x.get("io"):
             flag += " io"
             cpu = f"{x['cores']:g}-core cap"
@@ -1536,7 +1835,8 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){why}")
     if "busy_cores" in s:
         print(f"cores busy now (measured): {s['busy_cores']:g} of {cap['cores']:g}; "
-              "CPU admission uses this; memory admission reserves at least lease sizes")
+              "CPU admission uses this; memory admission uses lease sizes, or "
+              "measured use plus growth allowances when those do not fit")
     if s.get("unleased_cores"):
         print(f"  other  running {s['unleased_cores']:>4g} cores"
               "                   work not leased through agent-coord (measured)")
@@ -1579,8 +1879,50 @@ def _minutes(seconds: float | None) -> str:
     return "" if seconds is None else f"{seconds / 60:.1f}m"
 
 
+def peaks(events: list[dict], prefix: str = "", last: int = 10) -> dict[str, dict]:
+    """Per label starting with prefix: the measured peaks of its last runs
+    (ended leases with a memory sample, newest last), and --mem suggested as
+    the largest of those memory peaks plus PEAK_SIZING_MARGIN."""
+    runs: dict[str, list[dict]] = {}
+    for e in events:
+        if e.get("event") == "ended" and "mem_peak" in e and str(e.get("label", "")).startswith(prefix):
+            runs.setdefault(e["label"], []).append(e)
+    out = {}
+    for label, ended in sorted(runs.items()):
+        ended = ended[-last:]
+        mem = [e["mem_peak"] for e in ended]
+        cores = [e["cores_peak"] for e in ended if "cores_peak" in e]
+        scope = [e["mem_peak_scope"] for e in ended if "mem_peak_scope" in e]
+        out[label] = {
+            "runs": len(ended), "ok": sum(1 for e in ended if e.get("code") == 0),
+            "mem_peak_max": max(mem), "mem_peak_last": mem[-1],
+            "mem_asked_last": ended[-1].get("mem"),
+            "suggest_mem": math.ceil(max(mem) * (1 + PEAK_SIZING_MARGIN)),
+            **({"cores_peak_max": max(cores)} if cores else {}),
+            **({"mem_peak_scope_max": max(scope)} if scope else {}),
+            "last_time": ended[-1].get("time"),
+        }  # fmt: skip
+    return out
+
+
 def cmd_history(args: argparse.Namespace) -> int:
-    events = read_history(time.time() - args.since)
+    if args.peaks is not None:
+        since = args.since if args.since is not None else 30 * 24 * 3600.0
+        found = peaks(read_history(time.time() - since), args.peaks, args.last)
+        if args.json:
+            print(json.dumps(found, indent=2))
+            return 0
+        for label, p in found.items():
+            cores = f", {p['cores_peak_max']:g} cores" if "cores_peak_max" in p else ""
+            scope = (f" (scope {human(p['mem_peak_scope_max'])} with cache)"
+                     if "mem_peak_scope_max" in p else "")  # fmt: skip
+            print(f"{label}: {p['runs']} run(s), peak {human(p['mem_peak_max'])}{scope}{cores}; "
+                  f"asked {human(p['mem_asked_last'] or 0)}; "
+                  f"suggest --mem {human(p['suggest_mem'])}")
+        if not found:
+            print("no measured runs for that label prefix")
+        return 0
+    events = read_history(time.time() - (args.since if args.since is not None else 24 * 3600.0))
     if args.json:
         for event in events:
             print(json.dumps(event))
@@ -1599,6 +1941,11 @@ def cmd_history(args: argparse.Namespace) -> int:
                 times.append(f"{'wait' if key == 'waited' else key} {_minutes(e[key])}")
         if "code" in e:
             times.append(f"exit {e['code']}")
+        if "mem_peak" in e or "cores_peak" in e:
+            peak = [human(e["mem_peak"])] if "mem_peak" in e else []
+            if "cores_peak" in e:
+                peak.append(f"{e['cores_peak']:g} cores")
+            times.append("peak " + ", ".join(peak))
         detail = e.get("reason") or e.get("why") or e.get("backfill_reason") or ""
         print(f"{stamp} {e['event']:<9} {e['id']:<6} {e['cores']:>4g}c {human(e['mem']):>6} "
               f"{e['agent']}: {e['label']}{flag}"
@@ -1685,8 +2032,10 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("command", nargs=argparse.REMAINDER)
     subs.add_parser("status").add_argument("--json", action="store_true")
     history = subs.add_parser("history")
-    history.add_argument("--since", type=parse_duration, default=24 * 3600.0)
+    history.add_argument("--since", type=parse_duration)
     history.add_argument("--json", action="store_true")
+    history.add_argument("--peaks", nargs="?", const="", metavar="LABEL-PREFIX")
+    history.add_argument("--last", type=int, default=10)
     send = subs.add_parser("send")
     send.add_argument("--to", required=True)
     send.add_argument("text", nargs="+")
