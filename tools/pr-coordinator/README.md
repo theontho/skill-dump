@@ -231,8 +231,14 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
   review, including for explicit targets; a manual `--force` warns and only
   overrides that review gate. Configure `certification.ready_router` to return
   pinned base/head and eligible layers from the project's ready router.
-  Routed certification uses immediately available native slots and preexisting
-  inputs; unavailable hosts/inputs fall back to hosted tests instead of
+  Routed certification uses immediately available native slots. After admission,
+  optional `local_checkout_prepare` and `remote_checkout_prepare` hooks set up
+  the exact head and link existing inputs without installing environments or
+  downloading missing inputs. A host may override them with
+  `cert_checkout_prepare`. The matching cleanup runs even if checkout preparation
+  fails. Without a checkout hook, routed runs still skip preparation and cleanup.
+  Hooks that share a per-head checkout on a host should configure one slot on
+  that host. Unavailable hosts/inputs fall back to hosted tests instead of
   provisioning or retrying. Failed tests still block. WGS Extract can use
   `ci_changes.py --ready` with `ready_router_format = "actions"`.
 - **Draft handoff:** `watch-draft PR` requests Copilot review on an unreviewed

@@ -439,28 +439,29 @@ def certify(wt, pr, target, sha, base, _attempt=0, *, admitted=None, on_status=N
                 flush=True,
             )
             output = {"stdout": log, "stderr": subprocess.STDOUT}
+            preparation_started = admitted is None
             try:
-                envs = (
-                    P.command("certification", "environments", **ctx)
-                    if admitted is None
-                    else []
-                )
-                if envs:
+                ctx["envs"] = ""
+                if admitted is None and (
+                    envs := P.command("certification", "environments", **ctx)
+                ):
                     ctx["envs"] = run(
                         envs, cwd=wt, stdout=subprocess.PIPE, text=True, timeout=180
                     ).stdout.strip()
-                else:
-                    ctx["envs"] = ""
-                provision = (
-                    P.expand(P.hosts[host]["cert_prepare"], **ctx)
-                    if "cert_prepare" in P.hosts[host]
-                    else (P.command("certification", f"{kind}_prepare", **ctx))
+                hook = "prepare" if admitted is None else "checkout_prepare"
+                host_hook = f"cert_{hook}"
+                prepare = (
+                    P.expand(P.hosts[host][host_hook], **ctx)
+                    if host_hook in P.hosts[host]
+                    else P.command("certification", f"{kind}_{hook}", **ctx)
                 )
-                if provision and admitted is None:
+                if prepare:
+                    preparation_started = True
+                    timeout = 3600 if admitted is None else 180
                     if is_remote:
-                        remote(host, provision, timeout=3600, **output)
+                        remote(host, prepare, timeout=timeout, **output)
                     else:
-                        run(provision, cwd=wt, timeout=3600, **output)
+                        run(prepare, cwd=wt, timeout=timeout, **output)
                 code = run(
                     command, cwd=wt, timeout=6 * 3600, check=False, **output
                 ).returncode
@@ -468,16 +469,16 @@ def certify(wt, pr, target, sha, base, _attempt=0, *, admitted=None, on_status=N
                 failure_class = error_class(exc)
                 print(exc, file=log, flush=True)
             finally:
-                cleanup = (
-                    P.expand(P.hosts[host]["cert_cleanup"], **ctx)
-                    if "cert_cleanup" in P.hosts[host]
-                    else (P.command("certification", f"{kind}_cleanup", **ctx))
-                )
-                if cleanup and admitted is None:
+                if preparation_started:
                     try:
-                        if is_remote:
+                        cleanup = (
+                            P.expand(P.hosts[host]["cert_cleanup"], **ctx)
+                            if "cert_cleanup" in P.hosts[host]
+                            else P.command("certification", f"{kind}_cleanup", **ctx)
+                        )
+                        if cleanup and is_remote:
                             remote(host, cleanup, timeout=1800, **output)
-                        else:
+                        elif cleanup:
                             run(cleanup, cwd=wt, timeout=1800, **output)
                     except (OSError, subprocess.SubprocessError) as exc:
                         print(f"Cleanup failed: {exc}", file=log, flush=True)

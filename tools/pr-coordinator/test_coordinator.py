@@ -1463,6 +1463,7 @@ ready_router_format = "actions"
 ready_router = [{json.dumps(sys.executable)}, "-c", "print('routed=true\\\\ncli=false\\\\nrequired_layers=[\\\\\\\"generic\\\\\\\", \\\\\\\"linux-x64\\\\\\\"]\\\\nmove_modules=[]')", "{{base}}", "{{head}}"]
 controller_prepare = ["must-not-provision"]
 local_prepare = ["must-not-provision"]
+local_cleanup = ["{sys.executable}", "-c", "from pathlib import Path; Path('unexpected-cleanup').touch()"]
 local_command = [{json.dumps(sys.executable)}, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])", {json.dumps(str(ran))}, "{{layer}}"]
 [certification.slots]
 generic = ["local"]
@@ -1475,10 +1476,105 @@ slots = 2
 """)
         self.command("cert-pr", "7", timeout=10)
         self.assertEqual(ran.read_text(), "generic")
+        self.assertFalse((self.root / "wt-cert7" / "unexpected-cleanup").exists())
         rerun = self.command("cert-pr", "7", timeout=10)
         self.assertIn("already settled", rerun.stdout)
         plan = json.loads((self.data / "cert-plans" / f"7-{head}-{base}.json").read_text())
         self.assertEqual(plan["hosted"], [])
+
+    def routed_checkout(self, *, remote, prepare_fails=False):
+        _, head = self.create_git("feature.txt")
+        self.git("push", "origin", "HEAD:refs/pull/7/head")
+        self.git("switch", "trunk")
+        base = self.git("rev-parse", "HEAD")
+        self.fake_draft(head, statuses=[], base=base)
+        coord = self.root / "agent-coord"
+        coord.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+        coord.chmod(0o700)
+        ssh = self.root / "ssh"
+        ssh.write_text(
+            f"#!{sys.executable}\n"
+            "import os, shlex, sys\n"
+            "argv = shlex.split(sys.argv[-1])\n"
+            "if argv != ['exit', '0']:\n"
+            "    os.execvp(argv[0], argv)\n"
+        )
+        ssh.chmod(0o700)
+        shared = self.root / "shared-inputs"
+        shared.mkdir()
+        (shared / "wheel").write_text("cached wheel")
+        evidence = self.root / "evidence"
+        script = self.root / "checkout-hooks.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "step, path = sys.argv[1:3]\n"
+            "links = Path(path) / 'out/certify'\n"
+            "inputs = links / 'inputs'\n"
+            "if step == 'prepare':\n"
+            "    links.mkdir(parents=True)\n"
+            "    inputs.symlink_to(sys.argv[3], target_is_directory=True)\n"
+            "    if sys.argv[4] == 'fail':\n"
+            "        raise SystemExit(2)\n"
+            "elif step == 'cleanup':\n"
+            "    inputs.unlink()\n"
+            "else:\n"
+            "    Path(sys.argv[3]).write_text((inputs / 'wheel').read_text())\n"
+        )
+        executable = [sys.executable, str(script)]
+        worktree = "{remote_worktree}" if remote else "{worktree}"
+        prepare = [
+            *executable, "prepare", worktree, str(shared),
+            "fail" if prepare_fails else "pass",
+        ]
+        kind = "remote" if remote else "local"
+        router = f"import json, sys; print(json.dumps({dict(layers=['generic'])!r} | dict(base=sys.argv[1], head=sys.argv[2])))"
+        with self.config.open("a") as config:
+            config.write(f"""
+[certification]
+ready_router = {json.dumps([sys.executable, "-c", router, "{base}", "{head}"])}
+environments = ["must-not-install"]
+controller_prepare = ["must-not-install"]
+{kind}_prepare = ["must-not-install"]
+{kind}_checkout_prepare = {json.dumps(["use-host-hook"] if remote else prepare)}
+{kind}_cleanup = {json.dumps([*executable, "cleanup", worktree])}
+{kind}_command = {json.dumps([*executable, "certify", worktree, str(evidence)])}
+[certification.slots]
+generic = ["native"]
+[hosts.native]
+""")
+            if remote:
+                config.write(f"""
+ssh = "fixture-worker"
+checkout = {json.dumps(str(self.root / "worker"))}
+cert_prepare = ["must-not-install"]
+cert_checkout_prepare = {json.dumps(prepare)}
+""")
+        result = self.command("cert-pr", "7", "--head", head, timeout=15)
+        [cert] = json.loads((self.data / "state.json").read_text())["certs"]
+        if prepare_fails:
+            self.assertEqual(cert["status"], "error")
+            self.assertIn("hosted fallback for generic", result.stdout)
+            self.assertFalse(evidence.exists())
+        else:
+            self.assertEqual(cert["status"], "pass")
+            self.assertEqual(evidence.read_text(), "cached wheel")
+        checkout = (
+            self.root / "worker" / "scratch" / f"certify-{head}"
+            if remote
+            else self.root / "wt-cert7"
+        )
+        self.assertTrue((checkout / "out/certify").is_dir())
+        self.assertFalse((checkout / "out/certify/inputs").is_symlink())
+
+    def test_issue_38_routed_local_cert_uses_existing_inputs_without_provisioning(self):
+        self.routed_checkout(remote=False)
+
+    def test_issue_38_routed_remote_cert_prepares_exact_head_with_host_override(self):
+        self.routed_checkout(remote=True)
+
+    def test_issue_38_routed_remote_cert_cleans_up_partial_preparation(self):
+        self.routed_checkout(remote=True, prepare_fails=True)
 
     def test_1632_reconcile_leaves_live_routed_certification_running(self):
         project = Project("gadgets", config_file=self.config, data_dir=self.data)
