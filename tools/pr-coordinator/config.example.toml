@@ -158,6 +158,12 @@ rt_xml = "out/**/*.xml"
 # "polling_hours.read_bash" = 0
 
 [certification]
+# When set, plan candidate attestation layers from the trusted base checkout,
+# not default_targets. The hook receives full pinned commit IDs as argv.
+# Default output: {"base": "...", "head": "...", "layers": ["generic", "linux-x64"]}
+# ready_router = ["python3", "scripts/ready-router.py", "--base", "{base}", "--head", "{head}", "--ready"]
+# Use "actions" for WGS Extract's ci_changes.py key=value ready output.
+# ready_router_format = "actions"
 default_targets = ["generic", "linux"]
 must_run = ["generic"]
 slot_timeout = 2700

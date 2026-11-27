@@ -2,12 +2,12 @@
 
 import argparse
 import os
-import re
 import subprocess
 import time
 from urllib.parse import quote, urlencode
 
-from landing import assert_owner, json_gh, labels, paused, review, reviewed
+from cert_policy import plan_finished, review_state, routed, statuses
+from landing import assert_owner, json_gh, labels, paused, review
 from runtime import P, cli, gh, load, locked, save
 from worktrees import prepare
 
@@ -80,30 +80,16 @@ def running_certs(pr, head):
     return False
 
 
-def evidence(pr, head):
-    pattern = P.get(
-        "drafts",
-        "reviewer_pattern",
-        r"(?i)^(?:app/)?copilot(?:-pull-request-reviewer)?(?:\[bot\])?$",
-    )
-    api = f"repos/{P.repo}"
-    reviews = json_gh("api", f"{api}/pulls/{pr}/reviews", "--paginate", "--slurp")
-    reviewed_head = any(
-        row.get("commit_id") == head
-        and row.get("state") in {"APPROVED", "COMMENTED", "CHANGES_REQUESTED"}
-        and (user := row.get("user"))
-        and user.get("type") == "Bot"
-        and re.fullmatch(pattern, user["login"])
-        for page in reviews
-        for row in page
-    )
-    pages = json_gh("api", f"{api}/commits/{head}/statuses", "--paginate", "--slurp")
-    latest = {}
-    for page in pages:
-        for row in page:
-            if row["context"].startswith(P.cert_prefix):
-                latest.setdefault(row["context"], row["state"])
-    return reviewed_head, latest, running_certs(pr, head)
+def evidence(pr, head, *, row=None):
+    settled, _ = review_state(pr, head, row if row is not None else review(pr))
+    return settled, statuses(head), running_certs(pr, head)
+
+
+def base_head(pr, head):
+    row = json_gh("pr", "view", str(pr), "--json", "baseRefOid,headRefOid")
+    if row["headRefOid"] != head:
+        raise ValueError("head changed while checking the certification plan")
+    return row["baseRefOid"]
 
 
 def blocking(statuses):
@@ -111,7 +97,7 @@ def blocking(statuses):
 
     An error on an optional platform (host offline, infrastructure) only means hosted CI covers it.
     """
-    required = set(P.get("drafts", "required_statuses", []))
+    required = set(P.get("drafts", "required_statuses", [])) if not routed() else set()
     return {
         context: state
         for context, state in statuses.items()
@@ -119,13 +105,17 @@ def blocking(statuses):
     }
 
 
-def complete(result):
+def complete(result, *, planned=None):
     accepted, statuses, running = result
     required = set(P.get("drafts", "required_statuses", []))
     return (
         accepted
-        and bool(statuses)
-        and all(statuses.get(context) == "success" for context in required)
+        and (
+            planned
+            if planned is not None
+            else bool(statuses)
+            and all(statuses.get(context) == "success" for context in required)
+        )
         and "pending" not in statuses.values()
         and not blocking(statuses)
         and not running
@@ -145,7 +135,7 @@ def request_certification(pr, head, targets):
         )
 
 
-def request_missing(pr, head, result):
+def request_missing(pr, head, result, *, base=None):
     accepted, statuses, running = result
     mapping = P.get("drafts", "status_targets", {})
     missing = set(P.get("drafts", "required_statuses", [])) - statuses.keys()
@@ -164,25 +154,33 @@ def request_missing(pr, head, result):
             for key in missing
         ):
             missing_targets.add(target)
-    if accepted and (running or statuses and not missing_targets):
+    if accepted and (running or (base is None and statuses and not missing_targets)):
         return False
     with locked(f"draft-prerequisites-{pr}.lock"):
         path = P.data / f"draft-prerequisites-{pr}.json"
         marker = load(path, {})
         if marker.get("head") != head:
             marker = {"head": head}
-        request_review = not accepted and not marker.get("review")
+        row = owner_pr(pr, draft=True)
+        if row["headRefOid"] != head:
+            return False
+        settled, may_request_review = review_state(pr, head, row)
+        request_review = may_request_review and not marker.get("review")
         requested = marker.get("cert", [])
         targets = sorted(missing_targets - set(requested))
         request_default = not statuses and not requested
-        request_cert = not running and (
-            request_default or targets and "*" not in requested
+        request_cert = (
+            accepted
+            and settled
+            and not running
+            and (
+                not plan_finished(pr, head, base) and marker.get("cert_base") != base
+                if base is not None
+                else request_default or targets and "*" not in requested
+            )
         )
         if not (request_review or request_cert):
             return False
-        if owner_pr(pr, draft=True)["headRefOid"] != head:
-            return False
-
         changed = False
         if request_review:
             reviewer = P.get("drafts", "reviewer", "@copilot")
@@ -201,14 +199,17 @@ def request_missing(pr, head, result):
             changed = True
 
         if request_cert and not running_certs(pr, head):
-            targets = [] if request_default else targets
+            targets = [] if base is not None or request_default else targets
             print(
                 f"PR #{pr} head {head[:9]}: requesting certification"
                 + (f" ({', '.join(targets)})" if targets else ""),
                 flush=True,
             )
             request_certification(pr, head, targets)
-            marker["cert"] = requested + (targets or ["*"])
+            if base is None:
+                marker["cert"] = requested + (targets or ["*"])
+            else:
+                marker["cert_base"] = base
             save(path, marker)
             changed = True
         return changed
@@ -219,21 +220,31 @@ def watch(pr):
     grace = P.get("drafts", "idle_seconds", 480)
     idle_since = None
     previous_head = None
+    deadline = time.monotonic() + P.get("drafts", "watch_timeout", 21600)
     while True:
-        head = owner_pr(pr, draft=True)["headRefOid"]
-        result = evidence(pr, head)
+        if time.monotonic() >= deadline:
+            raise ValueError("timed out waiting for settled review and certification")
+        row = owner_pr(pr, draft=True)
+        head = row["headRefOid"]
+        base = base_head(pr, head) if routed() else None
+        result = evidence(pr, head, row=row)
+        planned = plan_finished(pr, head, base) if base is not None else None
         if previous_head != head or result[2]:
             idle_since = None
         previous_head = head
-        if complete(result) and owner_pr(pr, draft=True)["headRefOid"] == head:
+        if (
+            complete(result, planned=planned)
+            and owner_pr(pr, draft=True)["headRefOid"] == head
+        ):
             print(
-                f"PR {pr} head {head[:9]}: reviewed; certification passed", flush=True
+                f"PR {pr} head {head[:9]}: review and certification plan settled",
+                flush=True,
             )
             return head
         accepted, statuses, running = result
         if not running and blocking(statuses):
             raise ValueError(f"certification failed on {head[:9]}: {statuses}")
-        if request_missing(pr, head, result):
+        if request_missing(pr, head, result, base=base):
             idle_since = None
             time.sleep(interval)
             continue
@@ -310,26 +321,35 @@ def finish(pr):
             if not capacity:
                 raise ValueError("landing.ci_capacity must be configured")
             capacity += P.command("drafts", "capacity_args", pr=pr)
+            deadline = time.monotonic() + P.get("drafts", "admission_timeout", 3600)
             while True:
+                if time.monotonic() >= deadline:
+                    raise ValueError("timed out waiting for spare readiness capacity")
                 row = owner_pr(pr, draft=True)
-                if row["headRefOid"] != head or not reviewed(row):
+                if not review_state(pr, head, row)[0]:
                     raise ValueError(
                         "draft head changed or review still needs attention"
                     )
                 if paused():
                     time.sleep(P.get("drafts", "poll_seconds", 120))
                     continue
-                code = subprocess.run(capacity, cwd=P.checkout, check=False).returncode
+                code = subprocess.run(
+                    capacity, cwd=P.checkout, check=False, timeout=180
+                ).returncode
                 if code == 3:
                     time.sleep(P.get("drafts", "capacity_retry_seconds", 300))
                     continue
                 if code:
                     raise ValueError(f"capacity gate exited {code}")
-                if not complete(evidence(pr, head)):
+                base = base_head(pr, head) if routed() else None
+                planned = plan_finished(pr, head, base) if base is not None else None
+                if not complete(evidence(pr, head), planned=planned):
                     raise ValueError("exact-head review or certification changed")
                 wt, branch = handoff_worktree(pr, head)
                 row = owner_pr(pr, draft=True)
-                if row["headRefOid"] != head or not reviewed(row):
+                if not review_state(pr, head, row)[0] or (
+                    base is not None and base_head(pr, head) != base
+                ):
                     raise ValueError(
                         "draft head changed or review still needs attention"
                     )

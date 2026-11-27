@@ -1032,6 +1032,7 @@ ssh = "spare"
             mock.patch("runtime.P", project),
             mock.patch.object(drafts, "owner_pr", return_value={"headRefOid": head}),
             mock.patch.object(drafts, "evidence", return_value=(True, {}, False)),
+            mock.patch.object(drafts, "review_state", return_value=(True, False)),
             mock.patch.object(drafts, "request_certification") as request,
             mock.patch.object(drafts.time, "sleep"),
         ):
@@ -1064,7 +1065,9 @@ ssh = "spare"
             self.assertTrue(drafts.running_certs(7, old))
             self.assertFalse(drafts.running_certs(7, new))
 
-    def fake_draft(self, head, *, statuses, review_head=None):
+    def fake_draft(
+        self, head, *, statuses, review_head=None, pending=False, unresolved=False, base="base"
+    ):
         state = self.root / "ready"
         requests = self.root / "review-requests"
         review = {
@@ -1074,7 +1077,14 @@ ssh = "spare"
             "isCrossRepository": False,
             "author": {"login": "owner"},
             "labels": {"nodes": [], "pageInfo": {"hasNextPage": False}},
-            "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewThreads": {
+                "nodes": [{"isResolved": False}] if unresolved else [],
+                "pageInfo": {"hasNextPage": False},
+            },
+            "reviewRequests": {
+                "nodes": [{"id": "request"}] if pending else [],
+                "pageInfo": {"hasNextPage": False},
+            },
             "reviewDecision": None,
         }
         command = self.root / "gh"
@@ -1092,7 +1102,7 @@ elif args[:2] == ["api", "graphql"]:
     print(json.dumps({{"data": {{"repository": {{"pullRequest": row}}}}}}))
 elif args[:2] == ["pr", "view"]:
     print(json.dumps({{"number": 7, "headRefName": "feature", "headRefOid": {head!r},
-        "baseRefOid": "base", "isCrossRepository": False}}))
+        "baseRefOid": {base!r}, "isCrossRepository": False}}))
 elif args[:2] == ["pr", "ready"]:
     state.touch()
 elif args[:2] == ["pr", "edit"] and "@copilot" in args:
@@ -1211,6 +1221,7 @@ platform = "macos-arm64"
                 return_value=(True, {"local-ci/generic": "success"}, False),
             ),
             mock.patch.object(drafts, "request_certification") as request,
+            mock.patch.object(drafts, "review_state", return_value=(True, False)),
         ):
             with self.assertRaisesRegex(ValueError, "local-ci/generic"):
                 drafts.watch(7)
@@ -1259,6 +1270,90 @@ generic = ["local"]
         self.assertTrue((self.root / "wt-cert7" / "feature.txt").is_file())
         cert = json.loads((self.data / "state.json").read_text())["certs"][0]
         self.assertEqual(cert["status"], "pass")
+
+    def test_1632_pending_or_actionable_review_blocks_certification_until_forced(self):
+        _, head = self.create_git("feature.txt")
+        self.git("switch", "trunk")
+        coord = self.root / "agent-coord"
+        coord.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+        coord.chmod(0o700)
+        with self.config.open("a") as config:
+            config.write("""
+[certification]
+local_command = ["true"]
+[certification.slots]
+generic = ["local"]
+[hosts.local]
+""")
+        for reason in ({"pending": True}, {"unresolved": True}, {"review_head": "b" * 40}):
+            with self.subTest(reason=reason):
+                self.fake_draft(head, statuses=[], **reason)
+                result = self.command("cert-pr", "7", "generic", check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("--force", result.stderr)
+                self.assertFalse((self.root / "wt-cert7").exists())
+        result = self.command("cert-pr", "7", "generic", "--force", timeout=10)
+        self.assertIn("WARNING", result.stderr)
+        self.assertTrue((self.root / "wt-cert7").is_dir())
+
+    def test_1632_policy_router_keeps_workflow_smoke_hosted_and_never_provisions(self):
+        _, head = self.create_git("feature.txt")
+        self.git("push", "origin", "HEAD:refs/pull/7/head")
+        self.git("switch", "trunk")
+        base = self.git("rev-parse", "HEAD")
+        self.fake_draft(head, statuses=[], base=base)
+        ran = self.root / "cert-command"
+        with self.config.open("a") as config:
+            config.write(f"""
+[certification]
+ready_router_format = "actions"
+ready_router = [{json.dumps(sys.executable)}, "-c", "print('routed=true\\\\ncli=false\\\\nrequired_layers=[\\\\\\\"generic\\\\\\\", \\\\\\\"linux-x64\\\\\\\"]\\\\nmove_modules=[]')", "{{base}}", "{{head}}"]
+controller_prepare = ["must-not-provision"]
+local_prepare = ["must-not-provision"]
+local_command = [{json.dumps(sys.executable)}, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])", {json.dumps(str(ran))}, "{{layer}}"]
+[certification.slots]
+generic = ["local"]
+linux = ["local"]
+[certification.layers]
+linux = "platform"
+[hosts.local]
+platform = "linux-x64"
+slots = 2
+""")
+        self.command("cert-pr", "7", timeout=10)
+        self.assertEqual(ran.read_text(), "generic")
+        rerun = self.command("cert-pr", "7", timeout=10)
+        self.assertIn("already settled", rerun.stdout)
+        plan = json.loads((self.data / "cert-plans" / f"7-{head}-{base}.json").read_text())
+        self.assertEqual(plan["hosted"], [])
+
+    def test_1632_mergeable_behind_only_refreshes_for_generated_overlap(self):
+        self.create_git()
+        common = self.git("rev-parse", "HEAD^")
+        self.git("switch", "-c", "clean-base", common)
+        (self.checkout / "separate.txt").write_text("unrelated")
+        self.git("add", "separate.txt")
+        self.git("commit", "-m", "unrelated main advancement")
+        clean_base = self.git("rev-parse", "HEAD")
+        (self.checkout / "generated.txt").write_text("changed on branch")
+        self.git("commit", "-am", "identical generated change on base")
+        overlap_base = self.git("rev-parse", "HEAD")
+        source = """import json, sys, runtime
+runtime.P = runtime.Project('gadgets', config_file=sys.argv[1])
+from train import refresh_requirements
+for base in sys.argv[2:4]:
+    conflicts, overlap = refresh_requirements(runtime.P.checkout, base, sys.argv[4])
+    print(json.dumps([conflicts, sorted(overlap)]))
+"""
+        output = subprocess.run(
+            [sys.executable, "-c", source, str(self.config), clean_base, overlap_base,
+             self.git("rev-parse", "feature")],
+            cwd=TOOL, text=True, capture_output=True, check=True,
+        )
+        self.assertEqual(
+            [json.loads(line) for line in output.stdout.splitlines()],
+            [[[], []], [[], ["generated.txt"]]],
+        )
 
     def git(self, *args, cwd=None):
         return subprocess.run(

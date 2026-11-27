@@ -15,9 +15,17 @@ from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
-from landing import assert_owner, json_gh
+from cert_policy import (
+    planned_path,
+    review_state,
+    routed,
+    routed_targets,
+    router_layers,
+    statuses,
+)
+from landing import assert_owner, eligible, json_gh, review
 from retries import ACTION_ERRORS, Retry, RetryLimit, error_class
-from runtime import P, agent_coord_status, cli, load, locked
+from runtime import P, agent_coord_status, cli, load, locked, save
 
 RT_NOT_ADMITTED = 75
 
@@ -298,16 +306,18 @@ def cert_host_states(slots):
         yield key, state
 
 
-def certify(wt, pr, target, sha, base, _attempt=0):
+def certify(wt, pr, target, sha, base, _attempt=0, *, admitted=None, on_status=None):
     slots = P.get("certification", "slots", {}).get(target, [])
     if not slots:
         raise ValueError(f"no hosts configured in certification.slots.{target}")
     path = P.data / "logs"
     path.mkdir(exist_ok=True, mode=0o700)
     short = sha[:9]
-    host = "pending"
+    host = admitted or "pending"
 
     def status(phase):
+        if on_status:
+            on_status(phase)
         record(
             "cert-state",
             pr,
@@ -410,6 +420,8 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     raise ValueError(f"certification.{kind}_command is required")
                 command += P.command("certification", target + "_args", **ctx)
                 command += P.expand(P.hosts[host].get("cert_args", []), **ctx)
+                if admitted:
+                    command += P.command("certification", f"routed_{kind}_args", **ctx)
         except ACTION_ERRORS:
             status("error")
             raise
@@ -427,7 +439,11 @@ def certify(wt, pr, target, sha, base, _attempt=0):
             )
             output = {"stdout": log, "stderr": subprocess.STDOUT}
             try:
-                envs = P.command("certification", "environments", **ctx)
+                envs = (
+                    P.command("certification", "environments", **ctx)
+                    if admitted is None
+                    else []
+                )
                 if envs:
                     ctx["envs"] = run(
                         envs, cwd=wt, stdout=subprocess.PIPE, text=True, timeout=180
@@ -439,7 +455,7 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     if "cert_prepare" in P.hosts[host]
                     else (P.command("certification", f"{kind}_prepare", **ctx))
                 )
-                if provision:
+                if provision and admitted is None:
                     if is_remote:
                         remote(host, provision, timeout=3600, **output)
                     else:
@@ -456,7 +472,7 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     if "cert_cleanup" in P.hosts[host]
                     else (P.command("certification", f"{kind}_cleanup", **ctx))
                 )
-                if cleanup:
+                if cleanup and admitted is None:
                     try:
                         if is_remote:
                             remote(host, cleanup, timeout=1800, **output)
@@ -489,7 +505,11 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                 else failure_class or f"exit-{code}",
                 f"{host} exited {code}; output: {log_path} (byte offset {start})",
             )
-        retry = busy and _attempt < min(1, P.get("certification", "busy_retries", 1))
+        retry = (
+            admitted is None
+            and busy
+            and _attempt < min(1, P.get("certification", "busy_retries", 1))
+        )
         if retry:
             try:
                 retries[host].check()
@@ -564,13 +584,16 @@ def cert_pr_main():
     parser.add_argument("pr", type=int)
     parser.add_argument("targets", nargs="*")
     parser.add_argument("--head", help="require an exact published PR head")
+    parser.add_argument("--force", action="store_true", help="allow an unsettled head")
     args = parser.parse_args()
     assert_owner()
     targets = list(
         dict.fromkeys(args.targets or P.get("certification", "default_targets", []))
     )
     slots = P.get("certification", "slots", {})
-    if not targets or set(targets) - slots.keys():
+    if set(args.targets) - slots.keys() or (
+        not routed() and (not targets or set(targets) - slots.keys())
+    ):
         parser.error("provide configured certification targets")
     pr = json_gh(
         "pr",
@@ -586,6 +609,7 @@ def cert_pr_main():
     sha = pr["headRefOid"]
     if args.head and sha != args.head:
         raise ValueError("head changed before certification was requested")
+    check_cert_review(args.pr, sha, args.force, warn=True)
     # Per head: a push while an older head certifies must start the new head (the old run is superseded).
     with ExitStack() as stack:
         try:
@@ -593,6 +617,8 @@ def cert_pr_main():
         except BlockingIOError:
             print(f"PR #{args.pr} head {sha[:9]}: certification already running")
             return 0
+        if routed():
+            return certify_route(args.pr, pr, args.targets, slots, args.force, stack)
         runnable = []
         for target in targets:
             blocked = blocked_hosts(
@@ -618,6 +644,7 @@ def cert_pr_main():
             settings=P.settings.get("certification"),
         )
         with retry.observe("prepare"):
+            check_cert_review(args.pr, sha, args.force)
             with locked(f"worktree-pr-{args.pr}.lock"):
                 wt = prepare(args.pr, pr, "cert")
             prep = P.command(
@@ -625,6 +652,7 @@ def cert_pr_main():
             )
             if prep:
                 run(prep, cwd=wt, timeout=1800)
+        check_cert_review(args.pr, sha, args.force)
         with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
             return max(
                 declined,
@@ -637,3 +665,162 @@ def cert_pr_main():
                     runnable,
                 ),
             )
+
+
+def check_cert_review(pr, head, force, *, warn=False):
+    row = review(pr)
+    if row["headRefOid"] != head:
+        raise ValueError("head changed before certification")
+    if not eligible({**row, "isDraft": False}):
+        raise ValueError(
+            "cert-pr needs an eligible owner PR in the configured repository"
+        )
+    if not review_state(pr, head, row)[0]:
+        if not force:
+            raise ValueError(
+                "review is unsettled on this head; use --force to override"
+            )
+        if warn:
+            print(
+                f"WARNING: forcing certification of unsettled head {head[:9]}",
+                file=sys.stderr,
+            )
+
+
+def check_cert_plan(pr, sha, base, force):
+    check_cert_review(pr, sha, force)
+    row = json_gh("pr", "view", str(pr), "--json", "headRefOid,baseRefOid")
+    if row["headRefOid"] != sha or row["baseRefOid"] != base:
+        raise ValueError(
+            "PR head or base changed; abandon the stale certification plan"
+        )
+
+
+def admit_cert_host(hosts, stack):
+    for host, state in cert_host_states(hosts):
+        if state is not None:
+            continue
+        for slot in range(P.hosts[host].get("slots", 1)):
+            try:
+                stack.enter_context(locked(f"cert-host-{host}-{slot}.lock", wait=False))
+            except BlockingIOError:
+                continue
+            return host
+    return None
+
+
+def certify_route(pr, row, requested, slots, force, stack):
+    sha, base = row["headRefOid"], row["baseRefOid"]
+    path = planned_path(pr, sha, base)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    check_cert_plan(pr, sha, base, force)
+    try:
+        layers = router_layers(pr, sha, base)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        if requested:
+            raise ValueError(f"ready router unavailable: {exc}") from exc
+        check_cert_plan(pr, sha, base, force)
+        print(
+            f"PR #{pr}: ready router unavailable; hosted fallback ({exc})",
+            file=sys.stderr,
+        )
+        save(path, {"outcome": "complete", "hosted": ["unknown"]})
+        return 0
+
+    mapping = routed_targets(layers, slots)
+    if set(requested) - {target for target, hosts in mapping.items() if hosts}:
+        raise ValueError(
+            "explicit certification targets must match the ready router plan"
+        )
+    latest = statuses(sha)
+    if any(value == "failure" for value in latest.values()):
+        raise ValueError(
+            "local tests failed on this head; fix the failure before readiness"
+        )
+    saved = load(path, {})
+    if saved.get("outcome") == "failure":
+        raise ValueError("local tests failed on this certification plan")
+    if saved.get("outcome") == "complete" and not requested:
+        print(f"PR #{pr} head {sha[:9]}: certification plan already settled")
+        return 0
+    attempt_path = path.with_name(f"{pr}-{sha}-attempts.json")
+    attempted = load(attempt_path, {})
+    if "fail" in attempted.values():
+        raise ValueError("local tests failed on this certification head")
+    completed = {
+        layer for layer in layers if latest.get(P.cert_prefix + layer) == "success"
+    }
+    hosted = set()
+    reserved = {}
+    candidates = requested or mapping
+    for layer in sorted(
+        layers - completed, key=lambda layer: (layer != "generic", layer)
+    ):
+        if (
+            latest.get(P.cert_prefix + layer) in {"pending", "error"}
+            or layer in attempted
+        ):
+            hosted.add(layer)
+            continue
+        for target in candidates:
+            hosts = [
+                host
+                for host, candidate in mapping[target].items()
+                if candidate == layer
+            ]
+            if hosts and (host := admit_cert_host(hosts, stack)):
+                reserved[layer] = (target, host)
+                break
+        else:
+            hosted.add(layer)
+    if reserved:
+        check_cert_plan(pr, sha, base, force)
+        from worktrees import prepare
+
+        try:
+            with locked(f"worktree-pr-{pr}.lock", wait=False):
+                wt = prepare(pr, row, "cert")
+        except BlockingIOError:
+            hosted.update(reserved)
+            reserved.clear()
+    if reserved:
+        check_cert_plan(pr, sha, base, force)
+
+        def execute(layer, target, host):
+            phase = ""
+
+            def capture(value):
+                nonlocal phase
+                phase = value
+
+            check_cert_plan(pr, sha, base, force)
+            certify(wt, pr, target, sha, base, admitted=host, on_status=capture)
+            return layer, phase
+
+        attempted.update(dict.fromkeys(reserved, "started"))
+        save(attempt_path, attempted)
+        with ThreadPoolExecutor(max_workers=len(reserved)) as pool:
+            jobs = [
+                pool.submit(execute, layer, *job) for layer, job in reserved.items()
+            ]
+            outcomes = dict(job.result() for job in jobs)
+        attempted.update(outcomes)
+        save(attempt_path, attempted)
+        if "fail" in outcomes.values():
+            save(path, {"outcome": "failure"})
+            return 1
+        hosted.update(layer for layer, result in outcomes.items() if result != "pass")
+    check_cert_plan(pr, sha, base, force)
+    if hosted:
+        print(
+            f"PR #{pr} head {sha[:9]}: hosted fallback for {', '.join(sorted(hosted))}"
+        )
+    if not requested:
+        save(path, {"outcome": "complete", "hosted": sorted(hosted)})
+    return 0

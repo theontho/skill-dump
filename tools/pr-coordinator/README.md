@@ -212,10 +212,18 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
   limits and teardown. `cert-pr` uses an existing clean worktree on the PR
   branch or prepares a dedicated one, then waits for the configured targets;
   run it in a managed background shell if needed. `cert-pr PR --head SHA`
-  declines if the published head has already changed.
-- **Draft handoff:** `watch-draft PR` requests missing certification and Copilot
-  review once per published head, and waits for terminal certification and a
-  submitted bot review on that exact head. Configure `drafts.required_statuses`
+  declines if the published head has changed. `cert-pr` requires a settled
+  review, including for explicit targets; a manual `--force` warns and only
+  overrides that review gate. Configure `certification.ready_router` to return
+  pinned base/head and eligible layers from the project's ready router.
+  Routed certification uses immediately available native slots and preexisting
+  inputs; unavailable hosts/inputs fall back to hosted tests instead of
+  provisioning or retrying. Failed tests still block. WGS Extract can use
+  `ci_changes.py --ready` with `ready_router_format = "actions"`.
+- **Draft handoff:** `watch-draft PR` requests Copilot review on an unreviewed
+  head and requests certification only once that exact head has a submitted
+  bot review, no pending review, no unresolved threads and no required approval
+  outstanding. For projects without a ready router, configure `drafts.required_statuses`
   to require particular status contexts, `drafts.status_targets` to map a
   custom context to its certification target, and `drafts.reviewer` or
   `drafts.reviewer_pattern` to change who gets requested or recognized.
@@ -229,7 +237,10 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
   also prepares a missing checkout and keeps an existing active registration.
   Worktree preparation reuses the clean PR branch worktree or creates one and
   fast-forwards only; it does not discard local changes. `ATTENTION` means an
-  operator must investigate.
+  operator must investigate. The train keeps a mergeable head unless main
+  overlaps a changed generated file. When a conflict or generated overlap
+  requires a train refresh, it returns the PR to draft before pushing;
+  run `finish-draft` again after the new head is reviewed.
 - **Retry limit:** certification, remote tests and train actions record failures
   by command, inputs and failure class in the project's `retries/` directory.
   After two matching failures the coordinator refuses another unchanged

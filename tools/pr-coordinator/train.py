@@ -23,7 +23,7 @@ from landing import (
 from lane import acquire, touches
 from remote import RT_NOT_ADMITTED
 from retries import ACTION_ERRORS, Retry, RetryLimit, error_class
-from runtime import P, cli, gh_argv, load, locked, questions, save, uuid4
+from runtime import P, cli, gh, gh_argv, load, locked, questions, save, uuid4
 
 HERE = P.data
 MAIN = P.checkout
@@ -306,7 +306,7 @@ def settled_head(n, expected, attempts=5, pause=30):
     return head
 
 
-def refresh(n, wt, branch, *, active=lambda: True):
+def refresh(n, wt, branch, *, active=lambda: True, draft_head=None):
     """Merge origin/main; regenerate; push. Returns True if HEAD changed and was pushed."""
     git_step(wt, "fetch", "-q", P.remote, P.base, branch, timeout=180)
     code, out = sh(["git", "status", "--porcelain", "--untracked-files=no"], cwd=wt)
@@ -447,7 +447,15 @@ def refresh(n, wt, branch, *, active=lambda: True):
     if current and current["mergeQueueEntry"]:
         return "queued"  # preserve any unpushed local resolutions
     remote_head = git_step(wt, "rev-parse", f"{P.remote}/{branch}").strip()
-    if not eligible(current) or current["headRefOid"] != remote_head:
+    allowed = (
+        eligible(current)
+        if draft_head is None
+        else current
+        and current["isDraft"]
+        and remote_head == draft_head
+        and eligible({**current, "isDraft": False})
+    )
+    if not allowed or current["headRefOid"] != remote_head:
         need_agent(
             n, f"#{n}: head or eligibility changed during refresh; no push made."
         )
@@ -472,6 +480,96 @@ def git_step(wt, *args, timeout=180):
     if code:
         raise RuntimeError(f"git {args[0]} failed: {out[-500:]}")
     return out
+
+
+def refresh_requirements(wt, base, head):
+    """Return conflicts and shared generated paths, not mere distance from base."""
+    ancestor = git_step(wt, "merge-base", base, head).strip()
+    if ancestor == base:
+        return [], set()
+
+    def changes(tip):
+        return set(
+            git_step(
+                wt, "diff", "--name-only", "--no-renames", "-z", ancestor, tip, "--"
+            )
+            .rstrip("\0")
+            .split("\0")
+        )
+
+    overlap = {path for path in changes(base) & changes(head) if GEN.fullmatch(path)}
+    code, out = sh(
+        [
+            "git",
+            "-c",
+            "merge.generated.driver=git merge-file --marker-size=%L %A %O %B",
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            base,
+            head,
+        ],
+        cwd=wt,
+        timeout=90,
+    )
+    if code not in (0, 1):
+        raise RuntimeError(f"could not compute merge requirements: {out[-500:]}")
+    conflicts = [p for p in out.split("\n\n")[0].splitlines()[1:] if p] if code else []
+    if code and not conflicts:
+        raise RuntimeError("could not identify files requiring conflict resolution")
+    return conflicts, overlap
+
+
+def latest_requirements(n, head):
+    ref = f"refs/coord/train/{n}"
+    git_step(MAIN, "fetch", "-q", P.remote, P.base, f"+pull/{n}/head:{ref}")
+    if git_step(MAIN, "rev-parse", ref).strip() != head:
+        raise ValueError(f"#{n}: head changed outside the train")
+    base = git_step(MAIN, "rev-parse", P.base_ref).strip()
+    return base, refresh_requirements(MAIN, base, head)
+
+
+def unresolved_source_conflicts(n, wt, head, base, conflicts):
+    source = [path for path in conflicts if not GEN.fullmatch(path)]
+    if not source:
+        return False
+    local = git_step(wt, "rev-parse", "HEAD").strip()
+    if (
+        local != head
+        and sh(["git", "merge-base", "--is-ancestor", head, local], cwd=wt, timeout=30)[
+            0
+        ]
+        == 0
+    ):
+        local_conflicts, _ = refresh_requirements(wt, base, local)
+        if all(GEN.fullmatch(path) for path in local_conflicts):
+            return False
+    need_agent(
+        n,
+        f"#{n}: conflicts with main in source files {source}; needs an agent to resolve.",
+    )
+    return True
+
+
+def refresh_to_draft(n, wt, branch, head, *, active):
+    current = review(n)
+    if not active() or not eligible(current) or current["headRefOid"] != head:
+        return
+    if current["mergeQueueEntry"] or current["autoMergeRequest"]:
+        need_agent(n, f"#{n}: dequeue or disable auto-merge before refreshing this PR.")
+        return
+    gh("pr", "ready", str(n), "--undo", check=True, timeout=90)
+    pushed = refresh(n, wt, branch, active=active, draft_head=head)
+    if pushed:
+        need_agent(
+            n,
+            f"#{n}: refresh changed the head; review the new draft, then use finish-draft.",
+        )
+    elif pushed is False:
+        need_agent(
+            n,
+            f"#{n}: refresh is no longer needed; re-admit the draft with finish-draft.",
+        )
 
 
 def existing_tests(wt):
@@ -602,54 +700,10 @@ def land(entry):
                 active,
             )
             return
-        # Source conflicts with main need an agent; flag them now instead of after the lane wait.
-        git_step(
-            MAIN,
-            "fetch",
-            "-q",
-            P.remote,
-            P.base,
-            f"+pull/{n}/head:refs/coord/train/{n}",
-        )
-        # Prefer the worktree's unpushed commits (an agent's local conflict resolution) over the remote head.
-        _, local_head = sh(["git", "rev-parse", "HEAD"], cwd=wt)
-        ahead = (
-            sh(
-                [
-                    "git",
-                    "merge-base",
-                    "--is-ancestor",
-                    f"refs/coord/train/{n}",
-                    local_head.strip(),
-                ],
-                cwd=MAIN,
-            )[0]
-            == 0
-        )
-        target = local_head.strip() if ahead else f"refs/coord/train/{n}"
-        code, out = sh(
-            [
-                "git",
-                "-C",
-                str(MAIN),
-                "-c",
-                "merge.generated.driver=git merge-file --marker-size=%L %A %O %B",
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                P.base_ref,
-                target,
-            ]
-        )
-        if code == 1:
-            paths = [p for p in out.split("\n\n")[0].splitlines()[1:] if p]
-            source = [p for p in paths if not GEN.fullmatch(p)]
-            if source:
-                need_agent(
-                    n,
-                    f"#{n}: conflicts with main in source files {source}; needs an agent to resolve.",
-                )
-                return
+        head = info["headRefOid"]
+        base, (conflicts, _) = latest_requirements(n, head)
+        if unresolved_source_conflicts(n, wt, head, base, conflicts):
+            return
         needs_lane = touches(n)
         status(n, "waiting", "waiting for a conflict-free lane slot")
         while paused() or (needs_lane and not acquire(n)):
@@ -658,36 +712,19 @@ def land(entry):
             time.sleep(120)
         if not active():
             return  # removed from the train (an agent took it back)
-        status(n, "fixing", "merging main + regenerating")
-        pushed = refresh(n, wt, info["headRefName"], active=active)
-        if pushed is None:
-            return
-        if pushed == "queued":
-            status(
-                n,
-                "queued",
-                "enqueued elsewhere during refresh; local commits preserved, watching",
-            )
-            wait_merged_or_removed(
-                n,
-                pr_info(n)["headRefOid"],
-                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                active,
-            )
+        base, (conflicts, overlap) = latest_requirements(n, head)
+        if conflicts or overlap:
+            if not unresolved_source_conflicts(n, wt, head, base, conflicts):
+                status(n, "fixing", "refreshing required generated overlap or conflict")
+                refresh_to_draft(n, wt, info["headRefName"], head, active=active)
             return
         status(n, "waiting", "waiting for PR checks")
-        # After our own push GitHub can still report the previous head for a while; use what we pushed.
-        checked_head = (
-            sh(["git", "rev-parse", "HEAD"], cwd=wt)[1].strip()
-            if pushed is True
-            else pr_info(n)["headRefOid"]
-        )
+        checked_head = head
         entry["head"] = checked_head
         checks_action = train_retry(n, checked_head, "checks")
         checks_action.check()
         rerun_action = train_retry(n, checked_head, "cancelled-checks")
         deadline = time.time() + 3 * 3600
-        time.sleep(120 if pushed else 0)
         while active():
             ok, pending, rows = checks_ready(n)
             if ok:
@@ -713,7 +750,7 @@ def land(entry):
                     status(n, "waiting", "reran cancelled jobs; waiting for PR checks")
                     time.sleep(180)
                     continue
-                why = f"#{n}: PR checks failed on the refreshed head; see `gh pr checks {n}`."
+                why = f"#{n}: PR checks failed on the current head; see `gh pr checks {n}`."
                 log = checks_action.failed("failed-checks", why)
                 need_agent(n, f"{why} Log: {log}")
                 return
@@ -729,44 +766,13 @@ def land(entry):
         if head != checked_head:
             need_agent(n, f"#{n}: head changed outside the train; no enqueue made.")
             return
-        # main may have moved while checks ran; if it did and we touch generated files, refresh again
-        code, behind = sh(
-            gh_argv(
-                "api", f"repos/{P.repo}/compare/{P.base}...{head}", "--jq", ".behind_by"
-            )
-        )
-        gen = touches(n)
-        if gen and behind.strip() not in ("0", ""):
-            # Only refresh again if it no longer merges cleanly with main.
-            git_step(
-                MAIN,
-                "fetch",
-                "-q",
-                P.remote,
-                P.base,
-                f"+pull/{n}/head:refs/coord/train/{n}",
-            )
-            if (
-                sh(
-                    [
-                        "git",
-                        "-C",
-                        str(MAIN),
-                        "-c",
-                        "merge.generated.driver=git merge-file --marker-size=%L %A %O %B",
-                        "merge-tree",
-                        "--write-tree",
-                        P.base_ref,
-                        f"refs/coord/train/{n}",
-                    ]
-                )[0]
-                != 0
-            ):
-                continue
         since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         while paused():
             if not active():
                 return
+            _, (conflicts, overlap) = latest_requirements(n, head)
+            if conflicts or overlap:
+                continue
             time.sleep(120)
         if not active():
             return
