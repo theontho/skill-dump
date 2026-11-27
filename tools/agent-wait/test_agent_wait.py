@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,6 +15,7 @@ TOOLS = Path(__file__).resolve().parents[1]
 WAIT = TOOLS / "agent-wait/agent-wait"
 COORD = TOOLS / "agent-coord/agent_coord.py"
 LINUX = sys.platform.startswith("linux")
+WINDOWS = sys.platform == "win32"
 
 
 class WaitTest(unittest.TestCase):
@@ -29,6 +31,12 @@ class WaitTest(unittest.TestCase):
             "AGENT_COORD_RUNTIME_DIR": str(self.root / "runtime"),
             "AGENT_COORD_STATE_DIR": str(self.root / "state"),
         }
+        if WINDOWS:
+            # The gh.exe fixture is a copy of the native Python executable.
+            # It loads the real interpreter and runs the boundary script named
+            # by the command's first argument (run or pr).
+            self.env["PATH"] += os.pathsep + str(Path(sys.executable).parent)
+            self.env["PYTHONHOME"] = sys.base_prefix
         if LINUX:
             (self.root / "agent-coord").symlink_to(COORD)
             log = (self.root / "service.log").open("w")
@@ -59,11 +67,19 @@ class WaitTest(unittest.TestCase):
             time.sleep(0.025)
 
     def stub(self, name, body):
-        path = self.root / name
-        path.write_text(
-            f"#!{sys.executable}\nimport json, os, sys, time\nfrom pathlib import Path\n{body}"
-        )
-        path.chmod(0o755)
+        source = f"#!{sys.executable}\nimport json, os, sys, time\nfrom pathlib import Path\n{body}"
+        if WINDOWS:
+            shutil.copy2(sys.executable, self.root / f"{name}.exe")
+            for script in ("run", "pr"):
+                (self.root / script).write_text(source)
+        else:
+            path = self.root / name
+            path.write_text(source)
+            path.chmod(0o755)
+
+    def assert_pid_exited(self, pid):
+        # os.kill(pid, 0) is a terminating operation on Windows.
+        self.result(self.watcher("pid", str(pid), timeout="1s"), 0, f"exited pid={pid}")
 
     def coord(self, *args):
         return subprocess.check_output(
@@ -123,6 +139,10 @@ class WaitTest(unittest.TestCase):
         target.wait(timeout=3)
         self.result(self.watcher("pid", str(target.pid)), 0, f"exited pid={target.pid}")
 
+    def test_missing_file_has_a_hard_deadline(self):
+        proc = self.watcher("file", "not-created", timeout="0.2s")
+        self.result(proc, 124, "timeout")
+
     def test_orphan_stops_even_during_an_external_probe(self):
         self.stub(
             "gh", "Path('child.pid').write_text(str(os.getpid()))\ntime.sleep(30)\n"
@@ -133,25 +153,30 @@ class WaitTest(unittest.TestCase):
         owner.kill()
         owner.wait(timeout=3)
         self.result(proc, 125, "orphaned")
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int((self.root / "child.pid").read_text()), 0)
+        self.assert_pid_exited(int((self.root / "child.pid").read_text()))
 
     def test_hard_timeout_kills_a_hung_github_probe(self):
         self.stub(
-            "gh", "Path('child.pid').write_text(str(os.getpid()))\ntime.sleep(30)\n"
+            "gh",
+            """
+import subprocess
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+Path('child.pid').write_text(f'{os.getpid()} {child.pid}')
+time.sleep(30)
+""",
         )
         started = time.monotonic()
-        proc = self.watcher("run", "23456789012", timeout="0.8s")
+        proc = self.watcher("run", "23456789012", timeout="1.2s")
         self.result(proc, 124, "timeout")
-        self.assertLess(time.monotonic() - started, 3)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int((self.root / "child.pid").read_text()), 0)
+        self.assertLess(time.monotonic() - started, 4)
+        for pid in (self.root / "child.pid").read_text().split():
+            self.assert_pid_exited(int(pid))
 
     def test_github_run_waits_for_completion_and_preserves_failed_conclusion(self):
         self.stub(
             "gh",
             """
-assert sys.argv[1:3] == ['run', 'view']
+assert sys.argv[1] == 'view' if sys.platform == 'win32' else sys.argv[1:3] == ['run', 'view']
 assert sys.argv[-1] == '23456789012'
 seen = Path('seen')
 if seen.exists():
@@ -169,7 +194,7 @@ else:
         self.stub(
             "gh",
             """
-if sys.argv[2] == 'view':
+if ('view' in sys.argv[1:3]):
     print(json.dumps({'state': 'MERGED'}))
 else:
     seen = Path('seen')
@@ -189,6 +214,7 @@ else:
         self.result(self.watcher("pr", "42", "--checks"), 1, "fail")
         self.assertTrue((self.root / "pending").exists())
 
+    @unittest.skipIf(WINDOWS, "systemd waits are not supported on native Windows")
     def test_systemd_distinguishes_unit_failure_from_manager_error(self):
         self.stub(
             "systemctl",
@@ -208,6 +234,7 @@ else:
             self.watcher("systemd", "other.service"), 2, "Failed to connect to bus"
         )
 
+    @unittest.skipIf(WINDOWS, "launchd waits are not supported on native Windows")
     def test_launchd_stops_when_job_unloads(self):
         self.stub(
             "launchctl",

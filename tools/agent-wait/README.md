@@ -31,10 +31,15 @@ otherwise successful result into exit `2`.
 On Linux, the helper requires the local agent-coord service with watcher support.
 Registration does not claim compute. The coordinator records `watch_registered`
 and `watch_ended` in its history and stops an expired or orphaned watcher.
-The helper also enforces both checks itself. On macOS, local/GitHub waits work
-without the Linux coordinator, but `lease` and inbox delivery need one.
-GitHub waits require an authenticated `gh`; systemd and launchd waits require
-their platform's tools. The default owner is the parent PID. Set `--owner-pid`
+The helper also enforces both checks locally on Linux, macOS, and native Windows.
+Lease waits and inbox delivery are Linux-only. Use `systemd` on Linux and
+`launchd` on macOS. GitHub waits require authenticated `gh` (`gh.exe` on Windows).
+On native Windows, run `python tools/agent-wait/agent-wait --timeout 30s file PATH`
+from the checkout; a timed-out or orphaned watcher uses Windows process-tree
+termination for a running probe. To run just the portable waiter tests from the
+repository root, use `python -m unittest discover -s tools/agent-wait`.
+
+The default owner is the parent PID. Set `--owner-pid`
 when the command runner's parent is not the actual owner. Use `--as NAME` on
 its own to set the registration name, or with `--notify TARGET` to send the
 result to a different inbox.
