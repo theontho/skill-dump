@@ -9,6 +9,7 @@ from urllib.parse import parse_qs
 
 import lifecycle_page
 import tests_page
+from lifecycle_model import REVIEW_ESCALATION, stamp
 from runtime import P, questions
 
 HERE = P.data
@@ -303,15 +304,58 @@ def events_panel():
     )
 
 
+def review_panel(data):
+    if "weekly_reviews" not in data:
+        return ""
+    weekly = data["weekly_reviews"]
+    n = weekly["prs"]
+    report = (
+        f"Tracked merges, last 7 days: p90 {weekly['p90']} rounds; "
+        f"{weekly['four_or_more']}/{n} ({weekly['four_or_more'] / n:.0%}) with 4+ rounds."
+        if n
+        else "No tracked merges in the last 7 days."
+    )
+    escalated = "".join(
+        f"<li><a href='{esc(P.web)}/pull/{row['pr']}'>PR #{row['pr']}</a>: "
+        f"{row['rounds']} Copilot review rounds</li>"
+        for row in data.get("review_rounds", [])
+        if row["merged"] is None and row["rounds"] >= REVIEW_ESCALATION
+    )
+    return f"<h2>Copilot review rounds</h2><p>{report}</p><ul>{escalated}</ul>"
+
+
+def question_details(q):
+    try:
+        asked = stamp(q.get("asked"))
+    except ValueError:
+        asked = None
+    age = "Age unknown"
+    if asked is not None:
+        minutes = max(0, int(time.time() - asked) // 60)
+        age = (
+            f"Open {minutes}m"
+            if minutes < 60
+            else f"Open {minutes // 60}h {minutes % 60}m"
+        )
+    details = f"<small>{age}</small>"
+    if q.get("blocks"):
+        details += f"<p>Blocks: {esc(q['blocks'])}</p>"
+    if q.get("default"):
+        details += f"<p>Default if unanswered: {esc(q['default'])}</p>"
+    return details
+
+
 def page():
     s = load(STATE, {})
     qs = load(QUESTIONS, [])
+    lifecycle = load(HERE / "lifecycle.json", {})
+    rounds = {row["pr"]: row["rounds"] for row in lifecycle.get("review_rounds", [])}
     agent_q = ""
     if P.get("dashboard", "show_agent_questions", False):
         awaiting = [q for q in load(AGENT_QUESTIONS, []) if not q.get("answer")]
         rows = "".join(
             f"<li><b>{esc(q.get('agent'))}</b> {esc(q.get('pr'))}: "
-            f"<div class=qtext>{esc(q.get('question'))}</div></li>"
+            f"<div class=qtext>{esc(q.get('question'))}</div>{question_details(q)}</li>"
             for q in awaiting
         )
         agent_q = (
@@ -345,6 +389,8 @@ def page():
                 gh.append("queue: " + t["queue"].lower())
             if t.get("unresolved"):
                 gh.append(f"{t['unresolved']} open threads")
+        if (count := rounds.get(pr.get("number"))) is not None:
+            gh.append(f"{count} Copilot rounds")
         issues = " ".join(
             f"<a href='{repo}/issues/{n}'>#{n}</a>" for n in t.get("issues", [])
         )
@@ -498,13 +544,9 @@ def page():
     done_q = [q for q in qs if q.get("answer")]
     qhtml = (
         "".join(
-            f"<div class='card q'><div><b>Q{esc(q['id'])}</b> <small>{esc(q.get('asked'))}</small></div>"
+            f"<div class='card q'><div><b>Q{esc(q['id'])}</b> {esc(q.get('pr'))}</div>"
             f"<div class=qtext>{esc(q['question'])}</div>"
-            + (
-                f"<p><i>Default if unanswered: {esc(q.get('default'))}</i></p>"
-                if q.get("default")
-                else ""
-            )
+            + question_details(q)
             + (
                 ""
                 if READ_ONLY
@@ -543,6 +585,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;
 .q{{border-color:#ef6c00}}textarea{{width:100%;background:#000;color:#ddd}}h2{{margin-top:22px}}</style></head><body>
 <h1>PR backlog coordinator</h1><nav><a href="/lifecycle">PR lifecycle</a> · <a href="/tests">Tests</a></nav><div>Updated {esc(s.get("updated"))} — {esc(s.get("headline"))}</div><div>{esc(summary)}</div>
 <h2>Coordinator events</h2>{events_panel()}
+{review_panel(lifecycle)}
 <h2>PR dependency graph</h2><div><small>red arrow = waits for (conflicts with a queued PR or lane holder); ✕ = number of PRs it conflicts with; orange border = priority. Hover/click a PR for details. Updated {esc(s.get("graph", {}).get("at"))}</small></div>
 <div style='overflow-x:auto'>{graph_svg(s.get("graph", {}))}</div>
 <h2>Questions for you ({len(open_q)})</h2>{qhtml}

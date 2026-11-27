@@ -21,8 +21,6 @@ be told: work the repository's issue queue in its own priority order (for
 example, efficiency items, then bugs, then the roadmap's "Up next"), keeping
 every machine staffed with implementer or long-run work suited to its hardware.
 
-- Waiting on the owner blocks only the items that need an owner decision,
-  never the whole queue. Ask once, park those items, and move on.
 - A machine with no agent, no lease and no long run is a defect, not a resting
   state. When `events` reports an idle host, dispatch the next suitable item.
 - At the start of every supervisor turn, run `pr-coord --project PROJECT
@@ -56,8 +54,8 @@ every machine staffed with implementer or long-run work suited to its hardware.
    session and monitor exits. The server defaults to loopback and has no access
    control of its own.
 4. Keep `pr-coord --project <project> events --wait` armed as a background
-   watcher. It delivers main failures, queue drops, questions, idle hosts and
-   `SUPERVISOR-IDLE` alerts. Handle each batch and rearm the watcher. The `run`
+   watcher for main failures, queue drops, review escalations, questions, idle
+   hosts and `SUPERVISOR-IDLE` alerts. Handle each batch and rearm. The `run`
    service collects events even with no waiter; the dashboard shows recent
    events, pending counts, supervisor heartbeats and owner-resume incidents.
    Reuse the default `supervisor` cursor on handoff. Keep the configuration
@@ -83,16 +81,22 @@ every machine staffed with implementer or long-run work suited to its hardware.
   pr N <stage> --note '<short status>'`. Use `waiting`, `blocked`, or `done` as
   appropriate so the coordinator sees capacity and outstanding work.
 - Check mergeability, reviews, open threads and head-specific CI. Handle
-  review fixes and actual failures in one batch; only resolve a thread once
-  its fix is pushed or its rationale is posted. A generic recommendation to
+  all open threads and real failures in one batch. For each finding, sweep
+  related code/tests for the same bug and fix the class. Resolve threads only
+  after the push or a posted rationale. A generic recommendation to
   get human review is not a request for changes unless project policy says
   otherwise. Stop for ownership, required approvals, policy, or source
   conflicts you can't resolve; don't stop for a busy runner.
-- Run the repository's targeted local gate. Send heavy authorized tests to
+- Before every push, run the nearest tests for all changed files (`pr-coord
+  nearest-tests <files...>` if configured; otherwise pick them manually), plus
+  required local gates. Bound command timeouts; hand off long waits instead of
+  polling. Send heavy authorized tests to
   `pr-coord --project <project> rt <host> <worktree> -- <command>` or take a
   local resource lease. Remote tests copy the working tree including uncommitted
-  edits to that host; check that it is the intended destination. Push once per
-  review round and recertify only the final head.
+  edits to that host; check the destination. Self-review the full diff as the
+  reviewer, push once per round, then request re-review and certify that head.
+  At three Copilot rounds, bring the recurring findings and next plan to the
+  coordinator before another push; don't automatically repeat the loop.
 - `pr-coord --project <project> cert <worktree> <target> --pr N` certifies the
   published head; `cert-pr N` uses a managed worktree. Wait through a foreground
   runner notification, not repeated polling. Confirm review and certification
@@ -109,17 +113,22 @@ every machine staffed with implementer or long-run work suited to its hardware.
 
 ## Questions and dashboard
 
-Agent questions go to `pr-coord --project <project> ask 'Question and context'
---pr '#N' --machine <agent> --default '<safe fallback>'`. Proceed with a safe
-default or park the PR rather than asking the owner directly. The coordinator
-answers via `agent-questions ID ANSWER`; only unresolved policy decisions are
-rewritten with context, options and a default for `ask --owner`; when one
-owner question bundles several decisions, number each (1., 2., …) so the owner
-can answer by number. The owner can
-answer via the trusted dashboard (if enabled) or `answer ID ANSWER`.
+Use non-blocking `coord-remote ask` or `pr-coord ask` with `--pr '#N'` (or
+`--title`), `--default '<safe fallback>'`, and `--blocks '<parked action or none>'`
+(put the blocker in the question if the remote wrapper lacks the flag). Continue
+on the reversible default; otherwise park only the affected action and take
+other work. Use blocking prompts only for irreversible, destructive or owner-only
+actions if a live decision is essential; never hold a worker waiting.
+
+Template: `1. <decision> — Context: <why now>. A: <option and consequence>;
+B: <option and consequence>. Recommend: <A/B and why>. Blocks: <action or none>.`
+Number each decision so the owner can answer by number. The coordinator answers
+with `agent-questions ID ANSWER` or forwards unresolved decisions via `ask --owner`.
+The owner answers via the trusted dashboard (if enabled) or `answer ID ANSWER`.
 
 `/` shows PRs, a hoverable dependency graph and conflict matrix, host leases,
-runner capacity, certifications and agent status. `/lifecycle` shows where
+runner capacity, certifications, agent status, open question age/blockers,
+review escalations and weekly review-round p90/4+ share. `/lifecycle` shows where
 time went: wait vs. execution, revisits, queue drops and GitHub-linked traces.
 `/tests` shows observed outcomes and test costs. Missing JUnit isn't a pass;
 tests without evidence and workload reductions are recommendations, not

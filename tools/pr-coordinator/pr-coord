@@ -33,6 +33,7 @@ COMMANDS = {
     "cert": ("remote", "cert_main", "certify a worktree at the exact published head"),
     "cert-pr": ("remote", "cert_pr_main", "certify a PR from a managed worktree"),
     "rt": ("remote", "rt_main", "run tests against a synchronized remote copy"),
+    "nearest-tests": ("tests_inventory", "nearest_main", "select tests for changed files"),
     "events": (
         "events",
         "main",

@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -156,8 +157,25 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             self.assertFalse((self.data / path).exists(), path)
 
     def test_agent_and_owner_questions_are_independent(self):
-        self.command("ask", "agent question", "--pr", "#5", "--machine", "worker")
-        id_ = json.loads(self.command("agent-questions").stdout)[0]["id"]
+        self.command(
+            "ask",
+            "agent question",
+            "--pr",
+            "#5",
+            "--machine",
+            "worker",
+            "--default",
+            "continue elsewhere",
+            "--blocks",
+            "publishing the release",
+            timeout=5,
+        )
+        question = json.loads(self.command("agent-questions").stdout)[0]
+        self.assertEqual(question["default"], "continue elsewhere")
+        self.assertEqual(question["blocks"], "publishing the release")
+        self.assertFalse(question.get("answer"))
+        self.assertTrue(question["asked"])
+        id_ = question["id"]
         self.command("agent-questions", id_, "resolved")
         self.command("ask", "--owner", "owner question")
         self.command("answer", "1", "yes")
@@ -169,19 +187,130 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             "resolved",
         )
 
+    def test_nearest_tests_uses_the_worktree_and_relays_selector_errors(self):
+        missing = self.command("nearest-tests", "file.py", check=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("tests.nearest_command", missing.stderr)
+
+        worktree = self.root / "implementer"
+        nested = worktree / "src"
+        nested.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+        (worktree / "selector.py").write_text(
+            "import json, sys\n"
+            "if 'broken' in sys.argv[1:]: raise SystemExit(4)\n"
+            "print(json.dumps(sys.argv[1:]))\n"
+        )
+        with self.config.open("a") as config:
+            config.write(
+                f"\n[tests]\nnearest_command = "
+                f"{json.dumps([sys.executable, 'selector.py'])}\n"
+            )
+        for paths, code in (
+            (["src/with spaces.py", "src/gone.py"], 0),
+            (["broken"], 4),
+        ):
+            run = subprocess.run(
+                self.argv("nearest-tests", *paths),
+                cwd=nested,
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(run.returncode, code, run.stderr)
+            if code == 0:
+                self.assertEqual(json.loads(run.stdout), paths)
+
+    def test_review_rounds_ignore_duplicate_heads_and_escalate_once(self):
+        from dashboard import review_panel
+        from lifecycle_model import review_rounds, weekly_reviews
+
+        def review(
+            head, *, login="copilot-pull-request-reviewer[bot]", state="COMMENTED"
+        ):
+            return {
+                "__typename": "PullRequestReview",
+                "commit": {"oid": head},
+                "author": {"login": login},
+                "state": state,
+                "submittedAt": "2026-11-24T10:00:00Z" if state != "PENDING" else None,
+            }
+
+        timeline = [
+            review("a"),
+            review("b"),
+            review("a"),
+            review("c", login="human-copilot-fan"),
+            review("c", state="PENDING"),
+        ]
+        pattern = re.compile(r"copilot-pull-request-reviewer\[bot\]")
+        self.data.mkdir()
+        self.fake_gh()
+
+        def collect(closed=False):
+            count = review_rounds(timeline, pattern)
+            rows = [{"pr": 26, "rounds": count, "merged": None}]
+            if closed:
+                rows.append({"pr": 28, "rounds": count, "merged": 1000000})
+            (self.data / "lifecycle.json").write_text(
+                json.dumps({"review_rounds": rows})
+            )
+            self.command("event-collect", "--once", timeout=5)
+            return json.loads((self.data / "events_journal.json").read_text())["events"]
+
+        self.assertEqual(collect(), [])
+        timeline.append(review("c"))
+        entries = collect(closed=True)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("PR #26 has 3 Copilot review rounds", entries[0]["message"])
+        timeline.append(review("d"))
+        self.assertEqual(collect(), entries)
+        weekly = weekly_reviews(
+            [
+                {"merged": 1000000, "rounds": review_rounds(timeline, pattern)},
+                {"merged": 999999, "rounds": 0},
+                {"merged": 100000, "rounds": 9},
+                {"merged": None, "rounds": 9},
+            ],
+            1000000,
+        )
+        panel = review_panel(
+            {
+                "weekly_reviews": weekly,
+                "review_rounds": [{"pr": 26, "rounds": 4, "merged": None}],
+            }
+        )
+        self.assertIn("p90 4 rounds; 1/2 (50%)", panel)
+        self.assertIn("PR #26</a>: 4 Copilot review rounds", panel)
+
     def test_dashboard_keeps_question_line_breaks(self):
         import dashboard
 
         questions = self.root / "rendered-questions.json"
-        questions.write_text(json.dumps([
-            {"id": 1, "question": "Intro\n- #1 <go>\n- #2 hold", "default": "hold"},
-            {"id": 2, "question": "Done?\nyes", "answer": "ok\nthanks"},
-        ]))
-        with mock.patch.object(dashboard, "QUESTIONS", questions), mock.patch.object(
-            dashboard, "STATE", self.root / "missing-state.json"
+        questions.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": 1,
+                        "question": "Intro\n- #1 <go>\n- #2 hold",
+                        "default": "hold",
+                        "asked": "2026-11-24T10:00:00Z",
+                        "blocks": "<release>",
+                    },
+                    {"id": 2, "question": "Done?\nyes", "answer": "ok\nthanks"},
+                ]
+            )
+        )
+        with (
+            mock.patch.object(dashboard, "QUESTIONS", questions),
+            mock.patch.object(dashboard, "STATE", self.root / "missing-state.json"),
+            mock.patch.object(dashboard.time, "time", return_value=1795518000),
         ):
             html = dashboard.page()
         self.assertIn("<div class=qtext>Intro\n- #1 &lt;go&gt;\n- #2 hold</div>", html)
+        self.assertIn("Open 1h 0m", html)
+        self.assertIn("Blocks: &lt;release&gt;", html)
         self.assertIn("<div class=qtext>Done?\nyes</div>", html)
         self.assertIn("white-space:pre-wrap", html)
         # An answer being typed must survive the periodic refresh.

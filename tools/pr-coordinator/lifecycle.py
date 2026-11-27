@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-from lifecycle_model import build, stamp, summarize
+from lifecycle_model import build, review_rounds, stamp, summarize, weekly_reviews
 from runtime import P, gh_argv
 
 HERE = P.data
@@ -214,6 +214,26 @@ def collect():
                 holders[int(parts[0])] = int(parts[1])
     tracked = {pr["number"]: pr for pr in state.get("prs", [])}
     prs = cache.timelines(sorted(tracked.keys() | triage.keys()))
+    reviewer = re.compile(
+        P.get(
+            "drafts",
+            "reviewer_pattern",
+            r"(?i)^(?:app/)?copilot(?:-pull-request-reviewer)?(?:\[bot\])?$",
+        )
+    )
+    reviews = []
+    for n, pr in prs.items():
+        if not pr:
+            continue
+        merged = stamp(pr["mergedAt"])
+        if pr["state"] == "OPEN" or (merged and merged >= now - 7 * DAY):
+            reviews.append(
+                {
+                    "pr": n,
+                    "merged": merged,
+                    "rounds": review_rounds(pr["events"], reviewer),
+                }
+            )
     prs = {
         n: pr
         for n, pr in prs.items()
@@ -359,6 +379,8 @@ def collect():
             "generated": now,
             "prs": series,
             "summary": summarize(series),
+            "review_rounds": reviews,
+            "weekly_reviews": weekly_reviews(reviews, now),
             "warnings": sorted(set(cache.errors)),
             "scope_hours": 48,
         },

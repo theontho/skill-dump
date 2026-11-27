@@ -10,7 +10,8 @@ from contextlib import ExitStack
 from datetime import datetime, timezone
 
 from host_activity import busy_hosts, probe_window
-from runtime import P, SLUG, gh_argv, load, locked, save
+from lifecycle_model import REVIEW_ESCALATION
+from runtime import SLUG, P, gh_argv, load, locked, save
 
 HERE = P.data
 REPO = P.repo
@@ -126,7 +127,9 @@ def agent_questions():
     return [
         (
             f"agentq:{q['id']}",
-            f"AGENT QUESTION from {q['agent']} about {q.get('pr')}: {q['question']}",
+            f"AGENT QUESTION from {q['agent']} about {q.get('pr')}: {q['question']}"
+            + (f" [default: {q['default']}]" if q.get("default") else "")
+            + (f" [blocks: {q['blocks']}]" if q.get("blocks") else ""),
         )
         for q in qs
         if not q.get("answer")
@@ -232,6 +235,16 @@ def heartbeat(*, owner_resume=False):
 
 def collect(*, legacy_baseline=False):
     events = answers() + agent_questions()
+    for row in load(HERE / "lifecycle.json", {}).get("review_rounds", []):
+        if row["merged"] is None and row["rounds"] >= REVIEW_ESCALATION:
+            pr = row["pr"]
+            events.append(
+                (
+                    f"review-rounds:{pr}",
+                    f"REVIEW ESCALATION: PR #{pr} has {row['rounds']} Copilot review rounds; "
+                    f"check the recurring findings before another push — {P.web}/pull/{pr}",
+                )
+            )
     for source in (main_failures, queue_removals):
         try:
             events += source()
@@ -251,10 +264,18 @@ def collect(*, legacy_baseline=False):
         if first:
             seen_path = HERE / "events_seen.json"
             try:
-                journal["legacy_seen"] = json.loads(seen_path.read_text(encoding="utf-8"))
+                journal["legacy_seen"] = json.loads(
+                    seen_path.read_text(encoding="utf-8")
+                )
             except FileNotFoundError:
                 journal["legacy_seen"] = (
-                    sorted({key for key, _ in events if not key.startswith("idle:")})
+                    sorted(
+                        {
+                            key
+                            for key, _ in events
+                            if not key.startswith(("idle:", "review-rounds:"))
+                        }
+                    )
                     if legacy_baseline
                     else []
                 )

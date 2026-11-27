@@ -91,8 +91,27 @@ enable owner answers from the UI; otherwise use `pr-coord answer ID TEXT`.
 Agent questions are separate from owner questions. Read or answer them with
 `pr-coord agent-questions [ID ANSWER]`; `dashboard.show_agent_questions` exposes
 that queue to dashboard readers but does not put it in the owner answer form.
+Both queues show open question age, the suggested `--default` (not automatically
+applied) and the action parked with `--blocks`.
 
 ## Configuration and command contracts
+
+- **Review rounds:** lifecycle collection counts submitted Copilot reviews
+  once per distinct commit, using `drafts.reviewer_pattern`. The dashboard flags
+  open PRs at three rounds and reports rolling 7-day p90 and 4+ share for
+  tracked merges. `events` delivers one escalation per PR; it does not stop or
+  mutate GitHub work.
+- **Nearest tests:** `pr-coord nearest-tests <files...>` runs the configured
+  `[tests] nearest_command` argv in the current Git worktree root, appending
+  worktree-relative changed paths. It relays the selector's output and exit
+  status without running tests. `[tests] nearest_timeout` defaults to 120 seconds.
+  For wgsextract-cli, configure the existing Python selector, for example:
+  ```toml
+  [tests]
+  nearest_command = ["python3", "-c", "import json, sys; from scripts.ci_select_tests import select_tests; print(json.dumps(select_tests(sys.argv[1:])))"]
+  ```
+  The selector returns a JSON list of test paths or `"all"` when narrowing
+  is unsafe. A missing or failing selector is not a passing local gate.
 
 - **Idle hosts:** `[events] idle_minutes` (default `45`) is the minimum time a
   host must be observed reachable without working or waiting dashboard agents,

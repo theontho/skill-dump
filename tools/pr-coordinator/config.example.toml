@@ -172,6 +172,9 @@ linux = ["worker", "controller"]
 excludes = [".git", "out", ".venv", "node_modules", "target", ".env*"]
 
 [tests]
+# Receives worktree-root-relative paths as argv; prints selected tests.
+# nearest_command = ["python3", "scripts/select_tests.py"]
+# nearest_timeout = 120
 activity_days = 7
 report_days = 14
 artifact_pattern = 'junit-(.+)'

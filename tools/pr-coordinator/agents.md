@@ -4,9 +4,21 @@ the issue queue across machines), use the `pr-coordinator` skill and
 issue queue and keep every machine staffed; an empty PR list is not the end. Do not start landing automation
 without owner authorization. Keep checkout, host, and CI policy in the private
 project config; keep snapshots and logs in the separate state directory.
+
 Start every supervisor turn with `pr-coord --project PROJECT agent supervisor
 heartbeat`; add `--owner-resume` if the owner had to nudge you after a long gap.
 Hand waits to a watcher (`events --wait` for coordinator alerts), then take the
 next item. End a turn only if every managed host has an agent, lease, or
 registered unattended run with a failure alert, or you've verified that no
 eligible work remains and reported which sources and filters you checked.
+
+Before each push, sweep related code/tests for every instance of each review
+finding, run nearest tests for changed files (`pr-coord nearest-tests` or
+manual selection), and self-review the whole diff. Bound command timeouts;
+batch all threads and CI fixes into one push per round. Escalate at three
+Copilot rounds instead of repeating the loop.
+
+Queue numbered decisions with `coord-remote ask` or `pr-coord ask`: give context,
+options with consequences, a recommendation, a default and what it blocks.
+Continue on a reversible default or park only the affected action and do other
+work. Reserve blocking prompts for essential irreversible or owner-only decisions.

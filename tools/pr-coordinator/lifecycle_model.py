@@ -11,6 +11,7 @@ from runtime import P
 
 WEB = P.web
 DAY = 86400
+REVIEW_ESCALATION = 3
 ORDER = ("dev", "review", "cert", "lane", "refresh", "checks", "hosted", "queue")
 PRIORITY = ("queue", "hosted", "refresh", "cert", "review", "lane", "checks", "dev")
 
@@ -21,6 +22,36 @@ def stamp(value):
         if value
         else None
     )
+
+
+def review_rounds(events, reviewer_pattern):
+    """Count distinct commits with a submitted Copilot review."""
+    return len(
+        {
+            head
+            for row in events
+            if row["__typename"] == "PullRequestReview"
+            and row.get("submittedAt")
+            and row.get("state")
+            in {"APPROVED", "COMMENTED", "CHANGES_REQUESTED", "DISMISSED"}
+            and reviewer_pattern.fullmatch((row.get("author") or {}).get("login") or "")
+            and (head := (row.get("commit") or {}).get("oid"))
+        }
+    )
+
+
+def weekly_reviews(rows, now):
+    results = sorted(
+        row["rounds"]
+        for row in rows
+        if row["merged"] is not None and now - 7 * DAY <= row["merged"] <= now
+    )
+    n = len(results)
+    return {
+        "prs": n,
+        "p90": results[math.ceil(n * 0.9) - 1] if n else None,
+        "four_or_more": sum(count >= 4 for count in results),
+    }
 
 
 def union(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:

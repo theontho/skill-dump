@@ -27,6 +27,27 @@ DAYS = P.get("tests", "activity_days", 7)
 UTC = timezone.utc
 
 
+def nearest_main():
+    parser = argparse.ArgumentParser(description="Print the project's test selection.")
+    parser.add_argument("files", nargs="+", help="worktree-root-relative changed paths")
+    args = parser.parse_args()
+    argv = P.command("tests", "nearest_command")
+    if not argv:
+        parser.error(
+            "no tests.nearest_command configured; select targeted tests manually"
+        )
+    root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout.rstrip("\n")
+    return subprocess.run(
+        [*argv, *args.files], cwd=root, timeout=P.get("tests", "nearest_timeout", 120)
+    ).returncode
+
+
 def load(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text())

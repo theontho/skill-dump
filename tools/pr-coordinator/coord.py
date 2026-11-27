@@ -95,6 +95,7 @@ def main():
     p.add_argument("--os")
     p.add_argument("--task")
     p.add_argument("--default")
+    p.add_argument("--blocks", help="action or work item parked until the question is answered")
     p.add_argument(
         "--owner",
         action="store_true",
@@ -191,8 +192,10 @@ def main():
                         "id": uuid4().hex,
                         "agent": a.machine or "agent",
                         "pr": a.title or "",
-                        "question": " ".join(a.args)
-                        + (f"  [default: {a.default}]" if a.default else ""),
+                        "question": " ".join(a.args),
+                        "default": a.default,
+                        "asked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "blocks": a.blocks,
                     }
                 ]
             ),
@@ -208,8 +211,10 @@ def main():
                 {
                     "id": qid,
                     "question": " ".join(a.args),
+                    "pr": a.title or "",
                     "default": a.default,
-                    "asked": now(),
+                    "asked": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "blocks": a.blocks,
                 }
             ]
 
