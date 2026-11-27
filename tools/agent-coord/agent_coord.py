@@ -89,6 +89,8 @@ QUOTA
       Register a job that is already running (no waiting: it is running),
       until PID exits. Prints the lease ID. Holding a VM's qemu PID replaces
       its measured use with the lease.
+  agent-coord hold --label watch:NAME --pid PID --owner-pid PID --expect D
+      Register a watcher without a compute lease. D is a hard expiry.
   agent-coord release ID
   --io          For downloads, uploads and disk streaming: count measured CPU
                 use, even during warmup. Defaults to 1 core and 512M; both
@@ -186,6 +188,39 @@ def alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def process_start(pid: int) -> str | None:
+    """Linux process identity, excluding exited but unreaped processes."""
+    if type(pid) is not int or pid <= 1:
+        return None
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] in ("Z", "X") else fields[19]
+    except (OSError, IndexError):
+        return None
+
+
+def signal_watcher(pid: int, start: str, sig: int) -> None:
+    # Pin the process on kernels/Python versions with pidfds so PID reuse
+    # between the identity check and signalling cannot hit a different job.
+    fd = None
+    try:
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError:
+                pass
+        if process_start(pid) == start:
+            if fd is None:
+                os.kill(pid, sig)
+            else:
+                signal.pidfd_send_signal(fd, sig)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def mem_total() -> int:
@@ -361,8 +396,8 @@ class Coordinator:
         # Cores busy host-wide (smoothed) and memory available, as last measured.
         self.busy = 0.0
         self.available: int | None = None
-        self.state = {"leases": [], "queue": [], "messages": [], "read": {},
-                      "agents": {}, "locks": {}, "next": 1}  # fmt: skip
+        self.state: dict = {"leases": [], "queue": [], "messages": [], "read": {},
+                            "agents": {}, "locks": {}, "watchers": [], "next": 1}  # fmt: skip
         if state_file.exists():
             try:
                 self.state.update(json.loads(state_file.read_text()))
@@ -432,12 +467,47 @@ class Coordinator:
             changed |= len(live) != len(self.state[key])
             self.state[key] = live
         now = time.time()
+        changed |= self._prune_watchers(now)
         for name, lock in list(self.state["locks"].items()):
             if (lock.get("pid") and not alive(lock["pid"])) or (
                 lock.get("expires") and lock["expires"] < now
             ):
                 del self.state["locks"][name]
                 changed = True
+        return changed
+
+    def _prune_watchers(self, now: float) -> bool:
+        live = []
+        changed = False
+        watchers = self.state["watchers"]
+        for watch in watchers:
+            pid = watch["pid"]
+            if process_start(pid) != watch["start"]:
+                if "kill_after" not in watch:
+                    self._log("watch_ended", watch, why="process exited")
+                changed = True
+                continue
+            if "kill_after" in watch:
+                if now >= watch["kill_after"]:
+                    signal_watcher(pid, watch["start"], signal.SIGKILL)
+                    changed = True
+                    continue
+                live.append(watch)
+                continue
+            if process_start(watch["owner_pid"]) != watch["owner_start"]:
+                why = "owner exited"
+            elif now >= watch["expires"]:
+                why = "expired"
+            else:
+                live.append(watch)
+                continue
+            signal_watcher(pid, watch["start"], signal.SIGTERM)
+            # Let agent-wait stop its child command and post a result first.
+            watch["kill_after"] = now + TICK
+            live.append(watch)
+            self._log("watch_ended", watch, why=why)
+            changed = True
+        self.state["watchers"] = live
         return changed
 
     def _lock_holder(self, name: str, lease_id: str | None = None) -> str | None:
@@ -1111,6 +1181,26 @@ class Coordinator:
         self._admit()
         return {"id": lease["id"], **self._ticket(lease["id"])}
 
+    def op_watch(self, req: dict, agent: str) -> dict:
+        pid, owner, expect = req["pid"], req["owner_pid"], req["expect"]
+        label = str(req["label"])
+        if not label.startswith("watch:") or not label[6:].strip():
+            return {"error": "watcher label must start with watch: and have a name"}
+        if type(expect) not in (int, float) or not math.isfinite(expect) or expect <= 0:
+            return {"error": "watcher needs a positive finite --expect (hard expiry)"}
+        start, owner_start = process_start(pid), process_start(owner)
+        if not start or not owner_start or pid == owner:
+            return {"error": "watcher needs distinct, live watcher and owner PIDs"}
+        if any(w["pid"] == pid and w["start"] == start for w in self.state["watchers"]):
+            return {"error": f"watcher PID {pid} is already registered"}
+        watch = {"id": f"W{self.state['next']}", "agent": agent, "label": label,
+                 "pid": pid, "start": start, "owner_pid": owner, "owner_start": owner_start,
+                 "expires": time.time() + expect, "expect": expect, "cores": 0, "mem": 0}
+        self.state["next"] += 1
+        self.state["watchers"].append(watch)
+        self._log("watch_registered", watch)
+        return {"id": watch["id"]}
+
     def _ticket(self, lease_id: str) -> dict:
         if any(x["id"] == lease_id for x in self.state["leases"]):
             return {"state": "granted"}
@@ -1207,6 +1297,7 @@ class Coordinator:
         return {"agents": [{"name": k, **v} for k, v in agents]}
 
     def op_status(self, _req: dict, _agent: str) -> dict:
+        self._prune_watchers(time.time())
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
         return {
@@ -1219,6 +1310,7 @@ class Coordinator:
                       for x in self.state["queue"]],
             "vms": self._vms(), "load": os.getloadavg(),
             "locks": self.state["locks"],
+            "watchers": self.state["watchers"],
             "disks": {m: {"free": self.disk_free(m), "reserved": self._reserved(m)}
                       for m in sorted({m for x in self.state["leases"]
                                        for m in x.get("disk", {})})},
@@ -1481,6 +1573,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_hold(args: argparse.Namespace) -> int:
+    if args.owner_pid is not None:
+        reply = call({"op": "watch", "agent": args.agent, "cwd": os.getcwd(),
+                      "pid": args.pid, "owner_pid": args.owner_pid,
+                      "label": args.label, "expect": args.expect})
+        print(reply["id"])
+        return 0
     if not alive(args.pid):
         raise SystemExit(f"agent-coord hold: no process {args.pid}")
     reply = call({**_lease_request(args, args.pid), "running": True})
@@ -1547,10 +1645,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  lock   {name:<22} {since:5.0f} min  {lock['agent']}: {lock['reason']}{until}")
     for mount, d in s.get("disks", {}).items():
         print(f"  disk   {mount:<22} {human(d['free'])} free, {human(d['reserved'])} reserved")
+    for w in s.get("watchers", []):
+        remaining = max(0, w["expires"] - time.time())
+        expiry = "reaping" if "kill_after" in w else f"expires in {remaining:.0f}s"
+        print(f"  {w['id']:<6} watch   {w['agent']}: {w['label']} "
+              f"(pid {w['pid']}, owner pid {w['owner_pid']}, {expiry})")
     for g in s["vms"]:
         print(f"  vm     running {g['cores']:>4g} cores {human(g['mem']):>6}"
               f"            {g['name'] or 'qemu'} (pid {g['pid']}, measured)")
-    if not rows and not s["vms"]:
+    if not rows and not s["vms"] and not s.get("watchers"):
         print("  nothing held")
     return 0
 
@@ -1680,6 +1783,7 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--max-wait", type=parse_duration)
         if name == "hold":
             sub.add_argument("--pid", type=int, required=True)
+            sub.add_argument("--owner-pid", type=int, help="register a watch: label with a hard --expect expiry")
         else:
             sub.add_argument("--allow-archive", action="store_true")
             sub.add_argument("command", nargs=argparse.REMAINDER)
@@ -1705,7 +1809,12 @@ def main(argv: list[str] | None = None) -> int:
     subs.add_parser("release").add_argument("id")
     subs.add_parser("serve")
     args = parser.parse_args(argv)
-    if args.action in ("run", "hold", "check"):
+    if args.action == "hold" and args.owner_pid is not None:
+        if (args.cores is not None or args.mem is not None or args.io or args.exclusive
+                or args.lock or args.exclusive_lock or args.disk or args.headroom
+                or args.max_wait is not None):
+            parser.error("watchers do not take compute lease options")
+    elif args.action in ("run", "hold", "check"):
         if not args.io and (args.cores is None or args.mem is None):
             parser.error("--cores and --mem are required without --io")
         if args.cores is None:

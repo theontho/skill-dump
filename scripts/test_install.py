@@ -1,12 +1,11 @@
 """Exercise install, symlink entry points, git hooks and updates in an isolated HOME."""
 
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,7 +39,7 @@ class InstallTests(unittest.TestCase):
 
             def run(*command, cwd=source):
                 result = subprocess.run(command, cwd=cwd, env=env, text=True,
-                                        capture_output=True, timeout=30)
+                                        capture_output=True, timeout=30, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 return result.stdout
 
@@ -55,6 +54,7 @@ class InstallTests(unittest.TestCase):
             self.assertIn("hooks:    reinstall on git pull/checkout", run(str(command), "status"))
             self.assertIn("op-session start", run(str(home / ".local/bin/op-session"), "--help"))
             self.assertIn("sudo-session start", run(str(home / ".local/bin/sudo-session"), "--help"))
+            self.assertIn("--owner-pid", run(str(home / ".local/bin/agent-wait"), "--help"))
 
             for version, method in (("pull", "pull"), ("update", "update")):
                 marker = source / f"skills/installer-{version}/SKILL.md"
@@ -74,7 +74,9 @@ class InstallTests(unittest.TestCase):
             for file in (home / ".copilot/copilot-instructions.md", home / ".claude/CLAUDE.md",
                          home / ".codex/AGENTS.md", home / ".gemini/GEMINI.md",
                          home / ".config/opencode/AGENTS.md"):
-                self.assertEqual(file.read_text().count("<!-- BEGIN skill-dump:"), 1)
+                text = file.read_text()
+                self.assertEqual(text.count("<!-- BEGIN skill-dump:"), 1)
+                self.assertIn("Wait outside the model", text)
             self.assertEqual(run("git", "status", "--porcelain", cwd=installed), "")
 
 

@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Wait for one event outside the agent's model context."""
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+class Stopped(Exception):
+    pass
+
+
+def duration(text: str) -> float:
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
+    if match:
+        value = (
+            float(match[1]) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
+        )
+        if math.isfinite(value) and 0 < value <= 30 * 86400:
+            return value
+    raise argparse.ArgumentTypeError(
+        "use a positive duration up to 30d, e.g. 30s or 2h"
+    )
+
+
+def pid_number(text: str) -> int:
+    if re.fullmatch(r"[0-9]{1,10}", text) and 0 < int(text) < 2**31:
+        return int(text)
+    raise argparse.ArgumentTypeError("expected a positive PID")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--timeout", required=True, type=duration)
+    parser.add_argument(
+        "--interval",
+        type=duration,
+        help="poll interval (default: 10s remote, 1s local)",
+    )
+    parser.add_argument(
+        "--owner-pid",
+        type=pid_number,
+        default=os.getppid(),
+        help="owning process (default: parent)",
+    )
+    parser.add_argument(
+        "--as", dest="agent", help="agent-coord registration and message sender name"
+    )
+    parser.add_argument(
+        "--notify",
+        metavar="TARGET",
+        help="also send the result to this agent-coord inbox",
+    )
+    targets = parser.add_subparsers(dest="kind", required=True)
+    for name, more in (
+        ("run", "GitHub Actions run completion (success required)"),
+        ("pr", "pull request lifecycle or checks"),
+        ("systemd", "systemd user unit becoming inactive or failed"),
+        (
+            "launchd",
+            "launchd job stopping or disappearing; use a qualified service target",
+        ),
+        ("pid", "process exit"),
+        ("pidfile", "wait for a PID file, then wait for its process to exit"),
+        ("lease", "agent-coord compute lease leaving the queue or active set"),
+        ("file", "file appearance"),
+    ):
+        sub = targets.add_parser(name, help=more)
+        sub.add_argument("target", type=pid_number if name == "pid" else str)
+        if name in ("run", "pr"):
+            sub.add_argument("-R", "--repo", help="select [HOST/]OWNER/REPO")
+        if name == "pr":
+            mode = sub.add_mutually_exclusive_group()
+            mode.add_argument(
+                "--state", type=str.upper, choices=("OPEN", "CLOSED", "MERGED")
+            )
+            mode.add_argument("--checks", action="store_true")
+    args = parser.parse_args()
+    if args.notify and (not args.agent or args.agent == args.notify):
+        parser.error("--notify needs a distinct sender via --as NAME")
+    if args.owner_pid <= 1 or args.owner_pid == os.getpid():
+        parser.error(
+            "--owner-pid must identify a live owner other than PID 1 or this watcher"
+        )
+    if args.kind == "lease" and not re.fullmatch(r"L[1-9]\d*", args.target):
+        parser.error("lease expects an agent-coord compute lease ID, e.g. L123")
+    if args.kind == "run" and not re.fullmatch(r"[1-9][0-9]*", args.target):
+        parser.error("run expects a numeric GitHub Actions run ID")
+    if args.kind == "launchd" and not re.fullmatch(
+        r"(?:system|(?:gui|user)/[0-9]+)/[^/\s]+", args.target
+    ):
+        parser.error("launchd expects system/LABEL, gui/UID/LABEL, or user/UID/LABEL")
+    return args
+
+
+def process_start(pid: int) -> str | None:
+    if sys.platform.startswith("linux"):
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return None if fields[0] in ("Z", "X") else fields[19]
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+    reply = subprocess.run(
+        ["ps", "-o", "lstart=", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=1,
+    )
+    fields = reply.stdout.strip().rsplit(None, 1)
+    if not fields and reply.returncode == 1 and not reply.stderr.strip():
+        return None
+    if reply.returncode or len(fields) != 2:
+        raise ValueError(reply.stderr.strip() or f"could not identify PID {pid}")
+    return None if fields[1].startswith("Z") else fields[0]
+
+
+class Waiter:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.deadline = time.monotonic() + args.timeout
+        self.interval = args.interval or (10 if args.kind in ("run", "pr") else 1)
+        self.owner_start: str | None = None
+        self.next_owner_check = 0.0
+        self.pid: int | None = None
+        self.target_start: str | None = None
+        self.coord = ["agent-coord"] + (["--as", args.agent] if args.agent else [])
+        self.saw_unit = False
+
+    def guard(self, force: bool = False) -> None:
+        if force or time.monotonic() >= self.next_owner_check:
+            if process_start(self.args.owner_pid) != self.owner_start:
+                raise Stopped("orphaned")
+            self.next_owner_check = time.monotonic() + 1
+
+    def command(self, argv: list[str]) -> tuple[int, str, str]:
+        child = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            while True:
+                try:
+                    out, err = child.communicate(timeout=0.25)
+                    return child.returncode, out, err
+                except subprocess.TimeoutExpired:
+                    self.guard()
+        finally:
+            if child.returncode is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def gh(self, *argv: str) -> tuple[int, str, str]:
+        repo = ["--repo", self.args.repo] if self.args.repo else []
+        return self.command(["gh", *argv, *repo, "--", str(self.args.target)])
+
+    def register(self) -> None:
+        # The shared coordinator currently ships on Linux only. Local ownership
+        # and the hard deadline still apply on macOS without it.
+        if sys.platform != "darwin" or shutil.which(self.coord[0]) or self.args.notify:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise Stopped("timeout")
+            code, _, err = self.command(
+                [
+                    *self.coord,
+                    "hold",
+                    "--pid",
+                    str(os.getpid()),
+                    "--owner-pid",
+                    str(self.args.owner_pid),
+                    "--label",
+                    f"watch:{self.args.kind}",
+                    "--expect",
+                    f"{remaining:.9f}s",
+                ]
+            )
+            if code:
+                self.guard(force=True)
+                raise ValueError(err.strip() or "watcher registration failed")
+
+    def probe(self) -> tuple[int, str] | None:
+        kind, target = self.args.kind, self.args.target
+        if kind == "run":
+            code, out, err = self.gh("run", "view", "--json", "status,conclusion")
+            check_command(code, err, "gh run view")
+            run = json.loads(out)
+            if run["status"] == "completed":
+                conclusion = run["conclusion"] or "unknown"
+                return (0 if conclusion == "success" else 1), conclusion
+        elif kind == "pr" and not self.args.checks:
+            code, out, err = self.gh("pr", "view", "--json", "state")
+            check_command(code, err, "gh pr view")
+            state = json.loads(out)["state"]
+            if state == self.args.state or (
+                self.args.state is None and state in ("MERGED", "CLOSED")
+            ):
+                return 0, state.lower()
+        elif kind == "pr":
+            code, out, err = self.gh("pr", "checks", "--json", "bucket")
+            if code == 1 and not out and err.startswith("no checks reported on"):
+                return None
+            if code not in (0, 1, 8) or not out.strip():
+                check_command(code or 1, err, "gh pr checks")
+            buckets = {row["bucket"] for row in json.loads(out)}
+            if buckets - {"pass", "fail", "pending", "skipping", "cancel"}:
+                raise ValueError("unknown GitHub check bucket")
+            if buckets and "pending" not in buckets:
+                failed = buckets & {"fail", "cancel"}
+                return (1, ",".join(sorted(failed))) if failed else (0, "passed")
+        elif kind == "systemd":
+            code, out, err = self.command(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "--property=LoadState,ActiveState",
+                    "--",
+                    target,
+                ]
+            )
+            fields = dict(
+                line.split("=", 1) for line in out.splitlines() if "=" in line
+            )
+            if fields.get("LoadState") == "not-found":
+                if self.saw_unit:
+                    return 0, "unloaded"
+                raise ValueError("systemd unit not found")
+            check_command(code, err, "systemctl show")
+            state = fields["ActiveState"]
+            self.saw_unit = True
+            if state in ("inactive", "failed"):
+                return (1 if state == "failed" else 0), state
+        elif kind == "launchd":
+            code, out, err = self.command(["launchctl", "print", target])
+            if code == 113 and (
+                "Could not find service" in err or "No such process" in err
+            ):
+                return 0, "unloaded"
+            check_command(code, err, "launchctl print")
+            state = re.search(r"^\s*state = (.+)$", out, re.MULTILINE)
+            if not state:
+                raise ValueError(
+                    "launchctl did not return a job state; use a qualified service target"
+                )
+            # A waiting, scheduled, or on-demand job may still be loaded.
+            if state[1] not in (
+                "running",
+                "spawn scheduled",
+                "spawning",
+            ) and not re.search(r"^\s*pid = \d+", out, re.MULTILINE):
+                status = re.search(r"^\s*last exit code = (-?\d+)", out, re.MULTILINE)
+                return (
+                    (1, f"exit {status[1]}")
+                    if status and int(status[1])
+                    else (0, "stopped")
+                )
+        elif kind in ("pid", "pidfile"):
+            if self.pid is None:
+                if kind == "pidfile":
+                    try:
+                        text = Path(target).read_text().strip()
+                    except FileNotFoundError:
+                        return None
+                    if not text:
+                        return None
+                    self.pid = pid_number(text)
+                else:
+                    self.pid = target
+                self.target_start = process_start(self.pid)
+            if (
+                self.target_start is None
+                or process_start(self.pid) != self.target_start
+            ):
+                return 0, f"exited pid={self.pid}"
+        elif kind == "file":
+            if Path(target).exists():
+                return 0, "appeared"
+        elif kind == "lease":
+            code, out, err = self.command([*self.coord, "status", "--json"])
+            check_command(code, err, "agent-coord status")
+            status = json.loads(out)
+            if not any(
+                item["id"] == target for item in status["leases"] + status["queue"]
+            ):
+                return 0, "ended"
+        return None
+
+    def wait(self) -> tuple[int, str]:
+        self.owner_start = process_start(self.args.owner_pid)
+        if not self.owner_start:
+            raise Stopped("orphaned")
+        self.register()
+        while True:
+            self.guard(force=True)
+            result = self.probe()
+            if result is not None:
+                return result
+            until = time.monotonic() + self.interval
+            while (remaining := until - time.monotonic()) > 0:
+                self.guard()
+                time.sleep(min(1, remaining))
+
+
+def check_command(code: int, err: str, name: str) -> None:
+    if code:
+        raise ValueError(err.strip() or f"{name} exited {code}")
+
+
+def main() -> int:
+    args = parse_args()
+    waiter = Waiter(args)
+    signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+    def stop_interrupts() -> None:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
+
+    def interrupted(signum: int, _frame: object) -> None:
+        stop_interrupts()
+        if signum == signal.SIGALRM or time.monotonic() >= waiter.deadline:
+            raise Stopped("timeout")
+        waiter.guard(force=True)
+        raise Stopped("cancelled")
+
+    for sig in (signal.SIGALRM, *signals):
+        signal.signal(sig, interrupted)
+    try:
+        signal.setitimer(
+            signal.ITIMER_REAL, max(0.000001, waiter.deadline - time.monotonic())
+        )
+        code, detail = waiter.wait()
+    except Stopped as exc:
+        detail = str(exc)
+        code = {"timeout": 124, "orphaned": 125, "cancelled": 130}[detail]
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+        argparse.ArgumentTypeError,
+    ) as exc:
+        code, detail = 2, f"error: {exc}"
+    finally:
+        stop_interrupts()
+
+    line = " ".join(f"agent-wait {args.kind} {args.target}: {detail}".split())
+    print(line, flush=True)
+    if args.notify:
+        try:
+            reply = subprocess.run(
+                [*waiter.coord, "send", "--to", args.notify, line],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=1,
+            )
+            check_command(reply.returncode, reply.stderr, "agent-coord send")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"agent-wait: notification failed: {exc}", file=sys.stderr)
+            return code or 2
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

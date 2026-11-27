@@ -21,6 +21,7 @@ This clones the repo to `~/.local/share/skill-dump` and runs `skill-dump install
 | Tool | What it does | Needs |
 | --- | --- | --- |
 | `agent-coord` | CPU/RAM/disk leases, named locks and messages between agents | Linux, systemd user session, python3 |
+| [`agent-wait`](tools/agent-wait/README.md) | One-shot waits with hard expiry and optional inbox notification | Linux/macOS, Python 3, agent-coord on Linux |
 | [`pr-coord`](tools/pr-coordinator/README.md) | Multi-host PR landing, lifecycle and test evidence dashboards | Linux/macOS, Python 3.11+, Git, `gh`; SSH/rsync for remote work |
 | `sudo-session` | Share a time-limited, audited sudo credential with fresh agent shells | macOS/Linux, python3, tmux, sudo |
 | `op-session` | Persistent 1Password CLI session for fresh agent shells | macOS/Linux, tmux, op, jq |
