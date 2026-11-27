@@ -1,0 +1,6 @@
+{
+  "properties": {
+    "columns": [{"name": "Currency", "type": "String"}, {"name": "PreTaxCost", "type": "Number"}],
+    "rows": [["USD", 54.125]]
+  }
+}

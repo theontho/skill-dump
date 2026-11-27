@@ -28,6 +28,7 @@ STATE_COMMANDS = (
 )
 COMMANDS = {
     "dashboard": ("dashboard", "main", "serve the PR, lifecycle and test pages"),
+    "azure-budget": ("azure_budget", "main", "show or refresh Azure credit estimates"),
     "train": ("train", "main", "hand ready PRs to the landing train"),
     "lane": ("lane", "main", "reserve a conflict-free generated-files lane"),
     "cert": ("remote", "cert_main", "certify a worktree at the exact published head"),

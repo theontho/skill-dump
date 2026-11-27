@@ -1,0 +1,6 @@
+{
+  "value": [
+    {"properties": {"billingPeriodStartDate": "2026-11-06", "billingPeriodEndDate": "2026-12-05"}},
+    {"properties": {"billingPeriodStartDate": "2026-10-06", "billingPeriodEndDate": "2026-11-05"}}
+  ]
+}

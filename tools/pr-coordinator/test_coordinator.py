@@ -564,6 +564,91 @@ idle_alert = false
                 config.write(f"\n[events]\nidle_minutes = {threshold_override}\n")
         return Project("gadgets", config_file=self.config, data_dir=self.data)
 
+    def test_azure_budget_advises_from_current_credit_without_network(self):
+        import azure_budget
+        import dashboard
+        from events import idle_hosts
+
+        with self.config.open("a") as config:
+            config.write("""
+[azure_budget]
+subscription = "00000000-0000-0000-0000-000000000001"
+monthly_credit_usd = 150
+expected_burn_usd_per_day = 10
+""")
+        project = self.idle_project()
+        self.data.mkdir()
+        fixture = TOOL / "fixtures" / "azure-budget"
+        periods = json.loads((fixture / "billing-periods.json").read_text())
+        cost = json.loads((fixture / "cost-query.json").read_text())
+        now = datetime(2026, 11, 27, 16, tzinfo=UTC)
+        with mock.patch.object(
+            azure_budget, "azure_request", side_effect=[periods, cost]
+        ):
+            azure_budget.refresh(project, azure_budget.settings(project), now)
+        value = azure_budget.status(project, now=now)
+        self.assertAlmostEqual(value["remaining_usd"], 95.88)
+        self.assertEqual(value["reset_date"], "2026-12-06")
+        self.assertAlmostEqual(value["use_it_score"], 95.88 / 90)
+        observed_at = now.timestamp()
+        state = {
+            "hosts_observed_at": observed_at,
+            "hosts": {"worker": {"reachable": True}},
+            "host_idle": {"worker": {"since": observed_at - 3600, "id": "test"}},
+        }
+        with mock.patch.object(
+            azure_budget, "azure_request", side_effect=AssertionError("not offline")
+        ):
+            _, message = idle_hosts(state, project, now=observed_at)[0]
+            self.assertIn("$95.88", message)
+            self.assertIn("prefer Spot", message)
+            with (
+                mock.patch.object(dashboard, "P", project),
+                mock.patch.object(azure_budget, "datetime", wraps=datetime) as clock,
+            ):
+                clock.now.return_value = now
+                self.assertIn("estimated $95.88 credit left", dashboard.page())
+            self.assertFalse(
+                azure_budget.suggestion(project, now=now + timedelta(days=2))
+            )
+            self.assertFalse(
+                azure_budget.suggestion(project, now=now - timedelta(days=1))
+            )
+
+    def test_azure_budget_failed_refresh_keeps_cache_and_default_is_offline(self):
+        with self.config.open("a") as config:
+            config.write("""
+[azure_budget]
+subscription = "00000000-0000-0000-0000-000000000001"
+monthly_credit_usd = 150
+expected_burn_usd_per_day = 10
+""")
+        self.data.mkdir()
+        now = datetime.now(UTC)
+        cache = self.data / "azure-budget.json"
+        original = json.dumps(
+            {
+                "subscription": "00000000-0000-0000-0000-000000000001",
+                "monthly_credit_usd": 150,
+                "remaining_usd": 100,
+                "reset_date": (now + timedelta(days=4)).date().isoformat(),
+                "fetched_at": now.isoformat(),
+            }
+        )
+        cache.write_text(original)
+        marker = self.root / "azure-called"
+        fake = self.root / "az"
+        fake.write_text("#!/bin/sh\ntouch azure-called\nexit 1\n")
+        fake.chmod(0o755)
+        self.env["PATH"] = f"{self.root}{os.pathsep}{self.env['PATH']}"
+        value = json.loads(self.command("azure-budget", "--json").stdout)
+        self.assertEqual(value["remaining_usd"], 100)
+        self.assertFalse(marker.exists())
+        failed = self.command("azure-budget", "--refresh", check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertTrue(marker.exists())
+        self.assertEqual(cache.read_text(), original)
+
     def test_idle_event_uses_continuous_reachable_observations(self):
         from events import idle_hosts
         from host_activity import update_idle

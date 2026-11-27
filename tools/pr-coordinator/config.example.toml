@@ -23,6 +23,12 @@ headline_hours = 24
 # headline_since = "2026-01-01T00:00:00Z"
 # runner_limit = 20
 
+# Optional, for a fixed monthly benefit (e.g. Visual Studio Azure credit).
+# [azure_budget]
+# subscription = "00000000-0000-0000-0000-000000000000"
+# monthly_credit_usd = 150
+# expected_burn_usd_per_day = 10
+
 [labels]
 priority = "priority"
 hands_off = "hands-off"

@@ -96,6 +96,34 @@ that queue to dashboard readers but does not put it in the owner answer form.
 Both queues show open question age, the suggested `--default` (not automatically
 applied) and the action parked with `--blocks`.
 
+### Azure credit advisory
+
+For a fixed monthly USD benefit such as
+[Visual Studio Azure credit](https://learn.microsoft.com/en-us/visualstudio/subscriptions/vs-azure-eligibility),
+set `[azure_budget]` in the private project TOML (see `config.example.toml`).
+Set the subscription UUID, the verified monthly credit amount, and the expected
+daily spend for approved cloud work. Then run:
+
+```sh
+pr-coord --project PROJECT azure-budget --refresh  # requires a signed-in Azure CLI
+pr-coord --project PROJECT azure-budget --json    # offline, reads the cache
+```
+
+Only `--refresh` contacts Azure. It sends the configured subscription scope and
+billing-period date range to `management.azure.com`. For Visual Studio offers,
+the subscription billing period gives the reset date; the estimate subtracts
+reported current-period pre-tax Cost Management charges from the monthly grant.
+Cost data can lag or omit charges, so this is not the portal credit balance or
+permission to spend. Other credit types and non-USD billing are not supported.
+An unsuccessful refresh preserves the prior snapshot.
+
+The dashboard displays the estimate. An IDLE event can suggest approved cloud
+work when `(remaining credit ÷ days to reset) ÷ expected daily spend` is at
+least 1. The dashboard and event collector never refresh automatically; use a
+deliberate refresh before relying on them. Snapshots older than 24 hours or
+past their reset date never generate suggestions. Keep work short, prefer
+Spot, honor the approved spending cap, and verify resource deletion afterwards.
+
 ## Configuration and command contracts
 
 - **Review rounds:** lifecycle collection counts submitted Copilot reviews

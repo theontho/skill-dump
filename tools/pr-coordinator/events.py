@@ -9,6 +9,7 @@ import time
 from contextlib import ExitStack
 from datetime import datetime, timezone
 
+from azure_budget import suggestion as azure_suggestion
 from host_activity import busy_hosts, probe_window
 from lifecycle_model import REVIEW_ESCALATION
 from runtime import SLUG, P, gh_argv, load, locked, save
@@ -168,6 +169,10 @@ def idle_hosts(state, project, *, now):
                     f"IDLE: {host} has had no agent, lease or long run for {minutes} min",
                 )
             )
+    if events and (
+        hint := azure_suggestion(project, now=datetime.fromtimestamp(now, timezone.utc))
+    ):
+        return [(key, f"{message}; {hint}") for key, message in events]
     return events
 
 
