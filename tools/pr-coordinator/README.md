@@ -25,14 +25,39 @@ pr-coord --project project run --landing        # also supervise, train, yield, 
 
 Use one foreground `run` per project in a managed terminal or service. It stops
 the other children if any exits, and stops its children on Ctrl-C or SIGTERM.
-Alternatively run `dashboard`, `collect`, `supervise`, and `train run`
+Alternatively run `dashboard`, `collect`, `event-collect`, `supervise`, and `train run`
 separately. `collect --mutate` explicitly enables yield/stale cancellation;
-`collect --once` and `supervise --once` run one cycle. `events` blocks until a
-new main failure, queue drop, question, or idle-host alert, prints it and exits;
-restart `events` on notification. It is separate from `run`: updating the tool
-and re-arming `events` does not require restarting `run`. Monitor foreground
-errors and supervise processes externally. No units are installed or enabled
-by default.
+`collect --once` and `supervise --once` run one cycle. Monitor foreground errors
+and supervise processes externally. No units are installed or enabled by default.
+
+### Event watcher
+
+`run` collects new main failures, queue drops, questions and idle-host alerts
+even while the supervisor is away. `[events] interval` sets the collection
+interval in seconds (default `90`). The dashboard shows recent events, the
+pending count and when each consumer last received a batch.
+
+```sh
+pr-coord --project project events --wait
+pr-coord --project project events --wait --consumer audit --json
+```
+
+`--wait` reads local data only. It blocks for the next unseen batch, prints it,
+commits the cursor, and exits. Invoke it again when ready for the next batch;
+events accumulate in the meantime. Use the default `supervisor` cursor on
+handoff. A second waiter for the same name is refused; a different name reads
+the same journal from its own cursor. A crash before stdout is flushed does
+not consume the batch. Stdout and the on-disk cursor cannot commit together:
+if the process dies after output but before saving the cursor, it can replay
+that batch. Use `--json` and deduplicate by `id` if automating batch handling.
+
+To upgrade an existing installation, stop any old `events` process, then
+stop the running `run` with SIGTERM (or use your service manager) and relaunch
+`pr-coord --project PROJECT run` with the same options as before. This one-time
+restart enables the new collector. `events_seen.json` seeds the journal without
+replaying old IDs, and `events_known.json` continues to suppress known checks;
+neither file is rewritten. `events N` still waits for a batch and, if no service
+collector is running, polls on its own every `N` seconds.
 
 The dashboard reads only local snapshots and does not contact GitHub. `/` has PR
 tables, conflicts, dependencies, leases, certifications and questions;
@@ -52,7 +77,7 @@ that queue to dashboard readers but does not put it in the owner answer form.
   held `agent-coord` leases, heavy processes from a configured process probe,
   or running certifications or remote tests. Report agents with
   `pr-coord agent NAME STATUS --machine HOST` using the host key, display name,
-  or SSH alias. The host collector supplies the observations; `events` does
+  or SSH alias. The host collector supplies the observations; `event-collect` does
   not probe the hosts itself. Enable `agent_coord = true` on hosts whose leases
   should be collected; hosts without a workload probe get a reachability check.
   An offline host is not idle. Loss of observations resets the timer, but a
@@ -287,8 +312,8 @@ arguments; availability depends on the command. Do not copy untrusted hooks.
    run `skill-dump update`; do not edit the installed clone.
 4. Verify `pr-coord --project PROJECT status`; start
    `pr-coord --project PROJECT run --landing` under your process manager and
-   re-arm `pr-coord --project PROJECT events`. Use dashboard-only mode to
-   inspect migrated data before enabling any mutations.
+   use `pr-coord --project PROJECT events --wait` for the next batch. Use
+   dashboard-only mode to inspect migrated data before enabling any mutations.
 
 For browser verification on a populated copy, run `browser_smoke.py --base
 http://127.0.0.1:8787 --out out/browser.json`. This optional test needs Chromium

@@ -1,25 +1,39 @@
-"""Block until something needs the coordinator, print the events, and exit (the exit notifies the coordinator).
-
-Events: a failed check on main's head commit; a PR removed from the merge queue for a reason other than
-manual/merged; an owner answer on the dashboard; a new agent question for the coordinator.
-Reachable hosts that have been idle for the configured threshold also wake the coordinator.
-Seen events are remembered in events_seen.json so each is reported once.
-"""
+"""Wait for a batch of main failures, queue drops, questions, or idle hosts."""
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
+from datetime import datetime, timezone
 
 from host_activity import busy_hosts, probe_window
-from runtime import P, cli, gh_argv, load, save
+from runtime import P, SLUG, gh_argv, load, locked, save
 
 HERE = P.data
-SEEN = HERE / "events_seen.json"
 REPO = P.repo
 IGNORED_CHECKS = tuple(P.get("events", "ignored_check_prefixes", [P.cert_prefix]))
 KNOWN_FILE = HERE / "events_known.json"
+JOURNAL = "events_journal.json"
+DEFAULT_CONSUMER = "supervisor"
+PRODUCER_LOCK = "event-collect.lock"
+
+
+def empty_journal():
+    return {"events": [], "consumers": {}, "legacy_seen": []}
+
+
+def read_journal():
+    try:
+        return json.loads((HERE / JOURNAL).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return empty_journal()
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def gh(*args):
@@ -147,37 +161,151 @@ def idle_hosts(state, project, *, now):
     return events
 
 
+def collect(*, legacy_baseline=False):
+    events = answers() + agent_questions()
+    for source in (main_failures, queue_removals):
+        try:
+            events += source()
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.SubprocessError,
+        ) as exc:
+            print(f"events: {exc}", file=sys.stderr, flush=True)
+    events += idle_hosts(load(HERE / "state.json", {}), P, now=time.time())
+    with locked("events-journal.lock"):
+        path = HERE / JOURNAL
+        first = not path.exists()
+        journal = read_journal()
+        if first:
+            seen_path = HERE / "events_seen.json"
+            try:
+                journal["legacy_seen"] = json.loads(seen_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                journal["legacy_seen"] = (
+                    sorted({key for key, _ in events if not key.startswith("idle:")})
+                    if legacy_baseline
+                    else []
+                )
+        seen = set(journal["legacy_seen"]) | {row["id"] for row in journal["events"]}
+        at = timestamp()
+        changed = first
+        for key, message in events:
+            if key not in seen:
+                journal["events"].append({"id": key, "at": at, "message": message})
+                seen.add(key)
+                changed = True
+        if changed:
+            save(path, journal)
+
+
+def collect_main():
+    parser = argparse.ArgumentParser(description="Collect events independently of waiters.")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    interval = P.get("events", "interval", 90)
+    with locked(PRODUCER_LOCK):
+        while True:
+            try:
+                collect()
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                print(f"event-collect: {exc}", file=sys.stderr, flush=True)
+                if args.once:
+                    return 1
+            if args.once:
+                return 0
+            time.sleep(interval)
+
+
+def deliver(consumer, *, as_json):
+    journal = read_journal()
+    cursor = journal["consumers"].get(consumer, {}).get("cursor", 0)
+    batch = journal["events"][cursor:]
+    if not batch:
+        return False
+    body = json.dumps(batch) if as_json else "\n".join(row["message"] for row in batch)
+    try:
+        print(body, flush=True)
+    except BrokenPipeError:
+        # Don't retry the failed flush during interpreter shutdown.
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        raise
+    # A failed output never advances the cursor. The waiter lock keeps reads for
+    # this consumer exclusive even while the producer appends to the journal.
+    with locked("events-journal.lock"):
+        journal = read_journal()
+        journal["consumers"][consumer] = {
+            "cursor": cursor + len(batch),
+            "last_consumed": timestamp(),
+        }
+        save(HERE / JOURNAL, journal)
+    return True
+
+
+def wait_for_events(consumer, *, as_json, standalone_interval=None):
+    poll_at = 0
+    previous = None
+    while True:
+        try:
+            stat = (HERE / JOURNAL).stat()
+        except FileNotFoundError:
+            pass
+        else:
+            revision = (stat.st_ino, stat.st_mtime_ns)
+            if revision != previous:
+                if deliver(consumer, as_json=as_json):
+                    return
+                previous = revision
+        now = time.monotonic()
+        if standalone_interval is not None and now >= poll_at:
+            try:
+                with locked(PRODUCER_LOCK, wait=False):
+                    collect(legacy_baseline=True)
+            except BlockingIOError:
+                # The run service (or another legacy waiter) owns detection.
+                pass
+            else:
+                poll_at = time.monotonic() + standalone_interval
+                continue
+        time.sleep(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("interval", nargs="?", type=int, help="legacy poll interval")
+    parser.add_argument("--wait", action="store_true", help="read events collected by run")
     parser.add_argument(
-        "interval", nargs="?", type=int, default=P.get("events", "interval", 90)
+        "--consumer", default=DEFAULT_CONSUMER, help="cursor name (default: supervisor)"
     )
-    interval = parser.parse_args().interval
+    parser.add_argument("--json", action="store_true", help="include stable event IDs")
+    args = parser.parse_args()
+    if args.wait and args.interval is not None:
+        parser.error("interval is for legacy polling, not --wait")
+    if len(args.consumer) > 64 or not SLUG.fullmatch(args.consumer):
+        parser.error("consumer must be a slug of at most 64 characters")
+    interval = (
+        args.interval if args.interval is not None else P.get("events", "interval", 90)
+    )
     if interval < 1:
         parser.error("interval must be positive")
-    seen = set(load(SEEN, []))
-    first = not SEEN.exists()
-    while True:
-        events = answers() + agent_questions()
-        for collect in (main_failures, queue_removals):
-            try:
-                events += collect()
-            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-                print(f"events: {exc}", file=sys.stderr, flush=True)
-        events += idle_hosts(load(HERE / "state.json", {}), P, now=time.time())
-        new = [(k, msg) for k, msg in events if k not in seen]
-        if new:
-            seen.update(k for k, _ in new)
-            save(SEEN, sorted(seen))
-            notify = [(k, msg) for k, msg in new if not first or k.startswith("idle:")]
-            if notify:
-                for _, msg in notify:
-                    subprocess.run([*cli(), "log", "EVENT " + msg[:300]], check=False)
-                print("\n".join(msg for _, msg in notify))
-                return
-        first = False
-        time.sleep(interval)
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(locked(f"events-wait-{args.consumer}.lock", wait=False))
+        except BlockingIOError:
+            print(
+                f"events: consumer {args.consumer!r} already has a waiter",
+                file=sys.stderr,
+            )
+            return 1
+        wait_for_events(
+            args.consumer,
+            as_json=args.json,
+            standalone_interval=None if args.wait else interval,
+        )
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

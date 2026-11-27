@@ -43,10 +43,13 @@ every machine staffed with implementer or long-run work suited to its hardware.
    train and runner yield/stale cancellation. Run it in a managed foreground
    session and monitor exits. The server defaults to loopback and has no access
    control of its own.
-4. Watch `pr-coord --project <project> events` for main failures, queue drops
-   and questions. On notification, take action and restart the watcher. Keep
+4. Use `pr-coord --project <project> events --wait` for the next batch of main
+   failures, queue drops, questions or idle hosts. Run it again after handling
+   the batch. The `run` service collects events even with no waiter, and the
+   dashboard shows recent events, the pending count and when the supervisor
+   last read a batch. Reuse the default `supervisor` cursor on handoff. Keep
    the configuration and run commands in the handoff so another coordinator
-   can resume without changing deployment files.
+   can resume.
 5. Start implementers on another machine with `pr-coord --project <project>
    remote-agent <host> <name> <prompt-file>` (tmux on POSIX hosts). On a
    Windows host (`windows = true`) the agent runs detached under the host's

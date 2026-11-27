@@ -36,8 +36,9 @@ COMMANDS = {
     "events": (
         "events",
         "main",
-        "watch for main failures, drops, questions, and idle hosts",
+        "wait for the next unseen batch of coordinator events",
     ),
+    "event-collect": ("events", "collect_main", "collect coordinator events continuously"),
     "tests": ("tests_inventory", "main", "build or refresh test inventory"),
     "reports": ("tests_reports", "main", "collect JUnit reports"),
     "triage": ("triage", "main", "list PR landing metadata as JSON lines"),
@@ -64,7 +65,7 @@ COMMANDS = {
 LOCAL = {
     "migrate": "copy old coordinator datasets without overwriting existing files",
     "status": "show local data locations and status",
-    "run": "run dashboard and read-only collector (or opt into landing)",
+    "run": "run dashboard and read-only collectors (or opt into landing)",
     "collect": "refresh host, PR lifecycle and dependency datasets",
     "supervise": "run the auto-enqueue loop",
     "capacity": "wait for priority holds and run the project's CI capacity gate",
@@ -85,6 +86,7 @@ DATASETS = {
     "agent_questions.json",
     "train.json",
     "events_seen.json",
+    "events_journal.json",
     "triage.jsonl",
     "lifecycle.json",
     "lifecycle-cache.json",
@@ -182,7 +184,7 @@ def run_stack(args):
             dashboard += [f"--{arg}", str(value)]
     if flags.read_only:
         dashboard.append("--read-only")
-    commands = [dashboard, ["collect"]]
+    commands = [dashboard, ["collect"], ["event-collect"]]
     if flags.landing:
         from landing import assert_owner
 

@@ -1,5 +1,6 @@
 """Exercise the CLI, migration and train against isolated config, Git and gh."""
 
+import fcntl
 import json
 import os
 import shutil
@@ -49,19 +50,22 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             "GIT_CONFIG_GLOBAL": os.devnull,
         }
 
+    def argv(self, *args):
+        return [
+            sys.executable,
+            str(TOOL / "pr-coord"),
+            "--project",
+            "gadgets",
+            "--config",
+            str(self.config),
+            "--data-dir",
+            str(self.data),
+            *args,
+        ]
+
     def command(self, *args, check=True, timeout=None):
         return subprocess.run(
-            [
-                sys.executable,
-                str(TOOL / "pr-coord"),
-                "--project",
-                "gadgets",
-                "--config",
-                str(self.config),
-                "--data-dir",
-                str(self.data),
-                *args,
-            ],
+            self.argv(*args),
             cwd=self.root,
             env=self.env,
             capture_output=True,
@@ -69,6 +73,38 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             check=check,
             timeout=timeout,
         )
+
+    def background(self, *args):
+        process = subprocess.Popen(
+            self.argv(*args),
+            cwd=self.root,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=15)
+
+        self.addCleanup(stop)
+        return process
+
+    def fake_gh(self, body="exit 0\n"):
+        fake_gh = self.root / "gh"
+        fake_gh.write_text(f"#!/bin/sh\n{body}")
+        fake_gh.chmod(0o755)
+        self.env["PATH"] = f"{self.root}{os.pathsep}{self.env['PATH']}"
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail("background operation did not become ready")
 
     def test_config_selection_and_data_override(self):
         config = Project(
@@ -151,6 +187,98 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
         self.assertNotIn("http-equiv=refresh", html)
         self.assertIn("localStorage", html)
         self.assertIn("document.activeElement", html)
+
+    def test_run_records_events_without_waiters_and_cursors_survive_restarts(self):
+        import dashboard
+
+        self.fake_gh()
+        self.checkout.mkdir()
+        self.env["GIT_CEILING_DIRECTORIES"] = str(self.root)
+        with self.config.open("a") as config:
+            config.write("\n[events]\ninterval = 1\n")
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        service = self.background("run", "--port", "0")
+
+        def page():
+            with mock.patch.object(dashboard, "P", project):
+                return dashboard.page()
+
+        def take(*args):
+            result = self.command("events", "--wait", "--json", *args, timeout=5)
+            return json.loads(result.stdout)
+
+        self.command("ask", "first <alert>", "--machine", "worker")
+        self.wait_until(lambda: "first &lt;alert&gt;" in page())
+        self.assertIn("last consumed never · 1 pending", page())
+        first = take()
+        self.assertEqual(len(first), 1)
+        self.assertIn("first <alert>", first[0]["message"])
+        self.assertRegex(page(), r"last consumed \d{4}-\d{2}-\d{2}T[^<]+ · 0 pending")
+
+        waiter = self.background("events", "--wait")
+
+        def waiting():
+            lock = self.data / "locks/events-wait-supervisor.lock"
+            try:
+                with lock.open() as file:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            except FileNotFoundError:
+                pass
+            return False
+
+        self.wait_until(waiting)
+        duplicate = self.command("events", "--wait", check=False, timeout=5)
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn("already has a waiter", duplicate.stderr)
+        self.assertEqual(duplicate.stdout, "")
+        waiter.kill()
+        self.assertEqual(waiter.communicate(timeout=5)[0], "")
+        service.terminate()
+        service.communicate(timeout=15)
+
+        self.command("ask", "second alert", "--machine", "worker")
+        self.background("run", "--port", "0")
+        second = take()
+        self.assertEqual(len(second), 1)
+        self.assertIn("second alert", second[0]["message"])
+        self.assertNotEqual(first[0]["id"], second[0]["id"])
+        self.assertEqual(take("--consumer", "audit"), first + second)
+
+    def test_event_cutover_keeps_legacy_seen_and_known_checks_and_retries_failed_output(self):
+        self.fake_gh(
+            """case "$2" in
+  repos/example/gadgets/commits/trunk) printf 'sha\\n' ;;
+  *check-runs*) printf 'already seen\\tURL\\nknown check\\tURL\\nnew check\\tURL\\n' ;;
+esac
+"""
+        )
+        self.data.mkdir()
+        seen = self.data / "events_seen.json"
+        known = self.data / "events_known.json"
+        seen.write_text('["main:sha:already seen"]')
+        known.write_text('["known check"]')
+        self.command("event-collect", "--once")
+        # With no reader, writing the batch must fail without consuming it.
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, "w") as output, subprocess.Popen(
+            self.argv("events", "--wait"),
+            cwd=self.root,
+            env=self.env,
+            stdout=output,
+            stderr=subprocess.PIPE,
+        ) as process:
+            self.assertNotEqual(process.wait(timeout=5), 0)
+            self.assertIn(b"Broken pipe", process.stderr.read())
+
+        result = self.command("events", "1", timeout=5)
+        self.assertIn("'new check'", result.stdout)
+        self.assertNotIn("'known check'", result.stdout)
+        self.assertNotIn("'already seen'", result.stdout)
+        self.assertEqual(json.loads(seen.read_text()), ["main:sha:already seen"])
+        self.assertEqual(json.loads(known.read_text()), ["known check"])
 
     def idle_project(self, *, threshold_override=None):
         with self.config.open("a") as config:
@@ -249,10 +377,7 @@ idle_alert = false
         project = self.idle_project(threshold_override=1)
         self.data.mkdir()
         path = self.data / "state.json"
-        fake_gh = self.root / "gh"
-        fake_gh.write_text("#!/bin/sh\nexit 0\n")
-        fake_gh.chmod(0o755)
-        self.env["PATH"] = f"{self.root}{os.pathsep}{self.env['PATH']}"
+        self.fake_gh()
         start = int(time.time()) - 190
         state = {"hosts": {"worker": {"reachable": True}}, "prs": [], "log": []}
 

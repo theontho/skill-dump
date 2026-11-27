@@ -279,6 +279,24 @@ setInterval(() => {
 </script>"""
 
 
+def events_panel():
+    from events import DEFAULT_CONSUMER, JOURNAL, empty_journal
+
+    journal = load(P.data / JOURNAL, empty_journal())
+    events = journal["events"]
+    consumers = {DEFAULT_CONSUMER: {}, **journal["consumers"]}
+    statuses = "".join(
+        f"<li><b>{esc(name)}</b>: last consumed {esc(row.get('last_consumed', 'never'))}"
+        f" · {len(events) - row.get('cursor', 0)} pending</li>"
+        for name, row in sorted(consumers.items())
+    )
+    recent = "".join(
+        f"<li><small>{esc(row['at'])}</small> {esc(row['message'])}</li>"
+        for row in reversed(events[-20:])
+    )
+    return f"<ul>{statuses}</ul>" + (f"<ul>{recent}</ul>" if recent else "")
+
+
 def page():
     s = load(STATE, {})
     qs = load(QUESTIONS, [])
@@ -518,6 +536,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;
 .card{{background:#1c1c1c;border:1px solid #333;border-radius:6px;padding:8px;min-width:220px;flex:1}}
 .q{{border-color:#ef6c00}}textarea{{width:100%;background:#000;color:#ddd}}h2{{margin-top:22px}}</style></head><body>
 <h1>PR backlog coordinator</h1><nav><a href="/lifecycle">PR lifecycle</a> · <a href="/tests">Tests</a></nav><div>Updated {esc(s.get("updated"))} — {esc(s.get("headline"))}</div><div>{esc(summary)}</div>
+<h2>Coordinator events</h2>{events_panel()}
 <h2>PR dependency graph</h2><div><small>red arrow = waits for (conflicts with a queued PR or lane holder); ✕ = number of PRs it conflicts with; orange border = priority. Hover/click a PR for details. Updated {esc(s.get("graph", {}).get("at"))}</small></div>
 <div style='overflow-x:auto'>{graph_svg(s.get("graph", {}))}</div>
 <h2>Questions for you ({len(open_q)})</h2>{qhtml}

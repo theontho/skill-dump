@@ -50,7 +50,7 @@
       "description": "Use when the owner asks to coordinate work across machines: landing a pull request backlog, then working through the issue queue with implementer agents.",
       "license": "MIT",
       "path": "skills/pr-coordinator/SKILL.md",
-      "sha256": "13f9c4cbd822e7a3163f24daf40f9ba8f48ff807f7ef150707e2cec54e9628bb",
+      "sha256": "d0433a75d496e99453a399b11292649d8619f6b08f9f8740a4e61715ce738e24",
       "metadata": {
         "author": "theontho",
         "version": "1.0.0"
