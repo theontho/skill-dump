@@ -10,6 +10,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from uuid import uuid4
@@ -356,10 +357,17 @@ def certify(wt, pr, target, sha, base, _attempt=0):
         command += P.command("certification", target + "_args", **ctx)
         command += P.expand(P.hosts[host].get("cert_args", []), **ctx)
         log_path = path / f"cert-{pr}-{target}-{short}.log"
-        start = log_path.stat().st_size if log_path.exists() else 0
+        previous = log_path.stat() if log_path.exists() else None
+        start = previous.st_size if previous else 0
         code = 1
         with log_path.open("a", encoding="utf-8") as log:
-            output = dict(stdout=log, stderr=subprocess.STDOUT)
+            started = datetime.now(timezone.utc).isoformat()
+            print(
+                f"CERT START {started} {previous.st_mtime if previous else 0}",
+                file=log,
+                flush=True,
+            )
+            output = {"stdout": log, "stderr": subprocess.STDOUT}
             try:
                 envs = P.command("certification", "environments", **ctx)
                 if envs:
@@ -398,7 +406,8 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                     except (OSError, subprocess.SubprocessError) as exc:
                         print(f"Cleanup failed: {exc}", file=log, flush=True)
                         code = code or 1
-                print(f"\nEXIT {code}", file=log)
+                ended = datetime.now(timezone.utc).isoformat()
+                print(f"\nCERT END {ended}\nEXIT {code}", file=log)
         text = log_path.read_text(encoding="utf-8", errors="replace")
         # The project's controller may refuse a host it finds busy (e.g. a lock taken outside these slots):
         # wait for it instead of reporting an error.

@@ -9,6 +9,7 @@ from urllib.parse import parse_qs
 
 import lifecycle_page
 import tests_page
+from efficiency_report import dashboard_page
 from lifecycle_model import REVIEW_ESCALATION, stamp
 from runtime import P, questions
 
@@ -583,7 +584,7 @@ table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #333;
 .qtext{{white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0}}.q textarea{{width:100%;box-sizing:border-box}}
 .card{{background:#1c1c1c;border:1px solid #333;border-radius:6px;padding:8px;min-width:220px;flex:1}}
 .q{{border-color:#ef6c00}}textarea{{width:100%;background:#000;color:#ddd}}h2{{margin-top:22px}}</style></head><body>
-<h1>PR backlog coordinator</h1><nav><a href="/lifecycle">PR lifecycle</a> · <a href="/tests">Tests</a></nav><div>Updated {esc(s.get("updated"))} — {esc(s.get("headline"))}</div><div>{esc(summary)}</div>
+<h1>PR backlog coordinator</h1><nav><a href="/lifecycle">PR lifecycle</a> · <a href="/tests">Tests</a> · <a href="/efficiency">Efficiency</a></nav><div>Updated {esc(s.get("updated"))} — {esc(s.get("headline"))}</div><div>{esc(summary)}</div>
 <h2>Coordinator events</h2>{events_panel()}
 {review_panel(lifecycle)}
 <h2>PR dependency graph</h2><div><small>red arrow = waits for (conflicts with a queued PR or lane holder); ✕ = number of PRs it conflicts with; orange border = priority. Hover/click a PR for details. Updated {esc(s.get("graph", {}).get("at"))}</small></div>
@@ -627,6 +628,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, lifecycle_page.page())
         elif self.path == "/tests":
             self._send(200, tests_page.page())
+        elif self.path == "/efficiency":
+            self._send(200, dashboard_page(P.data))
         elif self.path == "/":
             self._send(200, page().replace("__REPO_WEB__", P.web))
         else:

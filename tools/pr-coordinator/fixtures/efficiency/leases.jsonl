@@ -1,0 +1,6 @@
+{"time":1795392000,"event":"waiting","id":"L1","agent":"project-42","waited":2400}
+{"time":1795395600,"event":"started","id":"L1","agent":"project-42","wait":3600}
+{"time":1795396200,"event":"ended","id":"L1","agent":"project-42","wait":3600}
+{"time":1795396200,"event":"cancelled","id":"L2","agent":"project","wait":1800}
+{"time":1795396200,"event":"cancelled","id":"L2","agent":"project","wait":1800}
+{"time":1795396200,"event":"started","id":"L3","agent":"other","wait":12000}

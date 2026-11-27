@@ -132,6 +132,22 @@ rt_xml = "out/**/*.xml"
 # agent_report = ["coordinator-report.cmd"]
 # agent_env_session = "coordenv"   # agent-env holds a piped credential in memory
 
+[efficiency]
+# Report last completed UTC ISO week when the persistent `pr-coord run` stack is up.
+# weekly = true
+# repo_report_dir = "out/efficiency"
+# supervisor_sessions = ["00000000-0000-0000-0000-000000000000"]
+# idle_gap_minutes = 30
+# repository_aliases = ["old-owner/project"]
+# lease_agent_pattern = "project|project-[0-9]+"
+# lease_history_files = ["/path/to/other-host-history.jsonl"]
+# session_metrics_file = "/path/to/session-metrics.json"
+
+[efficiency.targets]
+# Upper bounds (counts or hours); omit metrics with no agreed target.
+# review_rounds_p50 = 1
+# "polling_hours.read_bash" = 0
+
 [certification]
 default_targets = ["generic", "linux"]
 must_run = ["generic"]

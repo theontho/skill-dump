@@ -338,6 +338,68 @@ Hooks are argv arrays. Known values such as `{repo}`, `{checkout}`, `{data}`,
 `{envs}`, `{remote_worktree}`, and `{remote_config}` are substituted as single
 arguments; availability depends on the command. Do not copy untrusted hooks.
 
+## Weekly efficiency report
+
+Run `pr-coord --project PROJECT report` for the current UTC ISO week, or add
+`--week 2026-W48` for a specific week. Each invocation explicitly reads GitHub
+PR/workflow metadata and writes `YYYY-Www.md` and `YYYY-Www.json` under the
+project data directory's `efficiency/`. `[efficiency].repo_report_dir` mirrors
+both files inside the checkout; `--output-dir` adds a one-off copy. Reports
+include the previous complete week and numeric changes. Current-week totals
+are partial. Set maximum targets by metric key in `[efficiency.targets]`.
+The PR dashboard's **Efficiency** page shows the latest published report.
+
+For unattended reporting, set `[efficiency].weekly = true` in a persistent
+`pr-coord run` stack, or run `pr-coord --project PROJECT report --weekly`
+as a separate managed process. It checks hourly, publishes the previous
+complete week once and retries failed collections. Use `--week` to backfill.
+
+- **GitHub:** Review rounds count submitted Copilot reviews through merge,
+  including zero-review PRs in the merged-week cohort. Pushes after first
+  readiness use force-push events, named synchronize workflows and matched
+  branch push workflows (same PR/head within five minutes counted once).
+  Pushes without retained evidence are not observable. Merge-queue synthetic
+  heads and unassociated workflows are excluded. Superseded hosted runs
+  count completed PR workflows during readiness (excluding skipped and
+  neutral conclusions), using run rather than job metadata. Those runs and
+  non-busy certification log attempts are on a different final merged head
+  or have a witnessed replacement before completion. A rerun-only pass
+  is a successful run on the final merged head after a failure, timeout or
+  startup failure on the same run ID and head, with success recorded by merge.
+  Runs are assigned by creation time, certifications by exit. Historical
+  Actions retention, branch matching and missing attempts limit these counts.
+- **Hosts:** Busy/no-host refusals are nonzero certification exits with a
+  busy marker, not cleanup errors or slot waits without an exit. Old log exits
+  without timestamps use the file's last pre-upgrade modification time and
+  are flagged. Lease queue hours sum `wait` on `started` and `cancelled`
+  events ending in the week. By default only exact project/checkout agent
+  names match. Configure `lease_agent_pattern` as a full-match regex for
+  project worktrees. To include other hosts, export each host's
+  `agent-coord history --since 15d --json` to its own file and list the paths
+  in `lease_history_files`; do not import the local host again.
+- **Copilot:** The report uses the local SQLite session index to find project
+  traces, then reads the corresponding `session-state/*/events.jsonl` files.
+  Configure aliases for repository renames and `supervisor_sessions` (or pass
+  `--supervisor-session ID`) to identify the supervisor's traces. Idle gaps
+  start at a final message and end at the trigger for resumed work; idle
+  gaps shorter than 30 minutes are excluded by default (`idle_gap_minutes`).
+  Polling counts completed foreground wait calls (`read_bash`, waiting
+  `read_agent`, blocking shell sleep, GitHub watch and coordinator events);
+  `ask_user` elapsed time is separate. Durations are clipped to the week,
+  except idle gaps, assigned by resumption. Session text and tool arguments
+  never leave the host. Missing session data appears as unavailable, not zero.
+
+For cloud-only or off-host Copilot data, export aggregates, not transcripts.
+Provide `--session-metrics PATH` or set `session_metrics_file`:
+
+```json
+{"weeks":{"2026-W48":{"polling_hours":2.5,"polling_hours.read_bash":2.5,"blocking_question_hours":0.1,"supervisor_idle_gaps_owner":2,"supervisor_idle_hours_owner":3.4}}}
+```
+
+Use metric keys from the JSON report, and include both weeks for a trend.
+Supplied metrics override matching local values; omitted metrics use local
+evidence when available.
+
 ## Migrate and cut over
 
 1. Stop **only** the old dashboard, supervisor, collector, train and event

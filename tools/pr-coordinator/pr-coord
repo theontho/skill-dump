@@ -42,6 +42,7 @@ COMMANDS = {
     "event-collect": ("events", "collect_main", "collect coordinator events continuously"),
     "tests": ("tests_inventory", "main", "build or refresh test inventory"),
     "reports": ("tests_reports", "main", "collect JUnit reports"),
+    "report": ("efficiency_report", "main", "write weekly system-efficiency metrics"),
     "triage": ("triage", "main", "list PR landing metadata as JSON lines"),
     "graph": ("graph", "main", "refresh conflict and dependency graph"),
     "lifecycle": ("lifecycle", "main", "refresh lifecycle evidence"),
@@ -186,6 +187,8 @@ def run_stack(args):
     if flags.read_only:
         dashboard.append("--read-only")
     commands = [dashboard, ["collect"], ["event-collect"]]
+    if runtime.P.get("efficiency", "weekly", False):
+        commands.append(["report", "--weekly"])
     if flags.landing:
         from landing import assert_owner
 
