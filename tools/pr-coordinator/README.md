@@ -255,14 +255,21 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
   the train. If `drafts.ready_workflow` is set, the next adoption waits for the
   previous admission's run with `drafts.ready_run_suffix` (default `/ ready`).
   If interrupted after readiness, rerun `finish-draft PR` to recover train
-  registration, or use `handoff PR` for an already-ready PR. `train add PR`
-  also prepares a missing checkout and keeps an existing active registration.
+  registration, or use `handoff PR` for an already-ready PR. After fixing the
+  cause of a blocked entry, rerun any of those commands or use `train add PR`
+  or `train retry PR`. `retry` requires a blocked entry; `add` can also
+  register a new PR. Rearming uses the published head and preserves retry
+  limits and logs. A missing checkout is prepared when needed.
   Worktree preparation reuses the clean PR branch worktree or creates one and
   fast-forwards only; it does not discard local changes. `ATTENTION` means an
   operator must investigate. The train keeps a mergeable head unless main
   overlaps a changed generated file. When a conflict or generated overlap
   requires a train refresh, it returns the PR to draft before pushing;
   run `finish-draft` again after the new head is reviewed.
+  If a configured `landing.pr_checks_ready` gate passes using hosted coverage,
+  the train can submit a mergeable but `UNSTABLE` head when the only failures
+  on that exact commit are local certification commit statuses. Other failed
+  or pending checks still block; local statuses are never rewritten as passes.
 - **Retry limit:** certification, remote tests and train actions record failures
   by command, inputs and failure class in the project's `retries/` directory.
   After two matching failures the coordinator refuses another unchanged

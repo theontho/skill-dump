@@ -137,12 +137,64 @@ def reviewed(info):
     )
 
 
-def mergeable(info):
-    return info["mergeable"] == "MERGEABLE" and info["mergeStateStatus"] in {
-        "CLEAN",
-        "BEHIND",
-        "BLOCKED",
-    }
+def only_failed_certifications(head):
+    """Check all contexts on the pinned commit, not a branch or merge ref."""
+    prefix = P.cert_prefix
+    if not prefix:
+        return False
+    cursor = None
+    failed = False
+    while True:
+        after = ",after:" + json.dumps(cursor) if cursor else ""
+        commit = query(
+            f"object(oid:{json.dumps(head)}){{... on Commit{{oid statusCheckRollup"
+            f"{{contexts(first:100{after}){{nodes{{__typename "
+            "... on StatusContext{context state} ... on CheckRun{status conclusion}} "
+            "pageInfo{hasNextPage endCursor}}}}}"
+        )["object"]
+        if not commit or commit["oid"] != head or not commit["statusCheckRollup"]:
+            return False
+        contexts = commit["statusCheckRollup"]["contexts"]
+        for node in contexts["nodes"]:
+            if not node:
+                return False
+            if node["__typename"] == "StatusContext":
+                if node["state"] == "SUCCESS":
+                    continue
+                if node["state"] in {"FAILURE", "ERROR"} and node["context"].startswith(
+                    prefix
+                ):
+                    failed = True
+                    continue
+            elif (
+                node["__typename"] == "CheckRun"
+                and node["status"] == "COMPLETED"
+                and node["conclusion"] in {"SUCCESS", "SKIPPED", "NEUTRAL"}
+            ):
+                continue
+            return False
+        page = contexts["pageInfo"]
+        if not page["hasNextPage"]:
+            return failed
+        if not page["endCursor"] or page["endCursor"] == cursor:
+            return False
+        cursor = page["endCursor"]
+
+
+def mergeable(info, *, readiness_passed=False):
+    if info["mergeable"] != "MERGEABLE":
+        return False
+    state = info["mergeStateStatus"]
+    if state in {"CLEAN", "BEHIND", "BLOCKED"}:
+        return True
+    # A configured readiness gate may accept hosted coverage instead of local
+    # attestations. Never turn that verdict into a successful local attestation.
+    return (
+        state == "UNSTABLE"
+        and readiness_passed
+        and bool(P.get("landing", "pr_checks_ready"))
+        and only_failed_certifications(info["headRefOid"])
+    )
 
 
 def paused():
@@ -233,12 +285,12 @@ def stack_enqueue(pr, head, stack, info, active):
         if (
             not eligible(current, stack=fresh)
             or not reviewed(current)
-            or not mergeable(current)
             or current["mergeQueueEntry"]
             or current["autoMergeRequest"]
             or current["headRefOid"] != head
             or current["headRefName"] != info["headRefName"]
             or current["baseRefName"] != info["baseRefName"]
+            or not mergeable(current, readiness_passed=True)
             or boundary.get("state") != "open"
             or boundary.get("draft") is not False
             or boundary_head.get("ref") != current["headRefName"]
@@ -315,7 +367,7 @@ def enqueue_result(number, head, *, priority=False, active=lambda: True):
         return EnqueueResult.STOPPED, "", "PR head, eligibility or review changed"
     if info["mergeQueueEntry"]:
         return EnqueueResult.QUEUED, "", ""
-    if not mergeable(info):
+    if not mergeable(info, readiness_passed=not priority):
         # GitHub can still be computing mergeability just after a head update.
         outcome = (
             EnqueueResult.RECHECK

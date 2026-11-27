@@ -1358,6 +1358,46 @@ platform = "macos-arm64"
         self.command("train", "add", "7")
         self.assertEqual(json.loads(train.read_text())[0]["worktree"], row["worktree"])
 
+    def test_issue_37_rearms_a_blocked_train_entry_at_the_published_head(self):
+        _, head = self.create_git()
+        self.git("switch", "trunk")
+        self.fake_draft(head, statuses=[]).touch()
+        self.command("train", "add", "7")
+        path = self.data / "train.json"
+        row = json.loads(path.read_text())[0]
+        wt = Path(row["worktree"])
+
+        for args, advance in [
+            (("train", "add", "7"), False),
+            (("finish-draft", "7"), False),
+            (("train", "retry", "7"), False),
+            (("train", "add", "7"), True),
+            (("finish-draft", "7"), True),
+            (("train", "retry", "7"), True),
+        ]:
+            path.write_text(
+                json.dumps([dict(row, stage="blocked", note="missing wheel")])
+            )
+            if advance:
+                self.git("commit", "--allow-empty", "-m", "New PR head", cwd=wt)
+                self.git("push", "origin", "feature", cwd=wt)
+                head = self.git("rev-parse", "HEAD", cwd=wt)
+                self.fake_draft(head, statuses=[]).touch()
+            result = self.command(*args, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            [current] = json.loads(path.read_text())
+            self.assertEqual(current["head"], head)
+            self.assertEqual(current["stage"], "new")
+            self.assertEqual(Path(current["worktree"]), wt)
+            self.assertNotEqual(current["token"], row["token"])
+            self.assertNotIn("note", current)
+            row = current
+
+        result = self.command("train", "retry", "7", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no blocked landing train entry", result.stderr)
+        self.assertEqual(json.loads(path.read_text()), [row])
+
     def test_cert_pr_prepares_only_the_requested_published_head(self):
         _, head = self.create_git("feature.txt")
         self.git("switch", "trunk")
@@ -1727,6 +1767,86 @@ case "$*" in *failing-command) exit 42 ;; *) exit 0 ;; esac""",
             read.side_effect = [row, dict(row, headRefOid="b" * 40)]
             self.assertFalse(train.enqueue_checked(9, head))
             self.assertEqual(merge.call_count, 1)
+
+    def test_issue_37_unstable_head_needs_a_passing_gate_and_only_local_failures(self):
+        import landing
+
+        self.checkout.mkdir()
+        with self.config.open("a") as config:
+            config.write(
+                f'\npr_checks_ready = ["{sys.executable}", "-c", '
+                "\"import json,sys; raise SystemExit(not any(r['bucket'] == 'pass' "
+                "and r['name'] == 'required' for r in json.load(sys.stdin)))\"]\n"
+            )
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        project.prepare()
+        head = "a" * 40
+        pr = {
+            "state": "OPEN",
+            "isDraft": False,
+            "headRefOid": head,
+            "baseRefName": "trunk",
+            "author": {"login": "owner"},
+            "isCrossRepository": False,
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            "reviewDecision": None,
+            "mergeQueueEntry": None,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "UNSTABLE",
+        }
+        cases = json.loads(
+            (TOOL / "fixtures" / "hosted-fallback-rollup.json").read_text()
+        )
+        merge = self.root / "merge"
+        args_fixture = self.root / "scenario.json"
+        fake = self.root / "gh"
+        fake.write_text(
+            f"""#!{sys.executable}
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+case = json.loads(Path({str(args_fixture)!r}).read_text())
+if args[0] == "api" and args[-1].endswith("/stacks?pull_request=7"):
+    print("HTTP/2 200 OK\\n\\n[]")
+elif args[:2] == ["api", "graphql"]:
+    if "pullRequest(number:7)" in args[3]:
+        data = {{"pullRequest": {pr!r}}}
+    else:
+        assert 'object(oid:"{head}")' in args[3], args
+        page = 1 if 'after:"next"' in args[3] else 0
+        more = page + 1 < len(case["pages"])
+        data = {{"object": {{"oid": "b" * 40 if case.get("wrong_head") else "{head}",
+            "statusCheckRollup": {{"contexts": {{"nodes": case["pages"][page],
+                "pageInfo": {{"hasNextPage": more, "endCursor": "next" if more else None}}}}}}}}}}
+    print(json.dumps({{"data": {{"repository": data}}}}))
+elif args[:2] == ["pr", "checks"]:
+    print(json.dumps([{{"name": "required", "bucket": case.get("gate", "pass")}}]))
+elif args[:2] == ["pr", "merge"]:
+    Path({str(merge)!r}).write_text(args[args.index("--match-head-commit") + 1])
+else:
+    raise SystemExit(f"unexpected fake gh invocation: {{args}}")
+"""
+        )
+        fake.chmod(0o700)
+        path = f"{self.root}{os.pathsep}{os.environ['PATH']}"
+        with (
+            mock.patch("runtime.P", project),
+            mock.patch.object(landing, "P", project),
+            mock.patch("stack_landing.P", project),
+            mock.patch.dict(os.environ, {"PATH": path}),
+        ):
+            for case in cases:
+                with self.subTest(case=case["name"]):
+                    merge.unlink(missing_ok=True)
+                    args_fixture.write_text(json.dumps(case))
+                    outcome, _, _ = landing.enqueue_result(7, head)
+                    if case.get("enqueue"):
+                        self.assertIs(outcome, landing.EnqueueResult.QUEUED)
+                        self.assertEqual(merge.read_text(), head)
+                    else:
+                        self.assertIsNot(outcome, landing.EnqueueResult.QUEUED)
+                        self.assertFalse(merge.exists())
 
     def test_train_waits_for_github_to_report_its_own_push(self):
         import train

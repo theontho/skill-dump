@@ -1,0 +1,45 @@
+[
+  {
+    "name": "hosted fallback passed on the same head",
+    "enqueue": true,
+    "pages": [[
+      {"__typename": "StatusContext", "context": "local-ci/generic", "state": "FAILURE"},
+      {"__typename": "StatusContext", "context": "local-ci/linux-x64", "state": "ERROR"},
+      {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    ]]
+  },
+  {
+    "name": "the readiness gate rejected the head",
+    "gate": "fail",
+    "pages": [[
+      {"__typename": "StatusContext", "context": "local-ci/generic", "state": "FAILURE"}
+    ]]
+  },
+  {
+    "name": "another failed status is on the next page",
+    "pages": [
+      [{"__typename": "StatusContext", "context": "local-ci/generic", "state": "FAILURE"}],
+      [{"__typename": "StatusContext", "context": "third-party", "state": "FAILURE"}]
+    ]
+  },
+  {
+    "name": "a hosted check run also failed",
+    "pages": [[
+      {"__typename": "StatusContext", "context": "local-ci/generic", "state": "ERROR"},
+      {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}
+    ]]
+  },
+  {
+    "name": "the local certification is still pending",
+    "pages": [[
+      {"__typename": "StatusContext", "context": "local-ci/generic", "state": "PENDING"}
+    ]]
+  },
+  {
+    "name": "the rollup is for a different head",
+    "wrong_head": true,
+    "pages": [[
+      {"__typename": "StatusContext", "context": "local-ci/generic", "state": "FAILURE"}
+    ]]
+  }
+]

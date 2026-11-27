@@ -85,22 +85,26 @@ def registered(pr, head):
     return any(
         row["pr"] == pr
         and row.get("head", head) == head
-        and row.get("stage") not in {"closed", "merged"}
+        and row.get("stage") not in {"blocked", "closed", "merged"}
         for row in load(TRAIN, [])
     )
 
 
-def register(pr, wt, head, *, readd=False):
+def register(pr, wt, head, *, readd=False, blocked_only=False):
     wt = str(Path(wt).resolve())
     added = False
 
     def update(rows):
         nonlocal added
+        if blocked_only and not any(
+            row["pr"] == pr and row.get("stage") == "blocked" for row in rows
+        ):
+            raise ValueError(f"#{pr} has no blocked landing train entry")
         for row in rows:
             if row["pr"] == pr and row.get("head", head) == head:
                 stage = row.get("stage")
-                if stage not in {"closed", "merged"} and not (
-                    readd and (stage == "blocked" or row["worktree"] != wt)
+                if stage not in {"blocked", "closed", "merged"} and not (
+                    readd and row["worktree"] != wt
                 ):
                     row.setdefault("head", head)
                     return rows
@@ -811,21 +815,35 @@ def land(entry):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("cmd", choices=["add", "remove", "list", "run"])
+    p.add_argument("cmd", choices=["add", "retry", "remove", "list", "run"])
     p.add_argument("pr", nargs="?", type=int)
     p.add_argument("--worktree")
     a = p.parse_args()
-    if a.cmd in {"add", "remove"} and (a.pr is None or a.pr < 1):
-        p.error("add/remove requires a positive PR number")
-    if a.cmd == "add":
+    if a.cmd in {"add", "retry", "remove"} and (a.pr is None or a.pr < 1):
+        p.error(f"{a.cmd} requires a positive PR number")
+    if a.cmd in {"add", "retry"}:
         from drafts import handoff_worktree, owner_pr
 
         assert_owner()
+        retry = a.cmd == "retry"
+        path = a.worktree
+        if retry:
+            parked = next(
+                (
+                    row
+                    for row in load(TRAIN, [])
+                    if row["pr"] == a.pr and row.get("stage") == "blocked"
+                ),
+                None,
+            )
+            if parked is None:
+                raise ValueError(f"#{a.pr} has no blocked landing train entry")
+            path = path or parked["worktree"]
         head = owner_pr(a.pr, draft=False)["headRefOid"]
-        wt = Path(a.worktree).expanduser() if a.worktree else P.worktree(a.pr)
+        wt = Path(path).expanduser() if path else P.worktree(a.pr)
         if not wt.exists() and not wt.is_symlink():
             wt, _ = handoff_worktree(a.pr, head)
-        register(a.pr, wt, head, readd=True)
+        register(a.pr, wt, head, readd=True, blocked_only=retry)
     elif a.cmd == "remove":
         locked_json(TRAIN, lambda t: [e for e in (t or []) if e["pr"] != a.pr], [])
         print(f"#{a.pr} removed from the landing train")
