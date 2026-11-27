@@ -10,11 +10,12 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
 from landing import assert_owner, json_gh
-from runtime import P, cli, load, locked
+from runtime import P, agent_coord_status, cli, load, locked
 
 RT_NOT_ADMITTED = 75
 
@@ -209,6 +210,61 @@ def cert_args(wt, pr, target, sha, base, host):
     )
 
 
+def cert_reservation(snapshot, names, *, whole_host, long_hold_seconds):
+    """Classify a host reservation separately from ordinary cert contention."""
+    now = time.time()
+    cert_labels = {"certification", "local certification", "remote certification"}
+    holds = [
+        (lock.get("reason"), (lock.get("expires") or now) - now)
+        for name, lock in snapshot.get("locks", {}).items()
+        if name in names
+    ]
+    holds.extend(
+        (lease.get("label"), lease.get("granted", now) + lease.get("expect", 0) - now)
+        for lease in snapshot.get("leases", [])
+        if names.intersection(lease.get("locks", []))
+        or (whole_host and lease.get("exclusive"))
+    )
+    if any(
+        label not in cert_labels or remaining > long_hold_seconds
+        for label, remaining in holds
+    ):
+        return "reserved"
+    return "busy" if holds else None
+
+
+def cert_host_states(slots):
+    controller = agent_coord_status()
+    threshold = P.get("certification", "long_hold_seconds", 3600)
+    for key in slots:
+        if key not in P.hosts:
+            raise ValueError(f"unknown certification host {key!r}")
+        spec = P.hosts[key]
+        alias = spec.get("ssh")
+        names = {key, alias} if alias else {key}
+        state = cert_reservation(
+            controller, names, whole_host=not alias, long_hold_seconds=threshold
+        )
+        if state == "reserved":
+            yield key, state
+            continue
+        if not P.reachable(key):
+            yield key, "offline"
+            continue
+        if alias and spec.get("agent_coord"):
+            worker = agent_coord_status(partial(remote, key))
+            worker_lock = spec.get("cert_worker_lock")
+            remote_state = cert_reservation(
+                worker,
+                names | {worker_lock} if worker_lock else names,
+                whole_host=True,
+                long_hold_seconds=threshold,
+            )
+            if remote_state == "reserved" or state is None:
+                state = remote_state
+        yield key, state
+
+
 def certify(wt, pr, target, sha, base, _attempt=0):
     slots = P.get("certification", "slots", {}).get(target, [])
     if not slots:
@@ -239,6 +295,7 @@ def certify(wt, pr, target, sha, base, _attempt=0):
         except BlockingIOError:
             return 0
         status("queued")
+        required = target in P.get("certification", "must_run", [])
         deadline = time.monotonic() + P.get("certification", "slot_timeout", 2700)
         while host == "pending":
             waiting = {
@@ -246,35 +303,37 @@ def certify(wt, pr, target, sha, base, _attempt=0):
                 for c in load(P.data / "state.json", {}).get("certs", [])
                 if c.get("status") == "queued"
             }
-            online = [key for key in slots if P.reachable(key)]
-            if not online and target not in P.get("certification", "must_run", []):
-                # e.g. a laptop that left: hosted CI covers this platform.
-                status("skipped")
-                record("log", f"PR #{pr}: {target} cert skipped; no host online ({', '.join(slots)})")
-                return 0
-            for key in online:
+            unavailable = []
+            for key, state in cert_host_states(slots):
+                if state in {"offline", "reserved"}:
+                    unavailable.append(f"{key} ({state})")
+                    continue
+                if state == "busy":
+                    continue
                 preferred = P.hosts[key].get("cert_priority")
                 if preferred != target and preferred in waiting:
                     continue
-                try:
-                    for slot in range(P.hosts[key].get("slots", 1)):
-                        try:
-                            stack.enter_context(
-                                locked(f"cert-host-{key}-{slot}.lock", wait=False)
-                            )
-                            host = key
-                            break
-                        except BlockingIOError:
-                            continue
-                    if host != "pending":
+                for slot in range(P.hosts[key].get("slots", 1)):
+                    try:
+                        stack.enter_context(
+                            locked(f"cert-host-{key}-{slot}.lock", wait=False)
+                        )
+                        host = key
                         break
-                except KeyError:
-                    raise ValueError(f"unknown certification host {key!r}") from None
+                    except BlockingIOError:
+                        continue
+                if host != "pending":
+                    break
             if host == "pending":
-                if (
-                    target not in P.get("certification", "must_run", [])
-                    and time.monotonic() >= deadline
-                ):
+                if not required and len(unavailable) == len(slots):
+                    status("skipped")
+                    record(
+                        "log",
+                        f"PR #{pr}: {target} cert skipped; no host available "
+                        f"({', '.join(unavailable)})",
+                    )
+                    return 0
+                if not required and time.monotonic() >= deadline:
                     status("skipped")
                     return 0
                 time.sleep(30)

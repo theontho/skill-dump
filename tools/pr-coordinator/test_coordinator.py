@@ -344,6 +344,8 @@ idle_alert = false
             remote, "json_gh", lambda *a: {"headRefOid": "a" * 40}
         ), mock.patch.object(
             remote, "cert_args", lambda *a: {}
+        ), mock.patch.object(
+            remote, "agent_coord_status", return_value={}
         ), mock.patch.object(remote.time, "sleep"):
             code = remote.certify(self.root, 7, "generic", "a" * 40, "b" * 40)
         self.assertEqual(code, 0)
@@ -375,11 +377,97 @@ idle_alert = false
         ), mock.patch.object(
             remote, "record", lambda kind, *a: states.append(a[1]) if kind == "cert-state" else None
         ), mock.patch.object(remote, "run", lambda *a, **k: ran.append(a)), mock.patch.object(
+            remote, "agent_coord_status", return_value={}
+        ), mock.patch.object(
             remote.time, "sleep", side_effect=AssertionError("waited for an offline host")
         ):
             self.assertEqual(remote.certify(self.root, 7, "macos", "a" * 40, "b" * 40), 0)
         self.assertEqual(states[-1], "skipped")
         self.assertEqual(ran, [])
+
+    def test_certification_filters_reservations_before_remote_provisioning(self):
+        import remote
+        import runtime
+
+        sha = "a" * 40
+        manual = {"locks": {"mac-alias": {"reason": "whole-genome run"}}}
+        short = {"locks": {"mac-alias": {"reason": "remote certification"}}}
+        long = {
+            "leases": [
+                {"locks": ["mac-alias"], "label": "remote certification", "expect": 7200}
+            ]
+        }
+        worker = {
+            "leases": [{"locks": ["worker-cert"], "label": "benchmark", "expect": 300}]
+        }
+        cases = [
+            ("optional", [manual], {}, False, None),
+            ("long", [long], {}, False, None),
+            ("required", [manual, manual, {}], {}, True, "mac"),
+            ("alternative", [manual], {}, False, "spare"),
+            ("transient", [short, {}], {}, False, "mac"),
+            ("worker", [{}], worker, False, None),
+        ]
+        for name, controller, worker_status, required, prepared in cases:
+            with self.subTest(name):
+                slots = ["mac", "spare"] if prepared == "spare" else ["mac"]
+                self.config.write_text(f"""
+[certification]
+must_run = {json.dumps(["macos"] if required else [])}
+remote_prepare = ["prepare"]
+remote_command = ["certify"]
+[certification.slots]
+macos = {json.dumps(slots)}
+[hosts.mac]
+ssh = "mac-alias"
+agent_coord = true
+cert_worker_lock = "worker-cert"
+[hosts.spare]
+ssh = "spare"
+""")
+                project = Project("test", config_file=self.config, data_dir=self.data)
+                project.prepare()
+                snapshots = iter(controller)
+                states, events = [], []
+
+                def read_controller(argv, **kwargs):
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(next(snapshots)))
+
+                def fake_remote(host, argv, **kwargs):
+                    if argv[0] == "agent-coord":
+                        return subprocess.CompletedProcess(argv, 0, json.dumps(worker_status))
+                    events.append((host, argv[0]))
+
+                def fake_run(argv, **kwargs):
+                    events.append(("controller", argv[0]))
+                    return subprocess.CompletedProcess(argv, 0)
+
+                def fake_record(kind, *args):
+                    if kind == "cert-state":
+                        states.append(args[1])
+
+                with (
+                    mock.patch.object(remote, "P", project),
+                    mock.patch.object(runtime, "P", project),
+                    mock.patch.object(project, "reachable", return_value=True),
+                    mock.patch.object(runtime.subprocess, "run", side_effect=read_controller),
+                    mock.patch.object(remote, "remote", side_effect=fake_remote),
+                    mock.patch.object(remote, "run", side_effect=fake_run),
+                    mock.patch.object(remote, "json_gh", return_value={"headRefOid": sha}),
+                    mock.patch.object(remote, "record", side_effect=fake_record),
+                    mock.patch.object(
+                        remote.time, "sleep", side_effect=lambda _: events.append(("sleep", ""))
+                    ),
+                ):
+                    self.assertEqual(remote.certify(self.root, 7, "macos", sha, "b" * 40), 0)
+                self.assertEqual(
+                    events,
+                    [("sleep", "")] * (len(controller) - 1)
+                    + ([(prepared, "prepare"), ("controller", "certify")] if prepared else []),
+                )
+                self.assertEqual(
+                    states, ["queued", "running", "pass"] if prepared else ["queued", "skipped"]
+                )
 
     def test_optional_platform_errors_do_not_block_readiness(self):
         import drafts

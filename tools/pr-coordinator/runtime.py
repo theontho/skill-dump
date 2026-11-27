@@ -18,6 +18,26 @@ SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 REPO_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
+def agent_coord_status(runner=None):
+    """Read live reservations without acquiring a lease or running any hooks."""
+    try:
+        result = (runner or subprocess.run)(
+            ["agent-coord", "status", "--json"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            status = json.loads(result.stdout)
+            if isinstance(status, dict):
+                return status
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return {}
+
+
 def home_path(variable, fallback):
     return Path(os.environ.get(variable) or Path.home() / fallback).expanduser()
 

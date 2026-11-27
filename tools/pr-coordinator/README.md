@@ -83,11 +83,21 @@ that queue to dashboard readers but does not put it in the owner answer form.
   `cert_priority` for a host's preferred layer and `slots` for its concurrency.
   `shell_prefix` is an optional trusted remote shell prefix (e.g. tool PATH).
   `process_probe` and `process_probe_ssh` can supply a POSIX `ps`/load fallback.
-  Hosts that don't answer SSH within the connect timeout are skipped when
-  picking a certification slot. If none of a target's hosts is online and the
-  target isn't in `must_run`, its certification is recorded as skipped at once
-  (e.g. a laptop that left; hosted CI covers that platform). `finish-draft`
-  stops only for test failures, or for errors on `drafts.required_statuses`.
+  Before provisioning, certification checks SSH reachability and live
+  `agent-coord status --json` on the controller and on workers configured with
+  `agent_coord`. It checks locks and lease locks named for the host key or SSH
+  alias, and whole-machine exclusive leases on the selected machine. A worker
+  can also define `cert_worker_lock` for a project-specific lock on that worker.
+  Non-certification holders and holds expected to last more than
+  `certification.long_hold_seconds` (3600 by default) make a host unavailable.
+  Holds labeled `certification`, `local certification`, or `remote certification`
+  with no long estimate are ordinary contention: wait for a slot without
+  provisioning. If every configured host is reserved or offline, optional
+  targets skip immediately (hosted CI covers them); `must_run` targets keep
+  checking. Availability is re-evaluated without changing `certification.slots`.
+  If `agent-coord` is unavailable, SSH reachability and controller busy retries
+  still apply. `finish-draft` stops only for test failures, or for errors on
+  `drafts.required_statuses`.
 - **Certification:** `certification.slots` maps targets to ordered host keys.
   `local_command` runs in the selected worktree. `remote_command` also runs
   on the controller, and should invoke the project's remote controller with
