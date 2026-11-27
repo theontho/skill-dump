@@ -777,6 +777,57 @@ expected_burn_usd_per_day = 10
         self.assertTrue(snapshot["reachable"])
         self.assertEqual([(row["state"], row["label"]) for row in snapshot["leases"]], [("held", "dev: download")])
 
+    def test_issue_36_controller_lock_keeps_macbook_without_agent_coord_busy(self):
+        import collect_hosts
+        from events import idle_hosts
+
+        project = self.idle_project(threshold_override=1)
+        project.prepare()
+        project.hosts.clear()
+        project.hosts.update(
+            macbook={
+                "ssh": "macbook",
+                "aliases": ["mahyar-pro-14"],
+                "process_probe": "ps",
+            },
+            worker={"ssh": "worker", "process_probe": "ps"},
+        )
+        snapshot = json.loads((TOOL / "fixtures/controller-reserved-host.json").read_text())
+
+        def probe(argv, *, timeout):
+            if argv[0] == "agent-coord":
+                return json.dumps(snapshot)
+            self.assertEqual(argv[-1], "ps")  # Neither worker has local agent-coord.
+            return "0.1 0.1 0.1\n"
+
+        path = project.data / "state.json"
+        with (
+            mock.patch.object(collect_hosts, "P", project),
+            mock.patch.object(collect_hosts, "HERE", project.data),
+            mock.patch.object(collect_hosts, "run", side_effect=probe),
+            mock.patch.object(collect_hosts.time, "time", side_effect=lambda: now),
+        ):
+            for now in (0, 60, 120):
+                collect_hosts.main()
+            state = json.loads(path.read_text())
+            self.assertEqual(
+                {row["name"]: row["status"] for row in state["machines"]},
+                {"macbook": "busy", "worker": "idle"},
+            )
+            self.assertEqual(
+                [key.split(":")[1] for key, _ in idle_hosts(state, project, now=120)],
+                ["worker"],
+            )
+            snapshot["locks"] = {}
+            for now in (180, 240):
+                collect_hosts.main()
+            state = json.loads(path.read_text())
+            self.assertEqual(state["host_idle"]["macbook"]["since"], 180)
+            self.assertIn(
+                "macbook",
+                {key.split(":")[1] for key, _ in idle_hosts(state, project, now=240)},
+            )
+
     def test_registered_detached_driver_prevents_idle_even_without_cpu_use(self):
         from collect_hosts import leases
         from events import idle_hosts
@@ -1640,6 +1691,10 @@ case "$*" in *failing-command) exit 42 ;; *) exit 0 ;; esac""",
         }
         with (
             mock.patch("runtime.P", project),
+            mock.patch(
+                "stack_landing.gh",
+                return_value=subprocess.CompletedProcess([], 0, "HTTP/2 200 OK\n\n[]", ""),
+            ),
             mock.patch.object(train, "P", project),
             mock.patch.object(landing, "P", project),
             mock.patch.object(landing, "review", return_value=row) as read,
@@ -1767,6 +1822,9 @@ head = os.environ["TEST_PR_HEAD"]
 p = Path({str(state)!r})
 if kind == "pr" and action == "view":
     data = {{"state": "MERGED" if p.exists() else "OPEN", "headRefOid": head}}
+elif kind == "api" and sys.argv[-1].endswith("/stacks?pull_request=7"):
+    print("HTTP/2 200 OK\\n")
+    data = []
 elif kind == "api" and action == "graphql":
     pull = {{"mergeQueueEntry": None, "isDraft": False, "baseRefName": "trunk",
         "state": "OPEN", "author": {{"login": "owner"}}, "isCrossRepository": False,

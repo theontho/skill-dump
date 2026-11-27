@@ -387,6 +387,12 @@ def page():
             icon = ""
         gh = []
         if t and stage not in ("merged", "closed"):
+            if stack := t.get("stack"):
+                gh.append(
+                    "stack membership unknown"
+                    if stack.get("unknown")
+                    else f"stack #{stack['number']} ({stack['position']}/{stack['size']})"
+                )
             gh.append((t.get("merge") or "").lower())
             if t.get("queue"):
                 gh.append("queue: " + t["queue"].lower())

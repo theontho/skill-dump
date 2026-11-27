@@ -17,6 +17,7 @@ LEASE = re.compile(
     r"^\s+(L\d+)\s+(held|waiting)\s+([\d.]+)"
     r"(?: cores|-core cap(?:, [\d.]+ used)?)\s+([\d.]+G)\s+(\d+) min\s+(.*)$"
 )
+HOST_LOCK = re.compile(r"^\s+lock\s+(\S+)\s+\d+\s+min\b")
 
 
 def run(cmd, timeout=40):
@@ -55,8 +56,17 @@ def leases(prefix):
             for x in snapshot.get(key, [])
         ]
         busy = snapshot.get("busy_cores")
-        return {"leases": rows, "summary": f"cores busy now (measured): {busy:g}"
-                if busy is not None else "", "reachable": True}
+        lock_names = set(snapshot.get("locks", {}))
+        for lease in snapshot["leases"]:
+            lock_names.update(lease.get("locks", []))
+        return {
+            "leases": rows,
+            "locks": sorted(lock_names),
+            "summary": f"cores busy now (measured): {busy:g}"
+            if busy is not None
+            else "",
+            "reachable": True,
+        }
     # Old hosts may not accept --json. If they returned text anyway, use it;
     # otherwise retry the legacy command with only a short probe.
     if not out:
@@ -80,7 +90,8 @@ def leases(prefix):
                     "label": label,
                 }
             )
-    return {"leases": rows, "summary": summary, "reachable": bool(out)}
+    locks = [match[1] for line in out.splitlines() if (match := HOST_LOCK.match(line))]
+    return {"leases": rows, "locks": locks, "summary": summary, "reachable": bool(out)}
 
 
 def process_probe(host, probe, *, timeout=40):
@@ -120,9 +131,16 @@ def process_probe(host, probe, *, timeout=40):
 
 def main():
     hosts = {}
+    controller = None
     for key, host in P.hosts.items():
         if host.get("agent_coord"):
-            hosts[key] = leases(P.ssh(key) or None)
+            ssh = P.ssh(key)
+            if ssh:
+                hosts[key] = leases(ssh)
+            else:
+                if controller is None:
+                    controller = leases(None)
+                hosts[key] = controller
             if not hosts[key]["reachable"] and host.get("process_probe"):
                 hosts[key] = process_probe(key, host["process_probe"], timeout=5)
                 hosts[key]["activity_known"] = False
@@ -130,11 +148,14 @@ def main():
             hosts[key] = process_probe(key, host["process_probe"])
         else:
             hosts[key] = {"reachable": P.reachable(key)}
+    if controller is None and hosts:
+        controller = leases(None)
     with (HERE / "state.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = HERE / "state.json"
         state = load(path, {"prs": [], "machines": [], "log": []})
         state["hosts"] = hosts
+        state["controller_locks"] = (controller or {}).get("locks", [])
         now = time.time()
         state["hosts_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
         derive_machines(state, P.hosts, update_idle(state, P, observed_at=now))

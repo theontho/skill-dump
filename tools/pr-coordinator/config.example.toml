@@ -43,6 +43,8 @@ hold_seconds = 7200
 
 [landing]
 merge_flags = ["--squash", "--auto"]
+stack_merge_action = "merge_queue" # use "direct_merge" only for a base without a queue
+# stack_merge_method = "squash"  # optional, for direct_merge only
 required_checks = ["required"]
 aggregate_checks = ["required"]
 require_approval = false
@@ -104,6 +106,7 @@ cert_log = "out/certify/*/*/run.log"
 
 [hosts.worker]
 ssh = "worker-alias"
+# aliases = ["worker-hardware-name"]  # additional names for controller-side reservations
 # idle_alert = false  # suppress idle events for a dedicated host
 checkout = "~/src/project"
 platform = "linux-x64"

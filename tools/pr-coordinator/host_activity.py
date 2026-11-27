@@ -9,7 +9,7 @@ def probe_window(project):
 
 
 def busy_hosts(state, hosts):
-    active = {
+    active = {name.casefold() for name in state.get("controller_locks", [])} | {
         row["machine"].strip().casefold()
         for row in state.get("agents", [])
         if row.get("machine") and row.get("status") in {"working", "waiting"}
@@ -27,7 +27,13 @@ def busy_hosts(state, hosts):
         if key in running
         or any(
             alias.strip().casefold() in active
-            for alias in (key, spec.get("display"), spec.get("ssh"))
+            for alias in (
+                key,
+                spec.get("display"),
+                spec.get("ssh"),
+                spec.get("process_probe_ssh"),
+                *spec.get("aliases", []),
+            )
             if alias
         )
         or any(

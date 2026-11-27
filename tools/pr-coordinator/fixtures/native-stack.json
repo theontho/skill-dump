@@ -1,0 +1,45 @@
+{
+  "stack": {
+    "number": 42,
+    "base": {"ref": "main"},
+    "open": true,
+    "pull_requests": [
+      {
+        "number": 101, "state": "open", "draft": false, "merged_at": null,
+        "head": {"ref": "user-model", "sha": "6358cd125586d9def8c3e5943f23506202da81cc"},
+        "base": {"ref": "main"}
+      },
+      {
+        "number": 102, "state": "open", "draft": true, "merged_at": null,
+        "head": {"ref": "user-api", "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e"},
+        "base": {"ref": "user-model"}
+      }
+    ]
+  },
+  "pending": {
+    "status": "pending",
+    "details": {
+      "message": "Merge request enqueued.",
+      "uuid": "630b9d5e-3f2a-4f7e-8b0c-2d5f9a8c1e42",
+      "merge_method": "default",
+      "merge_action": "merge_queue",
+      "expected_head_sha": "6358cd125586d9def8c3e5943f23506202da81cc"
+    }
+  },
+  "enqueued": {
+    "status": "enqueued",
+    "details": {"message": "Pull request is in the merge queue."}
+  },
+  "merged": {
+    "status": "merged",
+    "details": {
+      "message": "Pull request was merged.",
+      "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e"
+    }
+  },
+  "failed": {
+    "status": "failed",
+    "details": {"message": "Merge conflict: the pull request could not be merged."}
+  },
+  "unavailable": {"message": "Not Found"}
+}

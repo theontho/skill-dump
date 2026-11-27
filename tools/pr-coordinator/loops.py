@@ -76,8 +76,11 @@ def queue_event(number):
 
 
 def priority_pr(n, current):
+    from stack_landing import membership
     from train import only_cancelled_run
 
+    if membership(n) is not None:
+        return  # Do not dequeue or jump only one member of a native stack.
     tags = labels(current)
     entry = current["mergeQueueEntry"]
     authorized = P.land_asap in tags or current["autoMergeRequest"] or entry

@@ -18,17 +18,21 @@ from cert_policy import (
 from landing import assert_owner, json_gh, labels, paused, review
 from reconcile import cert_pid
 from runtime import P, cli, gh, load, locked, save
+from stack_landing import lookup
 from worktrees import prepare
 
 
 def owner_pr(pr, *, draft):
     row = review(pr)
+    target = row["baseRefName"]
+    if not draft and target != P.base and (stack := lookup(pr)):
+        target = stack.base
     if (
         row["state"] != "OPEN"
         or row["isDraft"] != draft
         or (row["author"] or {}).get("login") != P.owner
         or row["isCrossRepository"]
-        or row["baseRefName"] != P.base
+        or target != P.base
         or row["labels"]["pageInfo"]["hasNextPage"]
         or P.hands_off in labels(row)
     ):

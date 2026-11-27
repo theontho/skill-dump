@@ -117,6 +117,13 @@ class Project:
         for key, host in self.hosts.items():
             if not SLUG.fullmatch(key) or not isinstance(host, dict):
                 raise ValueError(f"invalid host entry: {key!r}")
+            aliases = host.get("aliases", [])
+            if not isinstance(aliases, list) or not all(
+                isinstance(alias, str) and alias.strip() for alias in aliases
+            ):
+                raise ValueError(
+                    f"invalid aliases for {key}: expected an array of names"
+                )
             for field in ("ssh", "process_probe_ssh"):
                 if field in host and (
                     not isinstance(host[field], str)

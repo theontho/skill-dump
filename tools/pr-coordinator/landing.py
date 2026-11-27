@@ -4,6 +4,7 @@ import json
 import subprocess
 from enum import Enum, auto
 
+import stack_landing as stacks
 from runtime import P, gh
 
 
@@ -95,7 +96,7 @@ def checks(number):
 def review(number):
     return pull(
         number,
-        "id state isDraft author{login} isCrossRepository baseRefName headRefOid "
+        "id state isDraft author{login} isCrossRepository baseRefName headRefName headRefOid "
         "mergeable mergeStateStatus reviewDecision mergeQueueEntry{position} autoMergeRequest{enabledAt} "
         "labels(first:100){nodes{name} pageInfo{hasNextPage}} "
         "reviewRequests(first:100){nodes{requestedReviewer{... on Bot{login} ... on User{login}}} "
@@ -108,12 +109,12 @@ def labels(info):
     return {entry["name"] for entry in info["labels"]["nodes"]}
 
 
-def eligible(info, *, owned=True):
+def eligible(info, *, owned=True, stack=None):
     if (
         not info
         or info["state"] != "OPEN"
         or info["isDraft"]
-        or info["baseRefName"] != P.base
+        or (stack.base if stack else info["baseRefName"]) != P.base
     ):
         return False
     if info["labels"]["pageInfo"]["hasNextPage"] or P.hands_off in labels(info):
@@ -159,10 +160,141 @@ def enqueue(number, head, *, priority=False):
     return outcome is EnqueueResult.QUEUED
 
 
-def enqueue_result(number, head, *, priority=False):
+def stack_action(stack):
+    action = P.get("landing", "stack_merge_action", "merge_queue")
+    if action not in ("merge_queue", "direct_merge"):
+        raise stacks.StackError(
+            "landing.stack_merge_action must be merge_queue or direct_merge"
+        )
+    if stack.base != P.base:
+        raise stacks.StackError(
+            f"stack #{stack.number} targets unexpected base {stack.base!r}"
+        )
+    try:
+        queue = query(f"mergeQueue(branch:{json.dumps(stack.base)}){{id}}")[
+            "mergeQueue"
+        ]
+    except (RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        raise stacks.StackError(
+            f"cannot determine merge queue for {stack.base}: {exc}"
+        ) from exc
+    if (queue is not None) != (action == "merge_queue"):
+        raise stacks.StackError(
+            f"landing.stack_merge_action does not match the queue on {stack.base}"
+        )
+    if action == "merge_queue":
+        return action, None
+    allowed = stacks.read("")
+    method = P.get("landing", "stack_merge_method")
+    if method is None:
+        try:
+            preference = query("viewerDefaultMergeMethod")[
+                "viewerDefaultMergeMethod"
+            ].lower()
+        except (
+            RuntimeError,
+            ValueError,
+            KeyError,
+            AttributeError,
+            subprocess.SubprocessError,
+        ):
+            preference = None
+        methods = (preference, "merge", "squash", "rebase")
+    else:
+        methods = (method,)
+    for candidate in methods:
+        if (
+            candidate in ("merge", "squash", "rebase")
+            and allowed.get(f"allow_{candidate}_merge") is True
+        ):
+            return action, candidate
+    raise stacks.StackError("no allowed direct stack merge method")
+
+
+def stack_enqueue(pr, head, stack, info, active):
+    action, method = stack_action(stack)
+
+    def preflight():
+        fresh = stacks.lookup(pr)
+        if fresh is None or (fresh.number, fresh.base, fresh.prefix) != (
+            stack.number,
+            stack.base,
+            stack.prefix,
+        ):
+            raise stacks.StackError("stack prefix changed before submission")
+        for lower in fresh.prefix[:-1]:
+            if review(lower["number"])["state"] != "MERGED":
+                raise stacks.StackError(
+                    f"lower stack PR #{lower['number']} is not merged"
+                )
+        boundary = fresh.prefix[-1]
+        boundary_head = boundary.get("head") or {}
+        current = review(pr)
+        if (
+            not eligible(current, stack=fresh)
+            or not reviewed(current)
+            or not mergeable(current)
+            or current["mergeQueueEntry"]
+            or current["autoMergeRequest"]
+            or current["headRefOid"] != head
+            or current["headRefName"] != info["headRefName"]
+            or current["baseRefName"] != info["baseRefName"]
+            or boundary.get("state") != "open"
+            or boundary.get("draft") is not False
+            or boundary_head.get("ref") != current["headRefName"]
+            or boundary_head.get("sha") != head
+            or paused()
+            or not active()
+        ):
+            raise stacks.StackError(
+                "stack boundary changed or is no longer safe to submit"
+            )
+
+    state, record = stacks.merge(pr, head, stack, action, method, preflight=preflight)
+    if state == "enqueued" and action != "merge_queue":
+        raise stacks.StackError(
+            f"unexpected queue result for direct stack merge; record: {record}"
+        )
+    fresh = stacks.detail(stack.number, pr)
+    if [row["number"] for row in fresh.prefix] != [
+        row["number"] for row in stack.prefix
+    ]:
+        raise stacks.StackError(
+            f"stack prefix changed after merge-async; record: {record}"
+        )
+    for member in fresh.prefix:
+        current = review(member["number"])
+        if current["state"] != "MERGED" and not (
+            state == "enqueued"
+            and member["number"] == pr
+            and current["state"] == "OPEN"
+            and current["headRefOid"] == head
+            and current["mergeQueueEntry"]
+        ):
+            raise stacks.StackError(
+                f"could not verify #{member['number']} {state}; record: {record}"
+            )
+    remaining = ", ".join(f"#{n}" for n in fresh.upper)
+    return (
+        EnqueueResult.QUEUED,
+        "",
+        f"stack #{stack.number} {state}; upper PRs not submitted: {remaining or 'none'}; record: {record}",
+    )
+
+
+def enqueue_result(number, head, *, priority=False, active=lambda: True):
+    stack_number = stacks.membership(number)
+    if stack_number is not None and priority:
+        return EnqueueResult.STOPPED, "", "use the landing train for native stacks"
+    stack = stacks.detail(stack_number, number) if stack_number is not None else None
+    if stack and (problem := stacks.prefix_problem(stack)):
+        return EnqueueResult.STOPPED, "stack-prefix", problem
     # Check before and after the CI gate: never apply an old verdict to a new head.
     before = review(number)
-    if not eligible(before, owned=not priority) or before["headRefOid"] != head:
+    if (
+        not eligible(before, owned=not priority, stack=stack)
+        or before["headRefOid"] != head
+    ):
         return EnqueueResult.STOPPED, "", "PR head or eligibility changed"
     if not priority and paused():
         return EnqueueResult.STOPPED, "", "landing paused"
@@ -176,7 +308,7 @@ def enqueue_result(number, head, *, priority=False):
         )
     info = review(number)
     if (
-        not eligible(info, owned=not priority)
+        not eligible(info, owned=not priority, stack=stack)
         or not reviewed(info)
         or info["headRefOid"] != head
     ):
@@ -195,6 +327,16 @@ def enqueue_result(number, head, *, priority=False):
             "mergeability",
             f"PR mergeability: {info['mergeable']} ({info['mergeStateStatus']})",
         )
+    if stack:
+        if info["autoMergeRequest"]:
+            return (
+                EnqueueResult.STOPPED,
+                "stack-auto-merge",
+                "disable auto-merge before landing a stack",
+            )
+        return stack_enqueue(number, head, stack, info, active)
+    if stacks.membership(number) is not None or not active():
+        return EnqueueResult.STOPPED, "", "PR membership or train assignment changed"
     if priority:
         if P.land_asap not in labels(info):
             return EnqueueResult.STOPPED, "", "priority label removed"

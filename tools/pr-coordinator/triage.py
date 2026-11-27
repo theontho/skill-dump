@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 from runtime import P, gh_argv
+from stack_landing import StackError, membership_row, parse_stack
 
 Q = """
 query($n:Int!){repository(owner:"__OWNER__",name:"__REPO__"){pullRequest(number:$n){
@@ -62,11 +63,23 @@ def info(n):
             if lab["name"].startswith(P.get("labels", "machine_prefix", "machine-"))
         }
     )
+    stack = None
+    try:
+        if (row := membership_row(n)) is not None:
+            found = parse_stack(row, row["number"], n)
+            stack = {
+                "number": found.number,
+                "position": found.position,
+                "size": len(found.members),
+            }
+    except StackError:
+        stack = {"unknown": True}
     return {
         "n": n,
         "author": (d.get("author") or {}).get("login"),
         "title": d["title"][:60],
         "draft": d["isDraft"],
+        "stack": stack,
         "merge": d["mergeStateStatus"],
         "mergeable": d["mergeable"],
         "head": head[:9],

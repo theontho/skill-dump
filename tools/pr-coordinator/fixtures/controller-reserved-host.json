@@ -1,0 +1,6 @@
+{
+  "leases": [],
+  "queue": [{"id": "L22", "cores": 1, "mem": 536870912, "agent": "dev", "label": "waiting", "locks": ["worker"]}],
+  "busy_cores": 0.1,
+  "locks": {"mahyar-pro-14": {"since": 1795804200, "agent": "coordinator", "reason": "imputation driver"}}
+}

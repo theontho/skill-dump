@@ -24,6 +24,10 @@ manual selection), and self-review the whole diff. Bound command timeouts;
 batch all threads and CI fixes into one push per round. Escalate at three
 Copilot rounds instead of repeating the loop.
 
+Base new PRs on the project's base branch or deliberately register a native
+stack when they depend on an unmerged PR. Hand stack members to the train from
+the bottom up; never enable auto-merge on them.
+
 Queue numbered decisions with `coord-remote ask` or `pr-coord ask`: give context,
 options with consequences, a recommendation, a default and what it blocks.
 Continue on a reversible default or park only the affected action and do other

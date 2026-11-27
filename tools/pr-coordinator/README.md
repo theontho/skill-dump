@@ -146,9 +146,12 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
 - **Idle hosts:** `[events] idle_minutes` (default `45`) is the minimum time a
   host must be observed reachable without working or waiting dashboard agents,
   held `agent-coord` leases (including PID-file or unit holds during a restart),
-  queued detached drivers, heavy processes from a configured process probe, or
-  running certifications or remote tests. Report agents with
-  `pr-coord agent NAME STATUS --machine HOST` using the host key, display name,
+  queued detached drivers, heavy processes from a configured process probe,
+  coordinator-side reservations, or running certifications or remote tests. A
+  controller's named lock or held lease lock counts as activity for a host when
+  its name matches the host key, display, SSH/process probe alias, or an entry in
+  `[hosts.HOST] aliases`. The worker does not need its own `agent-coord`.
+  Report agents with `pr-coord agent NAME STATUS --machine HOST` using the host key, display name,
   or SSH alias. The host collector supplies the observations; `event-collect` does
   not probe the hosts itself. Enable `agent_coord = true` on hosts whose leases
   should be collected; hosts without a workload probe get a reachability check.
@@ -171,7 +174,19 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
   run selection and superseded attempts. Without it, every returned job must
   pass or skip and all `required_checks` must pass. `aggregate_checks` lists
   failing rollups that do not block a cancellation-only retry. `merge_flags`
-  must use `--auto`, never `--admin`. `provision`, `regenerate`, `quick_gate`,
+  must use `--auto`, never `--admin`, and apply only to standalone PRs.
+  Native stacks use `merge-async` with the exact ready head and
+  `landing.stack_merge_action` (`merge_queue` by default; use `direct_merge` only
+  when the configured ultimate base doesn't use a queue). For direct merges,
+  `stack_merge_method` can select an allowed repository method. The train lands
+  only the requested boundary PR after all lower members are merged; it never
+  modifies upper PRs. Land from the bottom up. Unknown stack membership stops
+  landing rather than falling back to auto-merge. Operation UUIDs and outcomes
+  are recorded in `logs/stack-merge-PR-HEAD.json` under the project state directory.
+  A pending operation can be followed again without resubmitting; diagnose
+  failed or indeterminate submissions from their record before retrying.
+  The dashboard shows stack positions, including drafts.
+  `provision`, `regenerate`, `quick_gate`,
   `quick_tests`, `quick_host`, `quick_local_prefix`, and `ci_capacity` are
   opt-in commands. Quick tests absent in the refreshed worktree are omitted.
   `quick_host` uses `rt --admit-now` and falls back to `quick_local_prefix`

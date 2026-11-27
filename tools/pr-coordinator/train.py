@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+import stack_landing as stacks
 from landing import (
     EnqueueResult,
     assert_owner,
@@ -152,13 +153,20 @@ def enqueue_checked(n, head, active=lambda: True):
             return False
         action.check()
         try:
-            outcome, kind, detail = enqueue_result(n, head)
+            outcome, kind, detail = enqueue_result(n, head, active=active)
+        except stacks.StackError as exc:
+            log = action.failed("native-stack", exc)
+            raise RetryLimit(f"Native stack landing stopped: {exc}; log {log}") from exc
         except ACTION_ERRORS as exc:
             action.failed(error_class(exc), exc)
             raise
         if outcome is EnqueueResult.QUEUED:
+            if detail:
+                sh([*cli(), "log", f"train #{n}: {detail}"])
             return True
         if outcome is EnqueueResult.STOPPED:
+            if kind.startswith("stack-"):
+                raise RetryLimit(detail)
             return False
         log = action.failed(kind, detail)
         if attempt == 0:
@@ -166,7 +174,7 @@ def enqueue_checked(n, head, active=lambda: True):
             if not active() or paused():
                 return False
             current = review(n)
-            if not eligible(current) or current["headRefOid"] != head:
+            if not current or current["headRefOid"] != head:
                 return False
             sh([*cli(), "log", f"train #{n}: re-checking enqueue gate once; log {log}"])
             time.sleep(P.get("landing", "enqueue_retry_seconds", 15))
@@ -685,7 +693,12 @@ def land(entry):
         entry["head"] = info["headRefOid"]
         entry["base"] = info.get("baseRefOid")
         train_retry(n, entry["head"], "land", base=entry["base"]).check()
-        if not eligible(review(n)):
+        try:
+            stack = stacks.lookup(n)
+        except stacks.StackError as exc:
+            need_agent(n, f"Could not determine stack membership: {exc}")
+            return
+        if not eligible(review(n), stack=stack):
             need_agent(
                 n,
                 f"#{n} is not an eligible ready owner PR targeting the configured base.",
@@ -699,6 +712,9 @@ def land(entry):
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 active,
             )
+            return
+        if stack and (problem := stacks.prefix_problem(stack)):
+            need_agent(n, problem)
             return
         head = info["headRefOid"]
         base, (conflicts, _) = latest_requirements(n, head)
@@ -715,6 +731,12 @@ def land(entry):
         base, (conflicts, overlap) = latest_requirements(n, head)
         if conflicts or overlap:
             if not unresolved_source_conflicts(n, wt, head, base, conflicts):
+                if stack is not None or stacks.membership(n) is not None:
+                    need_agent(
+                        n,
+                        f"#{n}: the train cannot resolve generated overlap or conflicts in a stack.",
+                    )
+                    return
                 status(n, "fixing", "refreshing required generated overlap or conflict")
                 refresh_to_draft(n, wt, info["headRefName"], head, active=active)
             return
