@@ -1030,9 +1030,10 @@ ssh = "spare"
         with (
             mock.patch.object(drafts, "P", project),
             mock.patch("runtime.P", project),
+            mock.patch("cert_policy.P", project),
             mock.patch.object(drafts, "owner_pr", return_value={"headRefOid": head}),
             mock.patch.object(drafts, "evidence", return_value=(True, {}, False)),
-            mock.patch.object(drafts, "review_state", return_value=(True, False)),
+            mock.patch.object(drafts, "review_state", return_value=drafts.ReviewState.SETTLED),
             mock.patch.object(drafts, "request_certification") as request,
             mock.patch.object(drafts.time, "sleep"),
         ):
@@ -1066,10 +1067,13 @@ ssh = "spare"
             self.assertFalse(drafts.running_certs(7, new))
 
     def fake_draft(
-        self, head, *, statuses, review_head=None, pending=False, unresolved=False, base="base"
+        self, head, *, statuses, review_head=None, pending=False, unresolved=False,
+        base="base", review_after=None,
     ):
         state = self.root / "ready"
         requests = self.root / "review-requests"
+        queries = self.root / "review-queries"
+        notes = self.root / "ready-notes"
         review = {
             "state": "OPEN",
             "baseRefName": "trunk",
@@ -1082,7 +1086,8 @@ ssh = "spare"
                 "pageInfo": {"hasNextPage": False},
             },
             "reviewRequests": {
-                "nodes": [{"id": "request"}] if pending else [],
+                "nodes": [{"requestedReviewer": {"login": "copilot-pull-request-reviewer[bot]"}}]
+                if pending else [],
                 "pageInfo": {"hasNextPage": False},
             },
             "reviewDecision": None,
@@ -1105,12 +1110,19 @@ elif args[:2] == ["pr", "view"]:
         "baseRefOid": {base!r}, "isCrossRepository": False}}))
 elif args[:2] == ["pr", "ready"]:
     state.touch()
+elif args[:2] == ["pr", "comment"]:
+    Path({str(notes)!r}).write_text(args[args.index("--body") + 1])
 elif args[:2] == ["pr", "edit"] and "@copilot" in args:
     with Path({str(requests)!r}).open("a") as log:
         log.write({head!r} + "\\n")
 elif args[1].endswith("/reviews"):
+    count_file = Path({str(queries)!r})
+    count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+    count_file.write_text(str(count))
+    after = {review_after!r}
     print(json.dumps([[{{"commit_id": {(review_head or head)!r},
-        "state": "COMMENTED", "user": {{"login": "copilot-pull-request-reviewer[bot]", "type": "Bot"}}}}]]))
+        "state": "COMMENTED", "user": {{"login": "copilot-pull-request-reviewer[bot]", "type": "Bot"}}}}]
+        if after is None or count >= after else []]))
 elif args[1].endswith("/statuses"):
     print(json.dumps([{statuses!r}]))
 elif "/actions/workflows/" in args[1]:
@@ -1125,7 +1137,7 @@ else:
         self.env["PATH"] = str(self.root) + os.pathsep + os.environ["PATH"]
         return state
 
-    def draft_config(self):
+    def draft_config(self, *, review_start_seconds=0.25, poll_seconds=0):
         gate = self.root / "gate.py"
         gate.write_text(
             "from pathlib import Path\n"
@@ -1140,7 +1152,8 @@ else:
             f.write(
                 f'\nci_capacity = [{json.dumps(sys.executable)}, {json.dumps(str(gate))}, "{{pr}}"]\n'
                 '[drafts]\nrequired_statuses = ["local-ci/generic", "local-ci/macos"]\n'
-                "idle_seconds = 0\npoll_seconds = 0\ncapacity_retry_seconds = 0\n"
+                f"idle_seconds = 0\npoll_seconds = {poll_seconds}\ncapacity_retry_seconds = 0\n"
+                f"review_start_seconds = {review_start_seconds}\n"
                 'ready_workflow = "pull_request.yml"\nready_run_timeout = 0\n'
             )
 
@@ -1193,8 +1206,56 @@ else:
             for _ in range(2):
                 result = self.command("watch-draft", "7", check=False, timeout=5)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn("exact-head review=False", result.stdout)
+                self.assertIn("review couldn't start", result.stdout)
         self.assertEqual(requests.read_text().splitlines(), ["a" * 40, "b" * 40])
+
+    def test_1632_waits_for_review_past_certification_grace_then_requests_certification(self):
+        _, head = self.create_git("feature.txt")
+        self.git("switch", "trunk")
+        base = self.git("rev-parse", "HEAD")
+        self.git("push", "origin", "feature:refs/pull/7/head")
+        self.draft_config(review_start_seconds=4, poll_seconds=0.2)
+        self.fake_draft(head, statuses=[], base=base, review_after=5)
+        with self.config.open("a") as config:
+            config.write(f"""
+[certification]
+ready_router = [{json.dumps(sys.executable)}, "-c", "import json,sys; print(json.dumps(dict(base=sys.argv[1], head=sys.argv[2], layers=['generic'])))", "{{base}}", "{{head}}"]
+[certification.slots]
+""")
+        result = self.command("watch-draft", "7", timeout=12)
+        self.assertIn("requesting certification", result.stdout)
+        self.assertIn("review and certification plan settled", result.stdout)
+        self.assertEqual((self.root / "review-requests").read_text().splitlines(), [head])
+        self.assertTrue((self.data / "cert-plans" / f"7-{head}-{base}.json").is_file())
+
+    def test_1632_timeout_accepts_recorded_independent_review_and_leaves_ready_note(self):
+        _, head = self.create_git("feature.txt")
+        self.git("switch", "trunk")
+        self.draft_config()
+        state = self.fake_draft(head, review_head="b" * 40, pending=True, statuses=[
+            {"context": "local-ci/generic", "state": "success"},
+            {"context": "local-ci/macos", "state": "success"},
+        ])
+        stale = self.command("finish-draft", "7", "--independent-review", "b" * 40, check=False)
+        self.assertIn("full published draft head SHA", stale.stdout)
+        blocked = self.command("finish-draft", "7", check=False, timeout=5)
+        self.assertIn("review couldn't start", blocked.stdout)
+        self.assertFalse(state.exists())
+        self.assertFalse((self.root / "review-requests").exists())
+        self.fake_draft(head, review_head="b" * 40, pending=True, unresolved=True, statuses=[])
+        blocked = self.command(
+            "finish-draft", "7", "--independent-review", head, check=False, timeout=5
+        )
+        self.assertIn("clear any other review blockers", blocked.stdout)
+        self.assertFalse(state.exists())
+        self.fake_draft(head, review_head="b" * 40, pending=True, statuses=[
+            {"context": "local-ci/generic", "state": "success"},
+            {"context": "local-ci/macos", "state": "success"},
+        ])
+        self.command("finish-draft", "7", "--independent-review", head, timeout=5)
+        self.assertTrue(state.exists())
+        self.assertIn(f"couldn't start before the timeout on `{head}`",
+                      (self.root / "ready-notes").read_text())
 
     def test_watch_draft_requests_only_the_missing_required_certification_target(self):
         import drafts
@@ -1214,6 +1275,7 @@ platform = "macos-arm64"
         with (
             mock.patch("runtime.P", project),
             mock.patch.object(drafts, "P", project),
+            mock.patch("cert_policy.P", project),
             mock.patch.object(drafts, "owner_pr", return_value={"headRefOid": head}),
             mock.patch.object(
                 drafts,
@@ -1221,7 +1283,7 @@ platform = "macos-arm64"
                 return_value=(True, {"local-ci/generic": "success"}, False),
             ),
             mock.patch.object(drafts, "request_certification") as request,
-            mock.patch.object(drafts, "review_state", return_value=(True, False)),
+            mock.patch.object(drafts, "review_state", return_value=drafts.ReviewState.SETTLED),
         ):
             with self.assertRaisesRegex(ValueError, "local-ci/generic"):
                 drafts.watch(7)

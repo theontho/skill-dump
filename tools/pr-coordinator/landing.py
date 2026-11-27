@@ -98,7 +98,8 @@ def review(number):
         "id state isDraft author{login} isCrossRepository baseRefName headRefOid "
         "mergeable mergeStateStatus reviewDecision mergeQueueEntry{position} autoMergeRequest{enabledAt} "
         "labels(first:100){nodes{name} pageInfo{hasNextPage}} "
-        "reviewRequests(first:100){nodes{id} pageInfo{hasNextPage}} "
+        "reviewRequests(first:100){nodes{requestedReviewer{... on Bot{login} ... on User{login}}} "
+        "pageInfo{hasNextPage}} "
         "reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}}",
     )
 

@@ -676,7 +676,7 @@ def check_cert_review(pr, head, force, *, warn=False):
         raise ValueError(
             "cert-pr needs an eligible owner PR in the configured repository"
         )
-    if not review_state(pr, head, row)[0]:
+    if not review_state(pr, head, row).settled:
         if not force:
             raise ValueError(
                 "review is unsettled on this head; use --force to override"

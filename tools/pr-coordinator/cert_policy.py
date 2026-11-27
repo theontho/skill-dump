@@ -3,15 +3,38 @@
 import json
 import re
 import subprocess
+import time
+from enum import Enum, auto
 
 from landing import json_gh, reviewed
 from runtime import P, load
 
 
+class ReviewState(Enum):
+    MISSING = auto()
+    REQUESTED = auto()
+    IN_PROGRESS = auto()
+    BLOCKED = auto()
+    SETTLED = auto()
+    START_TIMEOUT = auto()
+
+    @property
+    def settled(self):
+        return self in (self.SETTLED, self.START_TIMEOUT)
+
+
+def review_marker(pr):
+    return P.data / f"draft-prerequisites-{pr}.json"
+
+
+def review_start_seconds():
+    return P.get("drafts", "review_start_seconds", 1800)
+
+
 def review_state(pr, head, row):
-    """Return whether review is settled and whether another request is appropriate."""
+    """Resolve the current-head review gate, including recorded timeout evidence."""
     if row["headRefOid"] != head:
-        return False, False
+        return ReviewState.BLOCKED
     pattern = P.get(
         "drafts",
         "reviewer_pattern",
@@ -31,12 +54,31 @@ def review_state(pr, head, row):
         for entry in exact
     )
     requests = row.get("reviewRequests", {})
-    pending = (
-        requests.get("nodes")
-        or requests.get("pageInfo", {}).get("hasNextPage")
-        or any(entry.get("state") == "PENDING" for entry in exact)
-    )
-    return bool(accepted and not pending and reviewed(row)), not (accepted or pending)
+    nodes = requests.get("nodes", [])
+    truncated = requests.get("pageInfo", {}).get("hasNextPage")
+    in_progress = any(entry.get("state") == "PENDING" for entry in exact)
+    if in_progress or (accepted and (nodes or truncated)):
+        return ReviewState.IN_PROGRESS
+    if accepted:
+        return ReviewState.SETTLED if reviewed(row) else ReviewState.BLOCKED
+    marker = load(review_marker(pr), {})
+    since = marker.get("review_wait_since")
+    if (
+        marker.get("head") == head
+        and marker.get("independent_review")
+        and since is not None
+        and time.time() - since >= review_start_seconds()
+        and not truncated
+        and all(
+            re.fullmatch(
+                pattern, (node.get("requestedReviewer") or {}).get("login", "")
+            )
+            for node in nodes
+        )
+        and reviewed(row)
+    ):
+        return ReviewState.START_TIMEOUT
+    return ReviewState.REQUESTED if nodes or truncated else ReviewState.MISSING
 
 
 def statuses(head):

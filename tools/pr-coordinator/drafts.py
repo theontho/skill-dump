@@ -6,7 +6,15 @@ import subprocess
 import time
 from urllib.parse import quote, urlencode
 
-from cert_policy import plan_outcome, review_state, routed, statuses
+from cert_policy import (
+    ReviewState,
+    plan_outcome,
+    review_marker,
+    review_start_seconds,
+    review_state,
+    routed,
+    statuses,
+)
 from landing import assert_owner, json_gh, labels, paused, review
 from reconcile import cert_pid
 from runtime import P, cli, gh, load, locked, save
@@ -63,6 +71,9 @@ def running_certs(pr, head):
             pass
     except BlockingIOError:
         return True
+    marker = load(review_marker(pr), {})
+    if marker.get("head") == head and cert_pid(marker.get("route_attempt", {})):
+        return True
     for row in load(P.data / "state.json", {}).get("certs", []):
         if (
             row.get("pr") == pr
@@ -81,9 +92,8 @@ def running_certs(pr, head):
     return False
 
 
-def evidence(pr, head, *, row=None):
-    settled, _ = review_state(pr, head, row if row is not None else review(pr))
-    return settled, statuses(head), running_certs(pr, head)
+def evidence(pr, head, *, state):
+    return state.settled, statuses(head), running_certs(pr, head)
 
 
 def base_head(pr, head):
@@ -133,7 +143,69 @@ def request_certification(pr, head, targets):
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-        )
+        ).pid
+
+
+def await_review(pr, head):
+    with locked(f"draft-prerequisites-{pr}.lock"):
+        row = owner_pr(pr, draft=True)
+        if row["headRefOid"] != head:
+            return
+        state = review_state(pr, head, row)
+        if state.settled:
+            return
+        if state is ReviewState.BLOCKED:
+            raise ValueError(
+                f"review on {head[:9]} has unresolved threads or required approvals"
+            )
+        path = review_marker(pr)
+        marker = load(path, {})
+        if marker.get("head") != head:
+            marker = {"head": head}
+        now = time.time()
+        if "review_wait_since" not in marker:
+            marker["review_wait_since"] = now
+            save(path, marker)
+        since = marker["review_wait_since"]
+        if now - since >= review_start_seconds():
+            if state is ReviewState.IN_PROGRESS:
+                raise ValueError(
+                    f"Copilot review has not completed on {head[:9]}; a review is still in progress"
+                )
+            raise ValueError(
+                f"Copilot review couldn't start on {head[:9]} before the review-start timeout; "
+                "record a clean independent review for this head and clear any other review blockers"
+            )
+        if state is ReviewState.MISSING and not marker.get("review"):
+            reviewer = P.get("drafts", "reviewer", "@copilot")
+            gh(
+                "pr",
+                "edit",
+                str(pr),
+                "--add-reviewer",
+                reviewer,
+                check=True,
+                timeout=90,
+            )
+            marker["review"] = True
+            save(path, marker)
+            print(f"PR #{pr} head {head[:9]}: requested {reviewer} review", flush=True)
+
+
+def record_independent_review(pr, head):
+    with locked(f"draft-prerequisites-{pr}.lock"):
+        row = owner_pr(pr, draft=True)
+        if row["headRefOid"] != head:
+            raise ValueError(
+                "--independent-review must match the full published draft head SHA"
+            )
+        path = review_marker(pr)
+        marker = load(path, {})
+        if marker.get("head") != head:
+            marker = {"head": head}
+        marker["independent_review"] = True
+        save(path, marker)
+    print(f"PR #{pr} head {head[:9]}: recorded clean independent review", flush=True)
 
 
 def request_missing(pr, head, result, *, base=None):
@@ -158,15 +230,13 @@ def request_missing(pr, head, result, *, base=None):
     if accepted and (running or (base is None and statuses and not missing_targets)):
         return False
     with locked(f"draft-prerequisites-{pr}.lock"):
-        path = P.data / f"draft-prerequisites-{pr}.json"
+        path = review_marker(pr)
         marker = load(path, {})
         if marker.get("head") != head:
             marker = {"head": head}
         row = owner_pr(pr, draft=True)
         if row["headRefOid"] != head:
             return False
-        settled, may_request_review = review_state(pr, head, row)
-        request_review = may_request_review and not marker.get("review")
         requested = marker.get("cert", [])
         targets = sorted(missing_targets - set(requested))
         request_default = not statuses and not requested
@@ -175,7 +245,7 @@ def request_missing(pr, head, result, *, base=None):
             route_attempt = {}
         request_cert = (
             accepted
-            and settled
+            and review_state(pr, head, row).settled
             and not running
             and (
                 not plan_outcome(pr, head, base)
@@ -185,44 +255,25 @@ def request_missing(pr, head, result, *, base=None):
                 else request_default or targets and "*" not in requested
             )
         )
-        if not (request_review or request_cert):
+        if not request_cert or running_certs(pr, head):
             return False
-        changed = False
-        if request_review:
-            reviewer = P.get("drafts", "reviewer", "@copilot")
-            gh(
-                "pr",
-                "edit",
-                str(pr),
-                "--add-reviewer",
-                reviewer,
-                check=True,
-                timeout=90,
-            )
-            print(f"PR #{pr} head {head[:9]}: requested {reviewer} review", flush=True)
-            marker["review"] = True
-            save(path, marker)
-            changed = True
-
-        if request_cert and not running_certs(pr, head):
-            targets = [] if base is not None or request_default else targets
-            print(
-                f"PR #{pr} head {head[:9]}: requesting certification"
-                + (f" ({', '.join(targets)})" if targets else ""),
-                flush=True,
-            )
-            pid = request_certification(pr, head, targets)
-            if base is None:
-                marker["cert"] = requested + (targets or ["*"])
-            else:
-                marker["route_attempt"] = {
-                    "base": base,
-                    "pid": pid,
-                    "requests": route_attempt.get("requests", 0) + 1,
-                }
-            save(path, marker)
-            changed = True
-        return changed
+        targets = [] if base is not None or request_default else targets
+        print(
+            f"PR #{pr} head {head[:9]}: requesting certification"
+            + (f" ({', '.join(targets)})" if targets else ""),
+            flush=True,
+        )
+        pid = request_certification(pr, head, targets)
+        if base is None:
+            marker["cert"] = requested + (targets or ["*"])
+        else:
+            marker["route_attempt"] = {
+                "base": base,
+                "pid": pid,
+                "requests": route_attempt.get("requests", 0) + 1,
+            }
+        save(path, marker)
+        return True
 
 
 def watch(pr):
@@ -236,8 +287,14 @@ def watch(pr):
             raise ValueError("timed out waiting for settled review and certification")
         row = owner_pr(pr, draft=True)
         head = row["headRefOid"]
+        state = review_state(pr, head, row)
+        if not state.settled:
+            await_review(pr, head)
+            idle_since = None
+            time.sleep(interval)
+            continue
         base = base_head(pr, head) if routed() else None
-        result = evidence(pr, head, row=row)
+        result = evidence(pr, head, state=state)
         outcome = plan_outcome(pr, head, base) if base is not None else None
         if outcome == "failure":
             raise ValueError(f"local tests failed on {head[:9]}")
@@ -254,7 +311,7 @@ def watch(pr):
                 flush=True,
             )
             return head
-        accepted, statuses, running = result
+        _, statuses, running = result
         if not running and blocking(statuses):
             raise ValueError(f"certification failed on {head[:9]}: {statuses}")
         if request_missing(pr, head, result, base=base):
@@ -267,7 +324,7 @@ def watch(pr):
             if time.monotonic() - idle_since >= grace:
                 raise ValueError(
                     f"no running certification on {head[:9]}; "
-                    f"exact-head review={accepted}, statuses={statuses}"
+                    f"exact-head review settled, statuses={statuses}"
                 )
         time.sleep(interval)
 
@@ -339,7 +396,7 @@ def finish(pr):
                 if time.monotonic() >= deadline:
                     raise ValueError("timed out waiting for spare readiness capacity")
                 row = owner_pr(pr, draft=True)
-                if not review_state(pr, head, row)[0]:
+                if not review_state(pr, head, row).settled:
                     raise ValueError(
                         "draft head changed or review still needs attention"
                     )
@@ -360,11 +417,13 @@ def finish(pr):
                     if base is not None
                     else None
                 )
-                if not complete(evidence(pr, head), planned=planned):
+                state = review_state(pr, head, owner_pr(pr, draft=True))
+                if not complete(evidence(pr, head, state=state), planned=planned):
                     raise ValueError("exact-head review or certification changed")
                 wt, branch = handoff_worktree(pr, head)
                 row = owner_pr(pr, draft=True)
-                if not review_state(pr, head, row)[0] or (
+                state = review_state(pr, head, row)
+                if not state.settled or (
                     base is not None and base_head(pr, head) != base
                 ):
                     raise ValueError(
@@ -372,6 +431,21 @@ def finish(pr):
                     )
                 if paused():
                     continue
+                if state is ReviewState.START_TIMEOUT:
+                    gh(
+                        "pr",
+                        "comment",
+                        str(pr),
+                        "--body",
+                        f"(AI): Copilot review couldn't start before the timeout on `{head}`. "
+                        "Clean independent review was recorded for this head.",
+                        check=True,
+                        timeout=90,
+                    )
+                    if not review_state(pr, head, owner_pr(pr, draft=True)).settled:
+                        raise ValueError(
+                            "draft head changed or review still needs attention"
+                        )
                 since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 gh("pr", "ready", str(pr), check=True, timeout=90)
                 if workflow := P.get("drafts", "ready_workflow"):
@@ -398,11 +472,19 @@ def finish(pr):
 def main(command):
     parser = argparse.ArgumentParser()
     parser.add_argument("pr", type=int)
+    if command != "handoff":
+        parser.add_argument(
+            "--independent-review",
+            metavar="SHA",
+            help="record a completed, clean independent review of the full exact head SHA",
+        )
     args = parser.parse_args()
     if args.pr < 1:
         parser.error("provide a positive PR number")
     try:
         assert_owner()
+        if getattr(args, "independent_review", None):
+            record_independent_review(args.pr, args.independent_review)
         if command == "watch-draft":
             watch(args.pr)
             return 0

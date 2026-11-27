@@ -62,6 +62,7 @@ quick_gate = ["python3", "-m", "pytest", "-q"]
 [drafts]
 required_statuses = ["local-ci/generic", "local-ci/linux-x64"]
 # reviewer = "@copilot"
+# review_start_seconds = 1800
 # status_targets = {"local-ci/custom" = "linux"}
 # capacity_args = ["--pr", "{pr}"]
 # ready_workflow = "pull_request.yml"

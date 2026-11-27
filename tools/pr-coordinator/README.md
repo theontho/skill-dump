@@ -223,7 +223,14 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
 - **Draft handoff:** `watch-draft PR` requests Copilot review on an unreviewed
   head and requests certification only once that exact head has a submitted
   bot review, no pending review, no unresolved threads and no required approval
-  outstanding. For projects without a ready router, configure `drafts.required_statuses`
+  outstanding. Review wait is separate from certification idle time.
+  `drafts.review_start_seconds` (default 1800) bounds the wait for review.
+  If Copilot doesn't start, the owner can record a completed clean independent
+  review with `finish-draft PR --independent-review FULL_SHA`. This record
+  applies only to that head and only after the timeout. A review in progress,
+  another outstanding review request, or an actionable thread still blocks.
+  Readiness posts the timeout exception in a PR note. For projects without a
+  ready router, configure `drafts.required_statuses`
   to require particular status contexts, `drafts.status_targets` to map a
   custom context to its certification target, and `drafts.reviewer` or
   `drafts.reviewer_pattern` to change who gets requested or recognized.
