@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -791,6 +792,7 @@ def certify_route(pr, row, requested, slots, force, stack):
             reserved.clear()
     if reserved:
         check_cert_plan(pr, sha, base, force)
+        attempt_lock = threading.Lock()
 
         def execute(layer, target, host):
             phase = ""
@@ -800,18 +802,20 @@ def certify_route(pr, row, requested, slots, force, stack):
                 phase = value
 
             check_cert_plan(pr, sha, base, force)
+            with attempt_lock:
+                attempted[layer] = "started"
+                save(attempt_path, attempted)
             certify(wt, pr, target, sha, base, admitted=host, on_status=capture)
+            with attempt_lock:
+                attempted[layer] = phase
+                save(attempt_path, attempted)
             return layer, phase
 
-        attempted.update(dict.fromkeys(reserved, "started"))
-        save(attempt_path, attempted)
         with ThreadPoolExecutor(max_workers=len(reserved)) as pool:
             jobs = [
                 pool.submit(execute, layer, *job) for layer, job in reserved.items()
             ]
             outcomes = dict(job.result() for job in jobs)
-        attempted.update(outcomes)
-        save(attempt_path, attempted)
         if "fail" in outcomes.values():
             save(path, {"outcome": "failure"})
             return 1

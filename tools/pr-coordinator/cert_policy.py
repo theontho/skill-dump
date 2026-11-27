@@ -59,8 +59,8 @@ def planned_path(pr, head, base):
     return P.data / "cert-plans" / f"{pr}-{head}-{base}.json"
 
 
-def plan_finished(pr, head, base):
-    return load(planned_path(pr, head, base), {}).get("outcome") == "complete"
+def plan_outcome(pr, head, base):
+    return load(planned_path(pr, head, base), {}).get("outcome")
 
 
 def router_layers(pr, head, base):

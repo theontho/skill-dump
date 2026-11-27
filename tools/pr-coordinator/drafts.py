@@ -6,8 +6,9 @@ import subprocess
 import time
 from urllib.parse import quote, urlencode
 
-from cert_policy import plan_finished, review_state, routed, statuses
+from cert_policy import plan_outcome, review_state, routed, statuses
 from landing import assert_owner, json_gh, labels, paused, review
+from reconcile import cert_pid
 from runtime import P, cli, gh, load, locked, save
 from worktrees import prepare
 
@@ -41,10 +42,10 @@ def handoff(pr, head=None):
     return submit(pr, wt, head)
 
 
-def submit(pr, wt, head):
+def submit(pr, wt, head, *, readd=False):
     from train import register
 
-    register(pr, wt, head)
+    register(pr, wt, head, readd=readd)
     return 0
 
 
@@ -126,7 +127,7 @@ def request_certification(pr, head, targets):
     log = P.data / "logs" / f"cert-pr-{pr}-{head[:9]}-auto.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a") as out:
-        subprocess.Popen(
+        return subprocess.Popen(
             cli("cert-pr", pr, *targets, "--head", head),
             stdout=out,
             stderr=subprocess.STDOUT,
@@ -169,12 +170,17 @@ def request_missing(pr, head, result, *, base=None):
         requested = marker.get("cert", [])
         targets = sorted(missing_targets - set(requested))
         request_default = not statuses and not requested
+        route_attempt = marker.get("route_attempt", {})
+        if route_attempt.get("base") != base:
+            route_attempt = {}
         request_cert = (
             accepted
             and settled
             and not running
             and (
-                not plan_finished(pr, head, base) and marker.get("cert_base") != base
+                not plan_outcome(pr, head, base)
+                and route_attempt.get("requests", 0) < 2
+                and not cert_pid(route_attempt)
                 if base is not None
                 else request_default or targets and "*" not in requested
             )
@@ -205,11 +211,15 @@ def request_missing(pr, head, result, *, base=None):
                 + (f" ({', '.join(targets)})" if targets else ""),
                 flush=True,
             )
-            request_certification(pr, head, targets)
+            pid = request_certification(pr, head, targets)
             if base is None:
                 marker["cert"] = requested + (targets or ["*"])
             else:
-                marker["cert_base"] = base
+                marker["route_attempt"] = {
+                    "base": base,
+                    "pid": pid,
+                    "requests": route_attempt.get("requests", 0) + 1,
+                }
             save(path, marker)
             changed = True
         return changed
@@ -228,7 +238,10 @@ def watch(pr):
         head = row["headRefOid"]
         base = base_head(pr, head) if routed() else None
         result = evidence(pr, head, row=row)
-        planned = plan_finished(pr, head, base) if base is not None else None
+        outcome = plan_outcome(pr, head, base) if base is not None else None
+        if outcome == "failure":
+            raise ValueError(f"local tests failed on {head[:9]}")
+        planned = outcome == "complete" if base is not None else None
         if previous_head != head or result[2]:
             idle_since = None
         previous_head = head
@@ -342,7 +355,11 @@ def finish(pr):
                 if code:
                     raise ValueError(f"capacity gate exited {code}")
                 base = base_head(pr, head) if routed() else None
-                planned = plan_finished(pr, head, base) if base is not None else None
+                planned = (
+                    plan_outcome(pr, head, base) == "complete"
+                    if base is not None
+                    else None
+                )
                 if not complete(evidence(pr, head), planned=planned):
                     raise ValueError("exact-head review or certification changed")
                 wt, branch = handoff_worktree(pr, head)
@@ -373,7 +390,7 @@ def finish(pr):
                     raise ValueError(
                         "head changed at readiness; not submitted to train"
                     )
-                result = submit(pr, wt, head)
+                result = submit(pr, wt, head, readd=True)
                 wait_registered()
                 return result
 

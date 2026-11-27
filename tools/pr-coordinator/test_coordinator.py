@@ -1327,6 +1327,19 @@ slots = 2
         plan = json.loads((self.data / "cert-plans" / f"7-{head}-{base}.json").read_text())
         self.assertEqual(plan["hosted"], [])
 
+    def test_1632_reconcile_leaves_live_routed_certification_running(self):
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        project.prepare()
+        self.fake_gh("exit 91\n")
+        ps = self.root / "ps"
+        ps.write_text("#!/bin/sh\nprintf '%s\\n' 'python3 pr-coord --project gadgets cert-pr 7'\n")
+        ps.chmod(0o700)
+        existing = {"certs": [{"pr": 7, "target": "generic", "status": "running",
+                               "pid": 42, "sha": "a" * 40}]}
+        (self.data / "state.json").write_text(json.dumps(existing))
+        self.command("reconcile")
+        self.assertEqual(json.loads((self.data / "state.json").read_text()), existing)
+
     def test_1632_mergeable_behind_only_refreshes_for_generated_overlap(self):
         self.create_git()
         common = self.git("rev-parse", "HEAD^")

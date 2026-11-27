@@ -23,7 +23,7 @@ def cert_pid(row, *, legacy=False):
         return None
     if (
         "pr-coord" in ps.stdout
-        and " cert " in ps.stdout
+        and any(command in ps.stdout for command in (" cert ", " cert-pr "))
         and (str(P.config_file) in ps.stdout or f"--project {P.name} " in ps.stdout)
     ):
         return pid

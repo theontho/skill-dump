@@ -87,6 +87,7 @@ def main():
         for x in procs
         if len(x.split(None, 2)) == 3
     ]
+    stopped = set()
     for c in certs:
         p = by_number.get(c["pr"])
         if (
@@ -130,7 +131,7 @@ def main():
             family |= nxt
             frontier = nxt
         for pid, _, args in table:
-            if pid in family and any(
+            if pid not in stopped and pid in family and any(
                 token in args
                 for token in P.get("certification", "cancel_process_matches", [])
             ):
@@ -138,6 +139,7 @@ def main():
                     os.kill(
                         pid, signal.SIGTERM
                     )  # the controller marks the status `error` and cleans up the worker
+                    stopped.add(pid)
                     log(
                         f"stale: stopped {c['target']} certification of #{c['pr']} at {c['sha']} "
                         f"(head is now {p['headRefOid'][:9]})"
