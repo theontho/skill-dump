@@ -1,3 +1,9 @@
+After two failures with the same command, inputs and error class, stop retrying
+unchanged. Diagnose or change approach (partial repair, another source or host,
+smaller repro), or escalate with both logs. `pr-coord` refuses a third identical
+`cert`, `rt` or train attempt and points to both logs. Rerun CI only for confirmed
+infrastructure loss; file a flake issue for any rerun-only pass.
+
 For explicit multi-machine coordination (landing a PR backlog, then working
 the issue queue across machines), use the `pr-coordinator` skill and
 `pr-coord --project PROJECT status`. After the backlog lands, keep going on the

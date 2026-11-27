@@ -87,6 +87,12 @@ every machine staffed with implementer or long-run work suited to its hardware.
   get human review is not a request for changes unless project policy says
   otherwise. Stop for ownership, required approvals, policy, or source
   conflicts you can't resolve; don't stop for a busy runner.
+- After two failures with the same command, inputs and error class, don't run
+  it unchanged again. Diagnose or change approach (partial repair, another
+  source or host, smaller repro), or escalate with both logs. `pr-coord`
+  enforces this for `cert`, `rt` and train actions, pointing to both logs.
+  Rerun CI only for confirmed infrastructure loss; file a flake issue for any
+  rerun-only pass.
 - Before every push, run the nearest tests for all changed files (`pr-coord
   nearest-tests <files...>` if configured; otherwise pick them manually), plus
   required local gates. Bound command timeouts; hand off long waits instead of
@@ -107,7 +113,7 @@ every machine staffed with implementer or long-run work suited to its hardware.
   refresh, regeneration, quick checks, push, fresh CI and queue monitoring.
   Don't make further edits unless you remove it from the train and confirm
   its worker stopped. If manually landing under project policy, use `lane N`
-  and never push after enqueue. Do not retry actual failures as lost runners.
+  and never push after enqueue.
 - Set the dashboard row to `done` on handoff and leave a brief handoff with
   the head, gates, evidence paths, blockers and next action.
 
