@@ -11,6 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+if not sys.platform.startswith("linux"):
+    raise unittest.SkipTest("the agent-coord service in this checkout requires Linux")
+
 import agent_coord as ac
 
 GIB = 1024**3
