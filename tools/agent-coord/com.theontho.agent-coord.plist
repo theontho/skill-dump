@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Managed by skill-dump; edits are overwritten. -->
+  <key>Label</key><string>com.theontho.agent-coord</string>
+  <key>ProgramArguments</key>
+  <array><string>{{SKILL_DUMP_HOME}}/tools/agent-coord/agent_coord.py</string><string>serve</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{{HOME}}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>Umask</key><integer>63</integer>
+</dict>
+</plist>

@@ -141,12 +141,14 @@ def reachable_idle_hosts(state, project, *, now):
     if observed is None or not 0 <= now - observed <= probe_window(project):
         return []
     busy = busy_hosts(state, project.hosts)
+    hosts = state.get("hosts", {})
     return [
         key
         for key, spec in project.hosts.items()
         if spec.get("idle_alert", True)
         and key not in busy
-        and state.get("hosts", {}).get(key, {}).get("reachable")
+        and hosts.get(key, {}).get("reachable")
+        and hosts[key].get("activity_known", True)
     ]
 
 

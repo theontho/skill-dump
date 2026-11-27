@@ -31,7 +31,7 @@ def busy_hosts(state, hosts):
             if alias
         )
         or any(
-            row.get("state") in {"held", "running"}
+            row.get("state") in {"held", "running"} or row.get("detached")
             for row in live.get(key, {}).get("leases", [])
         )
     }
@@ -52,7 +52,8 @@ def update_idle(state, project, *, observed_at=None):
                 episode.pop("since", None)
         state["hosts_observed_at"] = observed_at
         for key in hosts.keys() - busy:
-            if state["hosts"].get(key, {}).get("reachable"):
+            observation = state["hosts"].get(key, {})
+            if observation.get("reachable") and observation.get("activity_known", True):
                 episode = idle.setdefault(key, {})
                 if "since" not in episode:
                     episode["since"] = observed_at

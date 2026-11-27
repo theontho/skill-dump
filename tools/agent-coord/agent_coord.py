@@ -1,42 +1,58 @@
 #!/usr/bin/env python3
 """agent-coord: a local coordinator for the agents (and people) on this computer.
 
-A user service (agent-coord.service) keeps the state; agents talk to it with
-this same file as a CLI. It hands out CPU/RAM leases first come, first served
-(running QEMU guests count at their measured use), so heavy jobs queue instead
-of piling up, and it carries messages between agents.
+A user service keeps the state; agents talk to it with this same file as a
+CLI. It hands out CPU/RAM leases first come, first served (running QEMU guests
+count at their measured use), so heavy jobs queue instead of piling up, and it
+carries messages between agents.
+
+On Linux the service is agent-coord.service (systemd user unit) on a Unix
+socket. On Windows it is a background process on a loopback TCP port, found
+through a token-protected endpoint file, started on demand by the CLI (and at
+logon after "agent-coord service install").
 """
 
 import argparse
+import hmac
 import json
 import math
 import os
+import plistlib
 import re
+import secrets
 import shutil
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+WINDOWS = sys.platform == "win32"
+DARWIN = sys.platform == "darwin"
+if DARWIN:
+    try:
+        import psutil
+    except ImportError:
+        raise SystemExit("agent-coord on macOS requires psutil in the Python environment running it.") from None
+
 # Tests and throwaway trials only: AGENT_COORD_RUNTIME_DIR and
 # AGENT_COORD_STATE_DIR point an instance at its own socket, state and history.
 # Set for the shared service, it would start from an empty state.
-RUNTIME = Path(
-    os.environ.get("AGENT_COORD_RUNTIME_DIR")
-    or Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord"
-)
-SOCKET = RUNTIME / "sock"
-STATE_FILE = (
-    Path(
-        os.environ.get("AGENT_COORD_STATE_DIR")
-        or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agent-coord"
-    )
-    / "state.json"
-)
+if WINDOWS:
+    _state_home = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    _runtime = _state_home / "agent-coord"
+else:
+    _state_home = Path.home() / ".local/state"
+    _runtime = (Path.home() / ".agent-coord" if DARWIN else
+                Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "agent-coord")
+RUNTIME = Path(os.environ.get("AGENT_COORD_RUNTIME_DIR") or _runtime)
+SOCKET = RUNTIME / ("endpoint.json" if WINDOWS else "sock")
+STATE_FILE = Path(os.environ.get("AGENT_COORD_STATE_DIR") or
+                  Path(os.environ.get("XDG_STATE_HOME") or _state_home) / "agent-coord") / "state.json"
 # One JSON line per lease event, next to the state; rotated by size.
 HISTORY_FILE = STATE_FILE.with_name("history.jsonl")
 HISTORY_MAX_BYTES = 8 * 1024**2
@@ -72,6 +88,11 @@ STUCK_AFTER = 120
 # Kept free on every disk beyond all reservations.
 DISK_MARGIN = 20 * 1024**3
 MAX_MESSAGES = 1000
+RESTART_GRACE = 120
+TRACK_INTERVAL = 5
+EXCLUSIVE_IDLE_AFTER = 15 * 60
+EXCLUSIVE_SAMPLE = 30
+UNIT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,199}\Z")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -120,17 +141,21 @@ QUOTA
   agent-coord check [--io] [--cores N] [--mem SIZE] [--exclusive | --exclusive-lock NAME]
       Exit 0 if a lease that size would start now, else 1 with the reason.
   agent-coord run [--io] [--cores N] [--mem SIZE] --label TEXT [--exclusive | --exclusive-lock NAME]
-                  [--headroom N] [--expect D] [--max-wait D] -- CMD ...
+                  [--headroom N] [--expect D] [--max-wait D] [--detach --unit NAME] -- CMD ...
       Wait in line until N cores and SIZE of RAM are free, then run CMD capped
       at them (systemd scope: CPUQuota, MemoryMax; exceeding MemoryMax kills
-      CMD) at nice 19 and idle IO priority. CMD sees COMPUTE_LEASE_CORES=N:
+      CMD) at nice 19 and idle IO priority. On Windows CMD runs in a job object
+      (hard CPU rate cap, job memory limit, idle priority; allocations past the
+      limit fail). CMD sees COMPUTE_LEASE_CORES=N:
       give its tools that many threads. The lease ends when CMD exits.
-  agent-coord hold [--io] [--cores N] [--mem SIZE] --label TEXT --pid PID [--exclusive]
+  agent-coord hold [--io] [--cores N] [--mem SIZE] --label TEXT
+                   [--pid PID] [--pidfile PATH] [--unit NAME] [--exclusive]
       Register a job that is already running (no waiting: it is running),
       until PID exits. Prints the lease ID. Holding a VM's qemu PID replaces
-      its measured use with the lease.
+      its measured use with the lease. A PID file or unit follows restarts.
   agent-coord hold --label watch:NAME --pid PID --owner-pid PID --expect D
       Register a watcher without a compute lease. D is a hard expiry.
+  agent-coord poll ID [--json]   Track a lease across process restarts.
   agent-coord release ID
   --io          For downloads, uploads and disk streaming: count measured CPU
                 use, even during warmup. Defaults to 1 core and 512M; both
@@ -160,6 +185,9 @@ QUOTA
                 the lease; waits while anyone else holds it. Repeatable.
 
 RESOURCES
+  agent-coord phase [ID] (--exclusive-lock NAME | --release NAME)
+      Acquire or release an exclusive lock on a running lease. Without ID,
+      use the enclosing run. Acquisition fails if the lock or capacity is busy.
   agent-coord lock NAME --reason TEXT [--pid PID] [--ttl D]
       Own NAME (a VM, the GPU, the NAS link ...) until unlock, PID exits or
       D passes. Fails if someone else holds it.
@@ -173,7 +201,7 @@ MESSAGES
   agent-coord inbox [--wait D] [--all]     Unread messages (then marked read).
   agent-coord agents                       Agents seen, newest first.
 
-  agent-coord status [--json]              Leases, line, VMs, free capacity.
+  agent-coord status [--json]              Leases, line, warnings, free capacity.
   agent-coord history [--since D] [--json] Lease events (requested, waiting,
                                            started, ended, cancelled) with
                                            wait/run times and measured peaks
@@ -182,9 +210,14 @@ MESSAGES
       Per label starting with PREFIX: measured memory and CPU peaks of its
       last N (10) runs in D (30 days), and --mem suggested as peak + 15%.
 
+SERVICE (Windows; on Linux use systemctl --user ... agent-coord)
+  agent-coord service install|uninstall|start|stop|restart|status
+      install starts the service at logon (HKCU Run key) and now. Without it,
+      the CLI starts the service on demand.
+
 Lease anything using more than 2 cores or 2 GB for more than a few minutes.
 Running QEMU guests and other unleased load are measured and counted. --as NAME sets who you are
-(default: your git worktree's folder name). Sizes: 512M, 8G.
+(default: $AGENT_COORD_AS, else your git worktree's folder name). Sizes: 512M, 8G.
 """
 
 
@@ -225,6 +258,8 @@ def exclusive_mode(x: dict) -> str | None:
 
 
 def alive(pid: int) -> bool:
+    if not 0 < pid < 2**31:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -267,7 +302,62 @@ def signal_watcher(pid: int, start: str, sig: int) -> None:
             os.close(fd)
 
 
+def unit_name(name: str) -> str:
+    if not UNIT_NAME.fullmatch(name):
+        raise ValueError("unit name must contain only letters, digits, '.', '_', '@' or '-'")
+    if sys.platform.startswith("linux") and not name.endswith(".service"):
+        name += ".service"
+    return name
+
+
+def unit_pid(name: str) -> int:
+    if sys.platform.startswith("linux"):
+        cmd = ["systemctl", "--user", "show", "--property=MainPID", "--value", "--", name]
+        pattern = r"\s*(\d+)\s*"
+    elif sys.platform == "darwin":
+        cmd = ["launchctl", "print", f"gui/{os.getuid()}/{name}"]
+        pattern = r"(?m)^\s*pid = (\d+)\s*$"
+    else:
+        return 0
+    try:
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    match = re.search(pattern, output)
+    return int(match[1]) if match else 0
+
+
+def read_pidfile(path: str) -> int:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, encoding="ascii") as f:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return 0
+            text = f.read(32).strip()
+        pid = int(text) if text.isascii() and text.isdigit() else 0
+        return pid if 0 < pid < 2**31 else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def gpu_utilization() -> float | None:
+    """Max device utilization; a busy device or unknown reading is not idle."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL, timeout=2,
+        )
+        values = [float(line) for line in out.splitlines()]
+        if values and all(0 <= value <= 100 for value in values):
+            return max(values)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def mem_total() -> int:
+    if DARWIN:
+        return psutil.virtual_memory().total
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemTotal:"):
             return int(line.split()[1]) * 1024
@@ -279,6 +369,12 @@ def capacity() -> tuple[float, int]:
 
 
 def _cpu_seconds(pid: int, include_children: bool = False) -> float | None:
+    if DARWIN:
+        try:
+            counts = psutil.Process(pid).cpu_times()
+            return counts.user + counts.system
+        except psutil.Error:
+            return None
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     except OSError:
@@ -289,6 +385,11 @@ def _cpu_seconds(pid: int, include_children: bool = False) -> float | None:
 
 def _footprint(pid: int) -> int:
     """Resident plus swapped-out memory: what the process needs back in RAM."""
+    if DARWIN:
+        try:
+            return psutil.Process(pid).memory_info().rss
+        except psutil.Error:
+            return 0
     total = 0
     try:
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
@@ -300,6 +401,13 @@ def _footprint(pid: int) -> int:
 
 
 def _tree_pids(pid: int):
+    if DARWIN:
+        yield pid
+        try:
+            yield from (child.pid for child in psutil.Process(pid).children(recursive=True))
+        except psutil.Error:
+            pass
+        return
     seen, stack = set(), [pid]
     while stack:
         current = stack.pop()
@@ -378,7 +486,7 @@ def scope_memory(pid: int) -> tuple[int, int | None] | None:
 
 
 def tree_cpu_seconds(pid: int) -> float | None:
-    """Cumulative CPU time of live and already reaped processes in the tree."""
+    """CPU time of the live process tree, plus reaped children on Linux."""
     pids = _tree_pids(pid)
     root = _cpu_seconds(next(pids), include_children=True)
     if root is None:
@@ -388,6 +496,9 @@ def tree_cpu_seconds(pid: int) -> float | None:
 
 def _host_busy() -> tuple[float, float]:
     """(busy, total) CPU seconds since boot, summed over all cores."""
+    if DARWIN:
+        counts = psutil.cpu_times()
+        return sum(counts) - counts.idle, sum(counts)
     fields = [int(x) for x in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
     idle = fields[3] + fields[4]  # idle + iowait
     tick = os.sysconf("SC_CLK_TCK")
@@ -395,6 +506,8 @@ def _host_busy() -> tuple[float, float]:
 
 
 def mem_available() -> int:
+    if DARWIN:
+        return psutil.virtual_memory().available
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemAvailable:"):
             return int(line.split()[1]) * 1024
@@ -418,6 +531,8 @@ def measure(sample: float = 1.0) -> dict:
 def measure_vms(sample: float = 1.0) -> list[dict]:
     """Running QEMU guests: pid, name, cores in use over sample seconds, and
     memory (resident plus swapped out)."""
+    if DARWIN:
+        return []  # host-wide samples already account for unleased VM load
     guests: dict[int, dict] = {}
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
@@ -448,6 +563,8 @@ def measure_vms(sample: float = 1.0) -> list[dict]:
 
 
 def default_agent() -> str:
+    if name := os.environ.get("AGENT_COORD_AS", "").strip():
+        return name
     try:
         top = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -460,6 +577,240 @@ def default_agent() -> str:
     return Path.cwd().name
 
 
+def load_average() -> list[float] | None:
+    return list(os.getloadavg()) if hasattr(os, "getloadavg") else None
+
+
+# ---------------------------------------------------------------- Windows
+# The same measurements from the Win32 API instead of /proc.
+
+if WINDOWS:
+    import ctypes
+    import msvcrt
+    import winreg
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+    _HANDLE, _DWORD, _BOOL = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+    _U64 = ctypes.c_uint64
+    _SIZE = ctypes.c_size_t
+
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", _DWORD), ("dwMemoryLoad", _DWORD),
+                    ("ullTotalPhys", _U64), ("ullAvailPhys", _U64),
+                    ("ullTotalPageFile", _U64), ("ullAvailPageFile", _U64),
+                    ("ullTotalVirtual", _U64), ("ullAvailVirtual", _U64),
+                    ("ullAvailExtendedVirtual", _U64)]  # fmt: skip
+
+    class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [("cb", _DWORD), ("PageFaultCount", _DWORD),
+                    ("PeakWorkingSetSize", _SIZE), ("WorkingSetSize", _SIZE),
+                    ("QuotaPeakPagedPoolUsage", _SIZE), ("QuotaPagedPoolUsage", _SIZE),
+                    ("QuotaPeakNonPagedPoolUsage", _SIZE), ("QuotaNonPagedPoolUsage", _SIZE),
+                    ("PagefileUsage", _SIZE), ("PeakPagefileUsage", _SIZE),
+                    ("PrivateUsage", _SIZE)]  # fmt: skip
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", _DWORD), ("cntUsage", _DWORD), ("th32ProcessID", _DWORD),
+                    ("th32DefaultHeapID", _SIZE), ("th32ModuleID", _DWORD),
+                    ("cntThreads", _DWORD), ("th32ParentProcessID", _DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", _DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]  # fmt: skip
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", _DWORD),
+                    ("MinimumWorkingSetSize", _SIZE), ("MaximumWorkingSetSize", _SIZE),
+                    ("ActiveProcessLimit", _DWORD), ("Affinity", _SIZE),
+                    ("PriorityClass", _DWORD), ("SchedulingClass", _DWORD)]  # fmt: skip
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, _U64) for n in ("ReadOperationCount", "WriteOperationCount",
+                                        "OtherOperationCount", "ReadTransferCount",
+                                        "WriteTransferCount", "OtherTransferCount")]  # fmt: skip
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", _IO_COUNTERS), ("ProcessMemoryLimit", _SIZE),
+                    ("JobMemoryLimit", _SIZE), ("PeakProcessMemoryUsed", _SIZE),
+                    ("PeakJobMemoryUsed", _SIZE)]  # fmt: skip
+
+    class _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+        _fields_ = [("ControlFlags", _DWORD), ("CpuRate", _DWORD)]
+
+    def _sig(fn, restype, *argtypes):
+        fn.restype, fn.argtypes = restype, list(argtypes)
+        return fn
+
+    _OpenProcess = _sig(_k32.OpenProcess, _HANDLE, _DWORD, _BOOL, _DWORD)
+    _CloseHandle = _sig(_k32.CloseHandle, _BOOL, _HANDLE)
+    _WaitForSingleObject = _sig(_k32.WaitForSingleObject, _DWORD, _HANDLE, _DWORD)
+    _GetProcessTimes = _sig(_k32.GetProcessTimes, _BOOL, _HANDLE, *[ctypes.POINTER(_U64)] * 4)
+    _GetSystemTimes = _sig(_k32.GetSystemTimes, _BOOL, *[ctypes.POINTER(_U64)] * 3)
+    _GlobalMemoryStatusEx = _sig(_k32.GlobalMemoryStatusEx, _BOOL,
+                                 ctypes.POINTER(_MEMORYSTATUSEX))
+    _GetProcessMemoryInfo = _sig(_k32.K32GetProcessMemoryInfo, _BOOL, _HANDLE,
+                                 ctypes.POINTER(_PROCESS_MEMORY_COUNTERS_EX), _DWORD)
+    _CreateToolhelp32Snapshot = _sig(_k32.CreateToolhelp32Snapshot, _HANDLE, _DWORD, _DWORD)
+    _Process32FirstW = _sig(_k32.Process32FirstW, _BOOL, _HANDLE,
+                            ctypes.POINTER(_PROCESSENTRY32W))
+    _Process32NextW = _sig(_k32.Process32NextW, _BOOL, _HANDLE,
+                           ctypes.POINTER(_PROCESSENTRY32W))
+    _GetVolumePathNameW = _sig(_k32.GetVolumePathNameW, _BOOL, wintypes.LPCWSTR,
+                               wintypes.LPWSTR, _DWORD)
+    _CreateJobObjectW = _sig(_k32.CreateJobObjectW, _HANDLE, ctypes.c_void_p, wintypes.LPCWSTR)
+    _SetInformationJobObject = _sig(_k32.SetInformationJobObject, _BOOL, _HANDLE,
+                                    ctypes.c_int, ctypes.c_void_p, _DWORD)
+    _AssignProcessToJobObject = _sig(_k32.AssignProcessToJobObject, _BOOL, _HANDLE, _HANDLE)
+    _NtResumeProcess = _sig(_ntdll.NtResumeProcess, ctypes.c_long, _HANDLE)
+
+    _SYNCHRONIZE, _QUERY_LIMITED = 0x00100000, 0x1000
+    _WAIT_TIMEOUT, _ERROR_ACCESS_DENIED = 0x102, 5
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _TICKS = 10_000_000  # FILETIME units (100 ns) per second
+
+    def _open(pid: int, access: int = _QUERY_LIMITED):
+        return _OpenProcess(access, False, pid) if pid > 0 else None
+
+    def alive(pid: int) -> bool:  # noqa: F811 - os.kill(pid, 0) would terminate it
+        handle = _open(pid, _SYNCHRONIZE | _QUERY_LIMITED)
+        if not handle:
+            return pid > 0 and ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            return _WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
+        finally:
+            _CloseHandle(handle)
+
+    def _memory_status() -> "_MEMORYSTATUSEX":
+        status = _MEMORYSTATUSEX(dwLength=ctypes.sizeof(_MEMORYSTATUSEX))
+        if not _GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return status
+
+    def mem_total() -> int:  # noqa: F811
+        return int(_memory_status().ullTotalPhys)
+
+    def mem_available() -> int:  # noqa: F811
+        return int(_memory_status().ullAvailPhys)
+
+    def _process_times(pid: int) -> tuple[int, float] | None:
+        """(creation time, CPU seconds) of a running pid, else None."""
+        handle = _open(pid, _SYNCHRONIZE | _QUERY_LIMITED)
+        if not handle:
+            return None
+        try:
+            if _WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT:
+                return None
+            created, ended, kernel, user = _U64(), _U64(), _U64(), _U64()
+            if not _GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(ended),
+                                    ctypes.byref(kernel), ctypes.byref(user)):  # fmt: skip
+                return None
+            return created.value, (kernel.value + user.value) / _TICKS
+        finally:
+            _CloseHandle(handle)
+
+    def _cpu_seconds(pid: int, include_children: bool = False) -> float | None:  # noqa: F811
+        if include_children:
+            tree = _windows_tree(pid)
+            root = next(tree, None)
+            return None if root is None else root[1] + sum(cpu for _, cpu in tree)
+        times = _process_times(pid)
+        return times[1] if times else None
+
+    def _footprint(pid: int) -> int:  # noqa: F811
+        """Working set or private commit, whichever is larger: what the
+        process needs in RAM (the counterpart of VmRSS + VmSwap)."""
+        handle = _open(pid, _SYNCHRONIZE | _QUERY_LIMITED)
+        if not handle:
+            return 0
+        try:
+            if _WaitForSingleObject(handle, 0) != _WAIT_TIMEOUT:
+                return 0
+            counters = _PROCESS_MEMORY_COUNTERS_EX(cb=ctypes.sizeof(_PROCESS_MEMORY_COUNTERS_EX))
+            if not _GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return 0
+            return int(max(counters.WorkingSetSize, counters.PrivateUsage))
+        finally:
+            _CloseHandle(handle)
+
+    def _processes() -> list[tuple[int, int, str]]:
+        """(pid, parent pid, exe name) of every process."""
+        snap = _CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == _INVALID_HANDLE:
+            return []
+        found = []
+        try:
+            entry = _PROCESSENTRY32W(dwSize=ctypes.sizeof(_PROCESSENTRY32W))
+            ok = _Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                found.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+                ok = _Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            _CloseHandle(snap)
+        return found
+
+    def _windows_tree(pid: int):
+        """Yield live (pid, CPU seconds) pairs rooted at pid."""
+        root = _process_times(pid)
+        if root is None:
+            return
+        children: dict[int, list[int]] = {}
+        for child, parent, _name in _processes():
+            if child != parent:
+                children.setdefault(parent, []).append(child)
+        seen, stack = set(), [(pid, root)]
+        while stack:
+            current, (created, cpu) = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            yield current, cpu
+            for child in children.get(current, ()):
+                times = _process_times(child)
+                # A recycled parent PID must not adopt an older process.
+                if times and times[0] >= created:
+                    stack.append((child, times))
+
+    def tree_pids(pid: int) -> set[int]:
+        return {child for child, _ in _windows_tree(pid)}
+
+    def tree_footprint(pid: int) -> int:  # noqa: F811
+        return sum(_footprint(child) for child, _ in _windows_tree(pid))
+
+    def tree_cpu_seconds(pid: int) -> float | None:
+        """CPU time of the live process tree; reaped children are unavailable."""
+        return _cpu_seconds(pid, include_children=True)
+
+    def _host_busy() -> tuple[float, float]:  # noqa: F811
+        idle, kernel, user = _U64(), _U64(), _U64()
+        if not _GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        total = kernel.value + user.value  # kernel time includes idle time
+        return (total - idle.value) / _TICKS, total / _TICKS
+
+    def measure_vms(sample: float = 1.0) -> list[dict]:  # noqa: F811
+        """Running QEMU guests and WSL2/Hyper-V worker processes (vmmem)."""
+        guests: dict[int, dict] = {}
+        for pid, _parent, exe in _processes():
+            name = exe.lower()
+            if name.startswith("qemu-system"):
+                guests[pid] = {"pid": pid, "name": Path(exe).stem}
+            elif name in ("vmmem", "vmmem.exe", "vmmemwsl", "vmmemwsl.exe"):
+                guests[pid] = {"pid": pid, "name": "wsl" if "wsl" in name else "hyper-v"}
+        before = {pid: _cpu_seconds(pid) for pid in guests}
+        if guests:
+            time.sleep(sample)
+        for pid, guest in guests.items():
+            after, start = _cpu_seconds(pid), before[pid]
+            guest["cores"] = (round((after - start) / sample, 1)
+                              if after is not None and start is not None else 0.0)  # fmt: skip
+            guest["mem"] = _footprint(pid)
+        # Worker processes this user may not open measure as nothing: leave
+        # them to the available-memory check instead of listing zeros.
+        return [g for g in guests.values() if g["mem"] or g["cores"]]
+
+
 # ---------------------------------------------------------------- service
 
 
@@ -469,7 +820,8 @@ class Coordinator:
     def __init__(self, state_file: Path, measure=measure, cap=capacity,
                  history_file: Path | None = None, footprint=tree_footprint,
                  cpu_seconds=tree_cpu_seconds, tree_pids=tree_pids,
-                 scope_memory=scope_memory, measured_mem: bool | None = None):
+                 scope_memory=scope_memory, measured_mem: bool | None = None,
+                 gpu_sample=gpu_utilization):
         self._saved = None
         self._peak_samples: dict[tuple, list[int]] = {}
         self.scope_memory = scope_memory
@@ -500,6 +852,9 @@ class Coordinator:
         self._trees: dict[str, set[int]] = {}
         self.tree_pids = tree_pids
         self._low_since: dict[tuple[str, str], float] = {}
+        self.gpu_sample = gpu_sample
+        self._track_at = -math.inf
+        self._exclusive_sample_at = -math.inf
         self.state_file = state_file
         self.history_file = history_file or state_file.with_name(HISTORY_FILE.name)
         self.measure = measure
@@ -517,6 +872,10 @@ class Coordinator:
                 self.state.setdefault("locks", {})
             except ValueError:
                 pass
+        for x in self.state["leases"]:
+            for usage in x.get("exclusive_usage", {}).values():
+                for key in ("sample_at", "idle_since", "busy"):
+                    usage.pop(key, None)
         self._prune()
 
     # -- persistence and housekeeping
@@ -562,6 +921,7 @@ class Coordinator:
     def _log_end(self, x: dict, held: bool, **extra) -> None:
         now = time.time()
         if held:
+            self._close_exclusive(x, self._exclusive_resources(x), now)
             granted = x.get("granted", now)
             self._log("ended", x, wait=round(granted - x["asked"], 1),
                       run=round(now - granted, 1), held=bool(x.get("running")),
@@ -584,16 +944,27 @@ class Coordinator:
 
     def _prune(self) -> bool:
         changed = False
+        now = time.time()
         for key in ("leases", "queue"):
             live = []
             for x in self.state[key]:
-                if alive(x["pid"]):
+                managed = x.get("run_unit")
+                if managed and "missing_since" not in x and not alive(x["pid"]):
+                    for name in list(x.get("phase_locks", {})):
+                        self._phase_release(x, name)
+                    x["missing_since"] = now
+                    self._log("restarting", x)
+                    changed = True
+                tracked = x.get("unit") or x.get("pidfile") or managed
+                if tracked and now - x.get("missing_since", now) < RESTART_GRACE:
+                    live.append(x)
+                elif not tracked and alive(x["pid"]):
                     live.append(x)
                 else:
-                    self._log_end(x, key == "leases", why="process exited")
+                    self._log_end(x, key == "leases",
+                                  why="registration inactive" if tracked else "process exited")
             changed |= len(live) != len(self.state[key])
             self.state[key] = live
-        now = time.time()
         changed |= self._prune_watchers(now)
         for name, lock in list(self.state["locks"].items()):
             if (lock.get("pid") and not alive(lock["pid"])) or (
@@ -637,6 +1008,50 @@ class Coordinator:
         self.state["watchers"] = live
         return changed
 
+    def _refresh_tracking(self, stamp: float) -> None:
+        if stamp - self._track_at < TRACK_INTERVAL:
+            return
+        self._track_at = stamp
+        with self.lock:
+            targets = [(x["id"], x.get("unit"), x.get("pidfile"))
+                       for x in self.state["leases"] if x.get("pidfile") or x.get("unit")]
+        units = {name: unit_pid(name) for name in {unit for _, unit, _ in targets if unit}}
+        files = {path: read_pidfile(path) for path in {file for _, _, file in targets if file}}
+        found = {}
+        for lease_id, unit, file in targets:
+            candidates = (units.get(unit, 0), files.get(file, 0))
+            found[lease_id] = next((pid for pid in candidates if pid > 0 and alive(pid)), 0)
+        now = time.time()
+        changed = False
+        with self.lock:
+            for x in self.state["leases"]:
+                if x["id"] not in found:
+                    continue
+                pid = found[x["id"]]
+                if pid != x["pid"]:
+                    for name in list(x.get("phase_locks", {})):
+                        self._phase_release(x, name)
+                    x["pid"] = pid
+                    lease_id = x["id"]
+                    self._own_cores.pop(lease_id, None)
+                    self._measured_cores.pop(lease_id, None)
+                    self._trees.pop(lease_id, None)
+                    if self._cpu_sample:
+                        self._cpu_sample[1].pop(lease_id, None)
+                    if self._peak_cpu:
+                        self._peak_cpu[1].pop(lease_id, None)
+                    changed = True
+                if pid and "missing_since" in x:
+                    del x["missing_since"]
+                    self._log("resumed", x)
+                    changed = True
+                elif not pid and "missing_since" not in x:
+                    x["missing_since"] = now
+                    self._log("restarting", x)
+                    changed = True
+            if changed:
+                self._save()
+
     def _lock_holder(self, name: str, lease_id: str | None = None) -> str | None:
         """Who holds named resource name (a lock, or another lease's --lock)."""
         if lock := self.state["locks"].get(name):
@@ -645,6 +1060,16 @@ class Coordinator:
             if name in x.get("locks", ()) and x["id"] != lease_id:
                 return f"{x['agent']}'s lease {x['id']} ({x['label']})"
         return None
+
+    @staticmethod
+    def _same_run(existing: dict, new: dict) -> bool:
+        phases = existing.get("phase_locks", {})
+        base_locks = {name for name in existing["locks"] if phases.get(name, True)}
+        base_exclusive = set(existing.get("exclusive_locks", ())) - phases.keys()
+        return (base_locks == set(new["locks"])
+                and base_exclusive == set(new.get("exclusive_locks", ()))
+                and all(existing.get(k) == new.get(k) for k in
+                        ("agent", "label", "cores", "mem", "disk", "exclusive", "headroom", "io")))
 
     def _reserved(self, mount: str) -> int:
         return sum(x.get("disk", {}).get(mount, 0) for x in self.state["leases"])
@@ -791,14 +1216,14 @@ class Coordinator:
         return {x["id"] for x in self.state["leases"]
                 if not x.get("io") and x.get("exclusive_locks")}
 
-    def _net_busy(self) -> float:
+    def _net_busy(self, released: set[str] | None = None) -> float:
         """Measured busy cores, less the own use of exclusive-lock leases, so
         a timing run counts once, at its size, not at its size plus its
         measured use. Only use up to its size comes off: use above it (a job
         in its process tree but in a scope of its own, an uncapped hold,
         noise) stays counted as load. Lease use is smoothed like the busy
         figure, and counted once per process tree."""
-        once = self._counted_once()
+        once = self._counted_once() - (released or set())
         covered = self._covered()
         net = self.busy
         for x in self.state["leases"]:
@@ -814,7 +1239,7 @@ class Coordinator:
         return [x for x in self.state["leases"]
                 if not x.get("running") and now - x.get("granted", now) < WARMUP]  # fmt: skip
 
-    def _usage(self) -> tuple[float, int]:
+    def _usage(self, borrow: set[str] | None = None) -> tuple[float, int]:
         """(cores, memory) in use. CPU is measured, since leases mostly use
         less than they ask and sharing CPU only slows everyone a little (each
         lease is capped at its size, at nice 19); new leases count at their
@@ -824,11 +1249,87 @@ class Coordinator:
         # their cores stay guaranteed; only the rest of the measured load
         # counts beside them (their own measured use is taken out of it).
         leases = self.state["leases"]
-        cores = max(self._net_busy(), sum(self._cpu_claim(x) for x in leases if x.get("io")))
-        cores += self._reserved_cpu(leases)
+        cores = max(self._net_busy(borrow), sum(self._cpu_claim(x) for x in leases if x.get("io")))
+        cores += self._reserved_cpu([x for x in leases if x["id"] not in (borrow or ())])
         vms = self._vms()
         mem = sum(self._mem_claim(x) for x in leases) + sum(g["mem"] for g in vms)
         return cores, mem
+
+    @staticmethod
+    def _exclusive_resources(lease: dict) -> list[str]:
+        return ["machine"] if lease.get("exclusive") else lease.get("exclusive_locks", [])
+
+    def _usage_record(self, lease: dict, resource: str) -> dict:
+        return lease.setdefault("exclusive_usage", {}).setdefault(
+            resource, {"since": lease["granted"], "observed": 0.0, "active": 0.0}
+        )
+
+    def _close_exclusive(self, lease: dict, resources: list[str], now: float) -> None:
+        for resource in list(resources):
+            usage = self._usage_record(lease, resource)
+            self._log("exclusive-ended", lease, resource=resource,
+                      exclusive_seconds=round(now - usage["since"], 1),
+                      observed_seconds=round(usage["observed"], 1),
+                      active_seconds=round(usage["active"], 1))
+            del lease["exclusive_usage"][resource]
+
+    def _exclusive_idle(self, lease: dict, resource: str, now: float) -> bool:
+        usage = lease.get("exclusive_usage", {}).get(resource, {})
+        return (now - usage.get("sample_at", -math.inf) <= 2 * EXCLUSIVE_SAMPLE
+                and now - usage.get("idle_since", now) >= EXCLUSIVE_IDLE_AFTER)
+
+    def _monitor_exclusive(self, now: float, gpu: float | None) -> bool:
+        changed = False
+        for x in self.state["leases"]:
+            resources = self._exclusive_resources(x)
+            if not resources:
+                continue
+            warnings = x.setdefault("exclusive_warnings", {})
+            if (x.get("expect_source") == "explicit"
+                    and now - x["granted"] > x["expect"] * 1.25
+                    and "overrun" not in warnings):
+                reason = (f"{x['id']} ({x['label']}) holds exclusive resources and "
+                          "has exceeded --expect by more than 25%; release any unneeded locks.")
+                warnings["overrun"] = reason
+                if not x.get("exclusive_overrun_told"):
+                    x["exclusive_overrun_told"] = True
+                    self._post("agent-coord", x["agent"], reason)
+                    self._log("exclusive-overrun", x, reason=reason)
+                changed = True
+            for resource in resources:
+                usage = self._usage_record(x, resource)
+                cpu = self._measured_cores.get(x["id"])
+                if resource == "gpu":
+                    busy = gpu > 1 if gpu is not None else None
+                elif x["exclusive"] and cpu is not None:
+                    busy = cpu >= .05 or (gpu is not None and gpu > 1)
+                else:
+                    busy = None
+                before = usage.get("sample_at")
+                contiguous = (before is not None and 0 <= now - before <= 2 * EXCLUSIVE_SAMPLE
+                              and busy is not None and usage.get("busy") is not None)
+                if contiguous:
+                    elapsed = now - before
+                    usage["observed"] += elapsed
+                    if busy or usage["busy"]:
+                        usage["active"] += elapsed
+                if busy is not False:
+                    usage.pop("idle_since", None)
+                elif not contiguous or "idle_since" not in usage:
+                    usage["idle_since"] = now
+                usage.update(sample_at=now, busy=busy)
+                warning_key = f"idle:{resource}"
+                if self._exclusive_idle(x, resource, now):
+                    if warning_key not in warnings:
+                        reason = (f"{x['id']} ({x['label']}) held {resource} exclusively with "
+                                  "near-zero measured use for 15 min; release it if unneeded.")
+                        warnings[warning_key] = reason
+                        self._post("agent-coord", x["agent"], reason)
+                        self._log("exclusive-idle", x, resource=resource, reason=reason)
+                else:
+                    warnings.pop(warning_key, None)
+                changed = True
+        return changed
 
     def _claimed(self) -> float:
         """Cores claimed: full size for CPU leases, measured use otherwise."""
@@ -847,8 +1348,11 @@ class Coordinator:
         kind is a stable category (exclusive, lock:NAME, disk, cores, mem,
         available, headroom, too-big) for the history."""
         leases = self.state["leases"]
+        now = time.time()
+        small = (req["cores"] <= SMALL_CORES and req["mem"] <= SMALL_MEM
+                 and not any(req.get(k) for k in ("exclusive", "locks", "headroom", "disk")))
         holder = next((x for x in leases if x["exclusive"]), None)
-        if holder:
+        if holder and not (small and self._exclusive_idle(holder, "machine", now)):
             return "exclusive", f"{holder['agent']} holds an exclusive lease ({holder['label']})"
         if req["exclusive"] and leases:
             return "exclusive", f"{len(leases)} other lease(s) must end first"
@@ -863,7 +1367,14 @@ class Coordinator:
         if too_big := self._too_big(req):
             return "too-big", too_big
         cores, mem = self.capacity()
-        used_cores, used_mem = self._usage()
+        borrow = set()
+        if small:
+            for x in leases:
+                locks = x.get("exclusive_locks", ())
+                if (not x.get("io") and not x.get("headroom") and locks
+                        and all(self._exclusive_idle(x, name, now) for name in locks)):
+                    borrow.add(x["id"])
+        used_cores, used_mem = self._usage(borrow)
         req_cores = self._cpu_claim(req)
         if used_cores + req_cores > cores:
             return "cores", f"{max(cores - used_cores, 0):.1f} of {cores:g} cores free"
@@ -924,6 +1435,8 @@ class Coordinator:
             self._footprints = None
 
     def _footprint(self, pid: int) -> int:
+        if pid <= 0:
+            return 0
         if self._footprints is None:
             return self.footprint(pid)
         if pid not in self._footprints:
@@ -1003,7 +1516,8 @@ class Coordinator:
         counts as free."""
         cores, mem = self.capacity()
         used_cores, used_mem = self._usage()
-        ending = [x for x in self.state["leases"] if waiting_for & set(x.get("locks", ()))]
+        ending = [x for x in self.state["leases"]
+                  if waiting_for & (set(x.get("locks", ())) - x.get("phase_locks", {}).keys())]
         freed_cores = sum(self._cpu_claim(x) for x in ending)
         freed_mem = sum(self._mem_claim(x) for x in ending)
         need_cores = self._cpu_claim(req) + self._cpu_claim(head)
@@ -1357,11 +1871,19 @@ class Coordinator:
 
     def tick(self) -> None:
         sample = self.measure()
+        stamp = time.monotonic()
+        self._refresh_tracking(stamp)
+        sample_exclusive = stamp - self._exclusive_sample_at >= EXCLUSIVE_SAMPLE
         with self.lock:
-            leases = [(x["id"], x["pid"]) for x in self.state["leases"]]
+            leases = [(x["id"], x["pid"]) for x in self.state["leases"]
+                      if x["pid"] > 0 and "missing_since" not in x]
             targets = [(x["id"], x["pid"]) for x in self.state["leases"]
-                       if x.get("io") or x.get("exclusive_locks")
-                       or (x["cores"] >= 2 and not x.get("io_hint"))]
+                       if x["pid"] > 0 and "missing_since" not in x
+                       and (x.get("io") or self._exclusive_resources(x)
+                            or (x["cores"] >= 2 and not x.get("io_hint")))]
+            watch_gpu = sample_exclusive and any(
+                x["exclusive"] or "gpu" in x.get("exclusive_locks", ()) for x in self.state["leases"]
+            )
         now = time.monotonic()
         pids = {pid for _, pid in leases}
         by_pid = {pid: self.cpu_seconds(pid) for pid in pids}
@@ -1369,6 +1891,7 @@ class Coordinator:
         every = {lease_id: by_pid[pid] for lease_id, pid in leases if by_pid[pid] is not None}
         trees = {pid: self.tree_pids(pid) for pid in pids} if len(pids) > 1 else {}
         memory = {pid: self._lease_memory(pid) for pid in pids}
+        gpu = self.gpu_sample() if watch_gpu else None
         with self.lock:
             self._trees = {lease_id: trees[pid] for lease_id, pid in targets
                            if pid in trees and by_pid[pid] is not None}  # fmt: skip
@@ -1379,6 +1902,9 @@ class Coordinator:
             # Smoothed over ~10 s: a moment's burst shouldn't hold the line.
             self.busy += BUSY_SMOOTHING * (sample["busy"] - self.busy)
             changed = self._prune()
+            if sample_exclusive:
+                self._exclusive_sample_at = stamp
+                changed |= self._monitor_exclusive(time.time(), gpu)
             changed |= self._hint_io(now)
             changed |= self._admit()
             if changed:
@@ -1395,6 +1921,8 @@ class Coordinator:
             result = getattr(self, f"op_{op}", None)
             if result is None:
                 return {"error": f"unknown op {op!r}"}
+            if op in {"poll", "status", "phase"}:
+                self._prune()
             reply = result(req, agent)
             self._prune()
             self._admit()
@@ -1436,6 +1964,32 @@ class Coordinator:
             lease["io"] = True
         if headroom:
             lease["headroom"] = headroom
+        for key in ("pidfile", "unit", "run_unit"):
+            if req.get(key):
+                lease[key] = str(req[key])
+        if (lease.get("pidfile") or lease.get("unit")) and not req.get("running"):
+            return {"error": "PID files and units require an existing hold"}
+        if unit := lease.get("run_unit"):
+            for existing in self.state["queue"] + self.state["leases"]:
+                if existing.get("run_unit") != unit:
+                    continue
+                if alive(existing["pid"]):
+                    return {"error": f"unit {unit} already has a live lease"}
+                if time.time() - existing.get("missing_since", time.time()) >= RESTART_GRACE:
+                    self._prune()
+                    break
+                if not self._same_run(existing, lease):
+                    return {"error": f"unit {unit} has a different pending registration; release it first"}
+                for name in list(existing.get("phase_locks", {})):
+                    self._phase_release(existing, name)
+                existing["pid"] = lease["pid"]
+                existing.pop("missing_since", None)
+                if self._cpu_sample:
+                    self._cpu_sample[1].pop(existing["id"], None)
+                if self._peak_cpu:
+                    self._peak_cpu[1].pop(existing["id"], None)
+                self._log("resumed", existing)
+                return {"id": existing["id"], **self._ticket(existing["id"])}
         self.state["next"] += 1
         too_big = self._too_big(lease)
         if too_big and not req.get("running"):
@@ -1446,6 +2000,8 @@ class Coordinator:
             self._log("requested", lease, held=True)
             lease["granted"] = time.time()
             lease["running"] = True
+            if lease["pid"] <= 0:
+                lease["missing_since"] = lease["granted"]
             self.state["leases"].append(lease)
             self._log("started", lease, wait=0.0, held=True)
         else:
@@ -1455,6 +2011,8 @@ class Coordinator:
         return {"id": lease["id"], **self._ticket(lease["id"])}
 
     def op_watch(self, req: dict, agent: str) -> dict:
+        if not sys.platform.startswith("linux"):
+            return {"error": "watcher registration requires Linux"}
         pid, owner, expect = req["pid"], req["owner_pid"], req["expect"]
         label = str(req["label"])
         if not label.startswith("watch:") or not label[6:].strip():
@@ -1475,8 +2033,9 @@ class Coordinator:
         return {"id": watch["id"]}
 
     def _ticket(self, lease_id: str) -> dict:
-        if any(x["id"] == lease_id for x in self.state["leases"]):
-            return {"state": "granted"}
+        for x in self.state["leases"]:
+            if x["id"] == lease_id:
+                return {"state": "granted", **({"restarting": True} if "missing_since" in x else {})}
         for position, x in enumerate(self.state["queue"]):
             if x["id"] == lease_id:
                 reason = self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"
@@ -1487,6 +2046,52 @@ class Coordinator:
 
     def op_poll(self, req: dict, _agent: str) -> dict:
         return self._ticket(str(req.get("id")))
+
+    def _phase_release(self, lease: dict, name: str) -> None:
+        self._close_exclusive(lease, [name], time.time())
+        lease["exclusive_locks"].remove(name)
+        if not lease["phase_locks"].pop(name):
+            lease["locks"].remove(name)
+        lease.get("exclusive_warnings", {}).pop(f"idle:{name}", None)
+        if not lease["exclusive_locks"]:
+            lease.get("exclusive_warnings", {}).pop("overrun", None)
+
+    def op_phase(self, req: dict, agent: str) -> dict:
+        lease_id = req.get("id")
+        lease = next((x for x in reversed(self.state["leases"])
+                      if (x["id"] == lease_id and x["agent"] == agent if lease_id else
+                          x["pid"] > 0 and req.get("pid") in self.tree_pids(x["pid"]))), None)
+        if lease is None or "missing_since" in lease:
+            return {"error": "no matching running lease (use its ID and owner with --as)"}
+        name = str(req.get("name", "")).strip()
+        if not name or exclusive_mode(lease) == "machine":
+            return {"error": "phase requires a named lock on a non-machine-exclusive lease"}
+        phases = lease.get("phase_locks", {})
+        if req.get("release"):
+            if name not in phases:
+                return {"error": f"{name} is not a phase lock on {lease['id']}"}
+            self._phase_release(lease, name)
+            return {"id": lease["id"], "released": name}
+        if name in phases:
+            return {"id": lease["id"], "locked": name}
+        if name in lease.get("exclusive_locks", ()):
+            return {"error": f"{name} is already exclusive for the entire lease"}
+        if holder := self._lock_holder(name, lease["id"]):
+            return {"error": f"{name} is held by {holder}"}
+        had_lock = name in lease["locks"]
+        if not had_lock and any(name in x.get("locks", ()) for x in self.state["queue"]):
+            return {"error": f"{name} is requested by a queued lease"}
+        scoped = lease.setdefault("exclusive_locks", [])
+        scoped.append(name)
+        if self._usage()[0] > self.capacity()[0]:
+            scoped.remove(name)
+            return {"error": f"not enough free cores for an exclusive phase on {name}"}
+        if not had_lock:
+            lease["locks"].append(name)
+        lease.setdefault("phase_locks", {})[name] = had_lock
+        self._usage_record(lease, name)["since"] = time.time()
+        self._log("exclusive-started", lease, resource=name)
+        return {"id": lease["id"], "locked": name}
 
     def op_release(self, req: dict, _agent: str) -> dict:
         lease_id = str(req.get("id"))
@@ -1564,6 +2169,9 @@ class Coordinator:
             )
         return {"messages": mine}
 
+    def op_ping(self, _req: dict, _agent: str) -> dict:
+        return {"pid": os.getpid()}
+
     def op_agents(self, _req: dict, _agent: str) -> dict:
         agents = sorted(self.state["agents"].items(),
                         key=lambda kv: -kv[1].get("last_seen", 0))  # fmt: skip
@@ -1597,7 +2205,7 @@ class Coordinator:
                        for x in self.state["leases"]],
             "queue": [{**x, "reason": self._blocked(x) or x.get("backfill_reason") or x.get("reason") or "waiting"}
                       for x in self.state["queue"]],
-            "vms": self._vms(), "load": os.getloadavg(),
+            "vms": self._vms(), "load": load_average(),
             "locks": self.state["locks"],
             "watchers": self.state["watchers"],
             "disks": {m: {"free": self.disk_free(m), "reserved": self._reserved(m)}
@@ -1612,30 +2220,61 @@ class Coordinator:
 def serve(
     socket_path: Path | None = None, state_file: Path | None = None, **coordinator_args
 ) -> None:
+    """Serve requests until stopped. On Windows socket_path is the endpoint
+    file, and a second server for the same endpoint exits at once."""
     socket_path, state_file = socket_path or SOCKET, state_file or STATE_FILE
-    coordinator = Coordinator(state_file, **coordinator_args)
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    socket_path.unlink(missing_ok=True)
+    instance = None
+    if WINDOWS:
+        instance = _claim_instance(socket_path)
+        if instance is None:
+            print(f"agent-coord: already serving {socket_path}", flush=True)
+            return
+    else:
+        socket_path.unlink(missing_ok=True)
+    coordinator = Coordinator(state_file, **coordinator_args)
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self) -> None:
             line = self.rfile.readline()
             try:
-                reply = coordinator.handle(json.loads(line))
-            except (ValueError, TypeError, KeyError) as e:
+                req = json.loads(line)
+                if WINDOWS and not hmac.compare_digest(
+                        str(req.pop("token", "")), self.server.token):  # fmt: skip
+                    reply = {"error": "bad token (is another service using this endpoint?)"}
+                elif WINDOWS and req.get("op") == "shutdown":
+                    reply = {"stopping": os.getpid()}
+                    threading.Thread(target=self.server.shutdown).start()
+                else:
+                    reply = coordinator.handle(req)
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
                 reply = {"error": f"bad request: {e}"}
             self.wfile.write(json.dumps(reply).encode() + b"\n")
 
-    class Server(socketserver.ThreadingUnixStreamServer):
-        daemon_threads = True
+    if WINDOWS:
+        class Server(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = False  # SO_REUSEADDR would let others share the port
+
+        address = ("127.0.0.1", 0)
+    else:
+        class Server(socketserver.ThreadingUnixStreamServer):
+            daemon_threads = True
+
+        address = str(socket_path)
 
     # Measure before answering anyone: admission needs real numbers, and the
     # smoothed CPU starts from a real reading rather than zero.
     first = coordinator.measure()
     coordinator.vms, coordinator.available = first["vms"], first["available"]
     coordinator.busy = first["busy"]
-    with Server(str(socket_path), Handler) as server:
-        os.chmod(socket_path, 0o600)
+    with Server(address, Handler) as server:
+        if WINDOWS:
+            server.token = secrets.token_hex(16)
+            _write_endpoint(socket_path, {"port": server.server_address[1],
+                                          "token": server.token, "pid": os.getpid()})  # fmt: skip
+        else:
+            os.chmod(socket_path, 0o600)
 
         def ticker() -> None:
             while True:
@@ -1649,31 +2288,93 @@ def serve(
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(
             target=server.shutdown).start())  # fmt: skip
         print(f"agent-coord: serving on {socket_path}", flush=True)
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        finally:
+            if WINDOWS:
+                _remove_endpoint(socket_path)
+                _release_instance(instance)
+                print("agent-coord: stopped", flush=True)
+
+
+def _claim_instance(endpoint: Path):
+    """An open file holding the endpoint's lock, or None if a server holds it."""
+    handle = open(endpoint.with_name(endpoint.name + ".lock"), "a+b")  # noqa: SIM115
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_instance(handle) -> None:
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+    handle.close()
+
+
+def _write_endpoint(path: Path, data: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+def _remove_endpoint(path: Path) -> None:
+    """Remove the endpoint file if it still names this process."""
+    try:
+        if json.loads(path.read_text()).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 # ---------------------------------------------------------------- client
 
+_DEFAULT_SOCKET = SOCKET
+START_HINT = {
+    "win32": "Start it: agent-coord service start (agent-coord service status shows its log)",
+    "darwin": "Start it: launchctl kickstart gui/$(id -u)/com.theontho.agent-coord",
+}.get(sys.platform, "Start it: systemctl --user start agent-coord")
 
-def call(request: dict, socket_path: Path | None = None, retry: float = 0) -> dict:
-    """Send request; retry for up to retry seconds while the service restarts."""
+
+def call(request: dict, socket_path: Path | None = None, retry: float = 0,
+         autostart: bool = True) -> dict:
+    """Send request; retry for up to retry seconds while the service restarts.
+    On Windows the default service is started on demand."""
     deadline = time.monotonic() + retry
+    started = False
     while True:
         try:
             return _call(request, socket_path or SOCKET)
         except _ServiceError:
             raise
         except SystemExit:
-            if time.monotonic() >= deadline:
+            if (WINDOWS and autostart and not started and socket_path is None
+                    and SOCKET == _DEFAULT_SOCKET):  # fmt: skip
+                started = True
+                start_service()
+                deadline = max(deadline, time.monotonic() + 20)
+            elif time.monotonic() >= deadline:
                 raise
-            time.sleep(1)
+            time.sleep(0.5 if started else 1)
 
 
 def _call(request: dict, socket_path: Path) -> dict:
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        if WINDOWS:
+            endpoint = json.loads(socket_path.read_text())
+            request = {**request, "token": endpoint["token"]}
+            sock = socket.create_connection(("127.0.0.1", int(endpoint["port"])), timeout=30)
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(30)
             sock.connect(str(socket_path))
+        with sock:
             sock.sendall(json.dumps(request).encode() + b"\n")
             data = b""
             while not data.endswith(b"\n"):
@@ -1681,11 +2382,8 @@ def _call(request: dict, socket_path: Path) -> dict:
                 if not chunk:
                     break
                 data += chunk
-    except OSError as e:
-        raise SystemExit(
-            f"agent-coord: the service isn't reachable ({e}). "
-            "Start it: systemctl --user start agent-coord"
-        ) from e
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f"agent-coord: the service isn't reachable ({e}). {START_HINT}") from e
     try:
         reply = json.loads(data)
     except ValueError as e:  # cut off mid-reply, e.g. by a service restart
@@ -1697,6 +2395,124 @@ def _call(request: dict, socket_path: Path) -> dict:
 
 class _ServiceError(SystemExit):
     """The service answered with an error (not worth retrying)."""
+
+
+# ---------------------------------------------------------------- Windows service
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+SERVICE_LOG = RUNTIME / "service.log"
+
+
+def _service_command() -> list[str]:
+    exe = Path(sys.executable)
+    windowless = exe.with_name("pythonw.exe")
+    return [str(windowless if windowless.exists() else exe), os.path.realpath(__file__), "serve"]
+
+
+def start_service() -> None:
+    """Start the service detached from this console and, where the job
+    allows it, from the calling job (an agent's shell)."""
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    try:
+        if SERVICE_LOG.stat().st_size > 1024**2:
+            SERVICE_LOG.replace(SERVICE_LOG.with_name(SERVICE_LOG.name + ".1"))
+    except OSError:
+        pass
+    with SERVICE_LOG.open("ab") as log:
+        _spawn_windows_background(_service_command(), RUNTIME, log)
+
+
+def _spawn_windows_background(command: list[str], cwd: Path | str, log) -> None:
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    flags = 0x00000008 | 0x00000200 | 0x08000000
+    for breakaway in (0x01000000, 0):  # CREATE_BREAKAWAY_FROM_JOB, if allowed
+        try:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             cwd=str(cwd), close_fds=True, creationflags=flags | breakaway)
+            return
+        except OSError:
+            if not breakaway:
+                raise
+
+
+def _service_pid() -> int | None:
+    try:
+        return int(call({"op": "ping"}, autostart=False)["pid"])
+    except SystemExit:
+        return None
+
+
+def _wait(predicate, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.3)
+    return predicate()
+
+
+def _stop_service() -> bool:
+    """Stop the service; True if it was running."""
+    pid = _service_pid()
+    if pid is None:
+        return False
+    try:
+        call({"op": "shutdown"}, autostart=False)
+    except SystemExit:
+        pass
+    if not _wait(lambda: not alive(pid), 15):
+        os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+        _wait(lambda: not alive(pid), 5)
+    return True
+
+
+def _logon_command() -> str | None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            return winreg.QueryValueEx(key, "agent-coord")[0]
+    except OSError:
+        return None
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    action = args.service_action
+    if not WINDOWS:
+        raise SystemExit("agent-coord service is for Windows; here use "
+                         f"systemctl --user {action} agent-coord")  # fmt: skip
+    if action == "install":
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+            winreg.SetValueEx(key, "agent-coord", 0, winreg.REG_SZ,
+                              subprocess.list2cmdline(_service_command()))  # fmt: skip
+        print("agent-coord: starts at logon (HKCU Run key)")
+        action = "start"
+    if action == "uninstall":
+        _stop_service()
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:  # fmt: skip
+                winreg.DeleteValue(key, "agent-coord")
+        except OSError:
+            pass
+        print("agent-coord: stopped; no longer starts at logon")
+        return 0
+    if action in ("stop", "restart"):
+        print("agent-coord: stopped" if _stop_service() else "agent-coord: was not running")
+        if action == "stop":
+            return 0
+    if action in ("start", "restart"):
+        if (pid := _service_pid()) is None:
+            start_service()
+            _wait(lambda: _service_pid() is not None, 20)
+            pid = _service_pid()
+        if pid is None:
+            raise SystemExit(f"agent-coord: the service did not start; see {SERVICE_LOG}")
+        print(f"agent-coord: running (pid {pid})")
+        return 0
+    pid = _service_pid()
+    print(f"service:  {f'running (pid {pid})' if pid else 'not running'}")
+    print(f"logon:    {_logon_command() or 'not installed (starts on demand)'}")
+    print(f"endpoint: {SOCKET}\nstate:    {STATE_FILE}\nlog:      {SERVICE_LOG}")
+    return 0 if pid else 3
 
 
 def _wait_for(lease_id: str, reply: dict, max_wait: float | None) -> None:
@@ -1723,6 +2539,13 @@ def mount_of(path: str) -> str:
     full = Path(os.path.realpath(os.path.expanduser(path)))
     while not full.exists() and full != full.parent:
         full = full.parent
+    if DARWIN:
+        return str(next(point for point in (full, *full.parents) if point.is_mount()))
+    if WINDOWS:
+        buf = ctypes.create_unicode_buffer(1024)
+        if _GetVolumePathNameW(str(full), buf, len(buf)):
+            return buf.value
+        return full.anchor or str(full)
     best = "/"
     for line in Path("/proc/mounts").read_text().splitlines():
         point = line.split()[1].replace("\\040", " ")
@@ -1734,6 +2557,8 @@ def mount_of(path: str) -> str:
 
 
 def disk_free(mount: str) -> int:
+    if WINDOWS:
+        return shutil.disk_usage(mount).free  # free to this user, like f_bavail
     st = os.statvfs(mount)
     return st.f_bavail * st.f_frsize
 
@@ -1747,8 +2572,14 @@ _OUTPUT_OPTIONS = {"-o", "-O", "--output", "--out", "--outdir", "--output-dir",
 
 def archive_mounts() -> list[str]:
     """Mount points of the HDD archive pools (ZFS): reference archives only;
-    active work (alignment, sorting, calling) belongs on the SSDs."""
-    mounts = []
+    active work (alignment, sorting, calling) belongs on the SSDs.
+    AGENT_COORD_ARCHIVE (paths separated by os.pathsep) adds more, e.g. a
+    NAS share on Windows, which has no /proc/mounts."""
+    mounts = [p for p in os.environ.get("AGENT_COORD_ARCHIVE", "").split(os.pathsep) if p]
+    if WINDOWS:
+        return [os.path.realpath(os.path.expanduser(m)) for m in mounts]
+    if DARWIN:
+        return mounts + [p.mountpoint for p in psutil.disk_partitions() if p.fstype == "zfs"]
     for line in Path("/proc/mounts").read_text().splitlines():
         fields = line.split()
         if len(fields) > 2 and fields[2] == "zfs":
@@ -1757,8 +2588,12 @@ def archive_mounts() -> list[str]:
 
 
 def _on_archive(path: str, mounts: list[str]) -> str | None:
-    full = os.path.realpath(os.path.expanduser(path))
-    return next((m for m in mounts if full == m or full.startswith(m.rstrip("/") + "/")), None)
+    full = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+    for m in mounts:
+        root = os.path.normcase(os.path.realpath(m))
+        if full == root or full.startswith(root.rstrip(os.sep) + os.sep):
+            return m
+    return None
 
 
 def archive_writes(cmd: list[str], cwd: str, mounts: list[str]) -> list[str]:
@@ -1780,10 +2615,22 @@ def archive_writes(cmd: list[str], cwd: str, mounts: list[str]) -> list[str]:
     return found
 
 
+def _low_priority(cmd: list[str]) -> list[str]:
+    if DARWIN:
+        return ["nice", "-n", "19", *cmd]
+    return ["nice", "-n", "19", "ionice", "-c", "3", *cmd]
+
+
+def _systemd_limits(cores: float, mem: int) -> list[str]:
+    return ["-p", f"CPUQuota={max(int(cores * 100), 1)}%", "-p", f"MemoryMax={mem}",
+            "-p", "MemorySwapMax=0"]
+
+
 def limited(cmd: list[str], cores: float, mem: int, unit: str | None = None) -> list[str]:
-    """cmd in a systemd user scope capped at cores and mem, at low priority.
-    unit names the scope (agent-coord-...), so the service can measure it."""
-    low = ["nice", "-n", "19", "ionice", "-c", "3", *cmd]
+    """Run at low priority; name Linux scopes so the service can measure them."""
+    low = _low_priority(cmd)
+    if DARWIN:
+        return low
     bus = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "bus")
     if not shutil.which("systemd-run") or not bus.exists():
         print("agent-coord: no systemd user session; running uncapped at low "
@@ -1792,9 +2639,59 @@ def limited(cmd: list[str], cores: float, mem: int, unit: str | None = None) -> 
     return [
         "systemd-run", "--user", "--scope", "--quiet", "--collect",
         *([f"--unit={unit}"] if unit else []),
-        "-p", f"CPUQuota={max(int(cores * 100), 1)}%", "-p", f"MemoryMax={mem}",
-        "-p", "MemorySwapMax=0", "--", *low,
+        *_systemd_limits(cores, mem), "--", *low,
     ]  # fmt: skip
+
+
+def _job_for(cores: float, mem: int):
+    """A Windows job object capping its processes at cores (hard CPU rate
+    cap) and mem (job commit limit) at idle priority, killed when the last
+    handle (this client's) closes: the counterpart of the systemd scope."""
+    job = _CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    # PRIORITY_CLASS | JOB_MEMORY | KILL_ON_JOB_CLOSE
+    limits.BasicLimitInformation.LimitFlags = 0x20 | 0x200 | 0x2000
+    limits.BasicLimitInformation.PriorityClass = 0x40  # IDLE_PRIORITY_CLASS ~ nice 19
+    limits.JobMemoryLimit = max(int(mem), 16 * 1024**2)
+    if not _SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    total = os.cpu_count() or 1
+    if cores < total:
+        rate = _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
+            ControlFlags=0x1 | 0x4,  # ENABLE | HARD_CAP
+            CpuRate=min(max(int(cores / total * 10000), 1), 10000))  # fmt: skip
+        if not _SetInformationJobObject(job, 15, ctypes.byref(rate), ctypes.sizeof(rate)):
+            print(f"agent-coord: no CPU rate cap ({ctypes.WinError(ctypes.get_last_error())})",
+                  file=sys.stderr)  # fmt: skip
+    return job
+
+
+def spawn_limited(cmd: list[str], cores: float, mem: int, env: dict, *,
+                  unit: str | None = None, stdout=None, stderr=None):
+    """(Popen, keep-alive handle) for cmd capped at cores and mem."""
+    if not WINDOWS:
+        return subprocess.Popen(limited(cmd, cores, mem, unit), env=env,
+                                stdout=stdout, stderr=stderr), None
+    # CreateProcess finds only .exe on PATH itself: resolve .cmd/.bat etc.
+    # through PATHEXT, as a shell would.
+    exe = shutil.which(cmd[0], path=env.get("PATH"))
+    cmd = [exe or cmd[0], *cmd[1:]]
+    try:
+        job = _job_for(cores, mem)
+    except OSError as e:
+        print(f"agent-coord: no job object ({e}); running uncapped at low priority",
+              file=sys.stderr)  # fmt: skip
+        return subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr, creationflags=0x40), None
+    # Start suspended, so nothing the command starts escapes the job.
+    child = subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr,
+                             creationflags=0x4)  # CREATE_SUSPENDED
+    if not _AssignProcessToJobObject(job, int(child._handle)):  # noqa: SLF001
+        print(f"agent-coord: not capped ({ctypes.WinError(ctypes.get_last_error())})",
+              file=sys.stderr)  # fmt: skip
+    _NtResumeProcess(int(child._handle))  # noqa: SLF001
+    return child, job
 
 
 def parse_disk(text: str) -> tuple[str, int]:
@@ -1812,6 +2709,68 @@ def _lease_request(args: argparse.Namespace, pid: int) -> dict:
             "expect": args.expect, "disk": dict(args.disk or [])}  # fmt: skip
 
 
+def detached_run(args: argparse.Namespace, command: list[str]) -> int:
+    unit = unit_name(args.unit)
+    worker = [sys.executable, str(Path(__file__).resolve()), f"--as={args.agent}", "run",
+              f"--label={args.label}", f"--cores={args.cores}", f"--mem={args.mem}",
+              f"--headroom={args.headroom}", f"--managed-unit={unit}"]
+    for name in ("io", "exclusive", "allow_archive"):
+        if getattr(args, name):
+            worker.append("--" + name.replace("_", "-"))
+    for name in ("expect", "max_wait"):
+        if (value := getattr(args, name)) is not None:
+            worker.append(f"--{name.replace('_', '-')}={value:f}s")
+    for name in ("lock", "exclusive_lock", "disk"):
+        for value in getattr(args, name) or ():
+            if name == "disk":
+                value = f"{Path(value[0]).expanduser().resolve()}:{value[1]}"
+            worker.append(f"--{name.replace('_', '-')}={value}")
+    worker.extend(["--", *command])
+    cwd = os.getcwd()
+    overrides = {key: os.environ[key] for key in
+                 ("AGENT_COORD_RUNTIME_DIR", "AGENT_COORD_STATE_DIR") if key in os.environ}
+    try:
+        if sys.platform.startswith("linux"):
+            supports_literal = "--expand-environment" in subprocess.check_output(
+                ["systemd-run", "--help"], text=True, timeout=5
+            )
+            cmd = ["systemd-run", "--user", "--collect", f"--unit={unit}",
+                   "--property=Type=exec", "--property=KillMode=mixed", f"--working-directory={cwd}",
+                   *_systemd_limits(args.cores, args.mem)]
+            if supports_literal:
+                cmd.append("--expand-environment=no")
+            else:
+                worker = [arg.replace("$", "$$") for arg in worker]
+            cmd.extend(f"--setenv={key}={value}" for key, value in overrides.items())
+            subprocess.run([*cmd, "--", *worker], check=True, timeout=20)
+        else:
+            directory = STATE_FILE.parent / "units"
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            log = directory / f"{unit}.log"
+            if sys.platform == "darwin":
+                plist = directory / f"{unit}.{os.getpid()}.plist"
+                domain = f"gui/{os.getuid()}"
+                plist.touch(mode=0o600, exist_ok=False)
+                try:
+                    with plist.open("wb") as f:
+                        plistlib.dump({"Label": unit, "ProgramArguments": worker, "WorkingDirectory": cwd,
+                                       "StandardOutPath": str(log), "StandardErrorPath": str(log),
+                                       "EnvironmentVariables": overrides, "RunAtLoad": True}, f)
+                    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
+                finally:
+                    plist.unlink()
+            elif sys.platform == "win32":
+                with log.open("ab") as f:
+                    _spawn_windows_background(worker, cwd, f)
+            else:
+                raise ValueError("detached runs are unsupported on this platform")
+            print(f"log: {log}")
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        raise SystemExit(f"agent-coord: could not start detached unit {unit}: {e}") from e
+    print(f"detached: {unit}")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
@@ -1824,19 +2783,33 @@ def cmd_run(args: argparse.Namespace) -> int:
             "or write there: " + "; ".join(bad) + ". Reading inputs from it is "
             "fine. Override with --allow-archive (e.g. archiving a finished result)."
         )
-    reply = call(_lease_request(args, os.getpid()))
+    if args.detach:
+        return detached_run(args, command)
+    pid = os.getpid()
+    in_systemd = args.managed_unit and sys.platform.startswith("linux")
+    if in_systemd and unit_pid(args.managed_unit) != pid:
+        raise SystemExit("agent-coord: managed run must be the named systemd service's main process")
+    reply = call({**_lease_request(args, pid), "run_unit": args.managed_unit})
     lease_id = reply["id"]
     child = None
     end: dict = {}
+    stopping_unit = False
 
     def forward(signum: int, _frame: object) -> None:
+        nonlocal stopping_unit
+        stopping_unit = bool(args.managed_unit and signum == signal.SIGTERM)
         if child is not None and child.poll() is None:
-            child.send_signal(signum)
+            if not WINDOWS:
+                child.send_signal(signum)
+            elif signum == signal.SIGTERM:
+                child.terminate()
+            # Windows: Ctrl+C/Ctrl+Break reach the child through the console.
         else:
             raise KeyboardInterrupt
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, forward)
+    for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), forward)
     try:
         _wait_for(lease_id, reply, args.max_wait)
         print(f"agent-coord: {lease_id} started ({args.cores:g} cores, "
@@ -1846,10 +2819,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         # get killed at it: tell them the lease's memory (heap up to 60% of it).
         java = f"-XX:MaxRAM={args.mem} -XX:MaxRAMPercentage=60"
         env["JAVA_TOOL_OPTIONS"] = f"{env.get('JAVA_TOOL_OPTIONS', '')} {java}".strip()
-        child = subprocess.Popen(limited(command, args.cores, args.mem,
-                                         unit=f"{SCOPE_PREFIX}{lease_id}-{os.getpid()}"), env=env)
+        if in_systemd:
+            child = subprocess.Popen(_low_priority(command), env=env)
+        elif WINDOWS and args.managed_unit:
+            child, _job = spawn_limited(command, args.cores, args.mem, env,
+                                        stdout=sys.stdout, stderr=sys.stderr)
+        else:
+            child, _job = spawn_limited(command, args.cores, args.mem, env,
+                                        unit=f"{SCOPE_PREFIX}{lease_id}-{pid}")
         code = child.wait()
-        if code == -signal.SIGKILL:
+        if code == -getattr(signal, "SIGKILL", 9):
             print(f"agent-coord: {lease_id} was killed; if it used more than "
                   f"--mem {human(args.mem)}, lease more", file=sys.stderr)  # fmt: skip
         end["code"] = 128 - code if code < 0 else code
@@ -1858,10 +2837,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         end.update(code=130, why="interrupted")
         return 130
     finally:
-        try:
-            call({"op": "release", "id": lease_id, **end}, retry=120)
-        except SystemExit:
-            pass
+        if not stopping_unit:
+            try:
+                call({"op": "release", "id": lease_id, **end}, retry=120)
+            except SystemExit:
+                pass
 
 
 def cmd_hold(args: argparse.Namespace) -> int:
@@ -1871,9 +2851,28 @@ def cmd_hold(args: argparse.Namespace) -> int:
                       "label": args.label, "expect": args.expect})
         print(reply["id"])
         return 0
-    if not alive(args.pid):
+    unit = unit_name(args.unit) if args.unit else None
+    pidfile = str(Path(args.pidfile).expanduser().resolve()) if args.pidfile else None
+    if unit and sys.platform not in ("darwin", "linux"):
+        raise SystemExit("agent-coord hold: use --pidfile on this platform")
+    candidates = (unit_pid(unit) if unit else 0, read_pidfile(pidfile) if pidfile else 0, args.pid or 0)
+    pid = next((p for p in candidates if p > 0 and alive(p)), 0)
+    if not pid and not (unit or pidfile):
         raise SystemExit(f"agent-coord hold: no process {args.pid}")
-    reply = call({**_lease_request(args, args.pid), "running": True})
+    reply = call({**_lease_request(args, pid), "running": True, "unit": unit, "pidfile": pidfile})
+    print(reply["id"])
+    return 0
+
+
+def cmd_poll(args: argparse.Namespace) -> int:
+    result = call({"op": "poll", "id": args.id})
+    print(json.dumps(result) if args.json else "restarting" if result.get("restarting") else result["state"])
+    return int(result["state"] == "gone")
+
+
+def cmd_phase(args: argparse.Namespace) -> int:
+    reply = call({"op": "phase", "id": args.id, "pid": os.getpid(), "agent": args.agent,
+                  "name": args.exclusive_lock or args.release, "release": bool(args.release)})
     print(reply["id"])
     return 0
 
@@ -1894,10 +2893,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(s, indent=2))
         return 0
     cap, free = s["capacity"], s["free"]
-    load = " ".join(f"{x:.1f}" for x in s["load"])
+    load = " ".join(f"{x:.1f}" for x in s["load"]) if s.get("load") else None
     print(f"{cap['cores']:g} cores, {human(cap['mem'])} for leases "
           f"({human(cap['reserve'])} kept back); free {free['cores']:.1f} cores, "
-          f"{human(free['mem'])}; load {load}")  # fmt: skip
+          f"{human(free['mem'])}" + (f"; load {load}" if load else ""))  # fmt: skip
     if s.get("available") is not None:
         print(f"memory actually available now: {human(s['available'])} "
               f"(leases need theirs plus {human(cap['reserve'])} of it)")
@@ -1918,6 +2917,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             flag += f" locks {','.join(x['locks'])}"
         if x.get("disk"):
             flag += " disk " + ",".join(f"{m}:{human(n)}" for m, n in x["disk"].items())
+        if unit := x.get("unit") or x.get("run_unit"):
+            flag += f" unit {unit}"
         detail = x.get("reason") if state == "waiting" else x.get("overrun_reason") or x.get("backfill_reason")
         why = f" -- {detail}" if detail else ""
         cpu = f"{x['cores']:>4g} cores"
@@ -1929,8 +2930,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             cpu = f"{x['cores']:g}-core cap"
             if state == "held":
                 cpu += f", {x['measured_cores']:g} used"
+        tracking = " restarting" if "missing_since" in x else ""
         print(f"  {x['id']:<6} {state:<7} {cpu} {human(mem):>6} "
-              f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){why}")
+              f"{since:5.0f} min  {x['agent']}: {x['label']}{flag} (pid {x['pid']}){tracking}{why}")
+        for warning in x.get("exclusive_warnings", {}).values():
+            print(f"    warning: {warning}")
     if "busy_cores" in s:
         print(f"cores busy now (measured): {s['busy_cores']:g} of {cap['cores']:g}; "
               "CPU admission uses this; memory admission uses lease sizes, or "
@@ -2049,7 +3053,12 @@ def cmd_history(args: argparse.Namespace) -> int:
             if "cores_peak" in e:
                 peak.append(f"{e['cores_peak']:g} cores")
             times.append("peak " + ", ".join(peak))
+        if "exclusive_seconds" in e:
+            times.extend(f"{key} {_minutes(e[key + '_seconds'])}"
+                         for key in ("exclusive", "observed", "active"))
         detail = e.get("reason") or e.get("why") or e.get("backfill_reason") or ""
+        if "resource" in e:
+            detail = " ".join(x for x in (e["resource"], detail) if x)
         print(f"{stamp} {e['event']:<9} {e['id']:<6} {e['cores']:>4g}c {human(e['mem']):>6} "
               f"{e['agent']}: {e['label']}{flag}"
               + (f" [{', '.join(times)}]" if times else "")
@@ -2129,12 +3138,25 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--label", required=True)
         sub.add_argument("--max-wait", type=parse_duration)
         if name == "hold":
-            sub.add_argument("--pid", type=int, required=True)
+            sub.add_argument("--pid", type=int)
             sub.add_argument("--owner-pid", type=int, help="register a watch: label with a hard --expect expiry")
+            sub.add_argument("--pidfile", type=Path)
+            sub.add_argument("--unit", type=unit_name)
         else:
             sub.add_argument("--allow-archive", action="store_true")
+            sub.add_argument("--detach", action="store_true")
+            sub.add_argument("--unit", type=unit_name)
+            sub.add_argument("--managed-unit", help=argparse.SUPPRESS)
             sub.add_argument("command", nargs=argparse.REMAINDER)
     subs.add_parser("status").add_argument("--json", action="store_true")
+    poll = subs.add_parser("poll")
+    poll.add_argument("id")
+    poll.add_argument("--json", action="store_true")
+    phase = subs.add_parser("phase")
+    phase.add_argument("id", nargs="?")
+    choice = phase.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--exclusive-lock", metavar="NAME")
+    choice.add_argument("--release", metavar="NAME")
     history = subs.add_parser("history")
     history.add_argument("--since", type=parse_duration)
     history.add_argument("--json", action="store_true")
@@ -2157,8 +3179,12 @@ def main(argv: list[str] | None = None) -> int:
     unlock.add_argument("--force", action="store_true")
     subs.add_parser("release").add_argument("id")
     subs.add_parser("serve")
+    subs.add_parser("service").add_argument(
+        "service_action", choices=["install", "uninstall", "start", "stop", "restart", "status"])
     args = parser.parse_args(argv)
     if args.action == "hold" and args.owner_pid is not None:
+        if args.pid is None or args.pidfile is not None or args.unit:
+            parser.error("watchers require --pid and cannot follow --pidfile or --unit")
         if (args.cores is not None or args.mem is not None or args.io or args.exclusive
                 or args.lock or args.exclusive_lock or args.disk or args.headroom
                 or args.max_wait is not None):
@@ -2173,14 +3199,20 @@ def main(argv: list[str] | None = None) -> int:
     args.agent = args.agent or default_agent()
     if getattr(args, "exclusive", False) and getattr(args, "exclusive_lock", None):
         parser.error("--exclusive already excludes everything; drop --exclusive-lock")
+    if args.action == "hold" and not (args.pid or args.pidfile or args.unit):
+        parser.error("hold requires --pid, --pidfile or --unit")
+    if args.action == "run" and args.detach != bool(args.unit):
+        parser.error("run --detach and --unit NAME must be used together")
     if args.action == "serve":
         serve()
         return 0
     return {
         "run": cmd_run, "hold": cmd_hold, "check": cmd_check, "status": cmd_status,
         "history": cmd_history,
+        "poll": cmd_poll, "phase": cmd_phase,
         "send": cmd_send, "inbox": cmd_inbox, "agents": cmd_agents,
         "release": cmd_release, "lock": cmd_lock, "unlock": cmd_unlock,
+        "service": cmd_service,
     }[args.action](args)  # fmt: skip
 
 

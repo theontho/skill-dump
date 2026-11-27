@@ -457,7 +457,10 @@ def page():
         rows = "".join(
             f"<div><span class=tag style='background:{'#2e7d32' if r['state'] in ('held', 'running') else '#455a64'}'>"
             f"{esc(r['state'])}</span> {esc(r['label'])} <small>{esc(r['cores'])} cores"
-            f"{(' · ' + esc(r['mem'])) if r.get('mem') else ''} · {esc(r['minutes'])}{' min' if r.get('id') else ''}</small></div>"
+            f"{(' · ' + esc(r['mem'])) if r.get('mem') else ''} · {esc(r['minutes'])}{' min' if r.get('id') else ''}"
+            f"{' · ' + esc(r['unit']) if r.get('unit') else ''}{' · restarting' if r.get('restarting') else ''}</small>"
+            + "".join(f"<div><small>{esc(w)}</small></div>" for w in r.get("warnings", []))
+            + "</div>"
             for r in h.get("leases", [])
         )
         return (

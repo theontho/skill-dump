@@ -117,14 +117,17 @@ applied) and the action parked with `--blocks`.
 
 - **Idle hosts:** `[events] idle_minutes` (default `45`) is the minimum time a
   host must be observed reachable without working or waiting dashboard agents,
-  held `agent-coord` leases, heavy processes from a configured process probe,
-  or running certifications or remote tests. Report agents with
+  held `agent-coord` leases (including PID-file or unit holds during a restart),
+  queued detached drivers, heavy processes from a configured process probe, or
+  running certifications or remote tests. Report agents with
   `pr-coord agent NAME STATUS --machine HOST` using the host key, display name,
   or SSH alias. The host collector supplies the observations; `event-collect` does
   not probe the hosts itself. Enable `agent_coord = true` on hosts whose leases
   should be collected; hosts without a workload probe get a reachability check.
-  An offline host is not idle. Loss of observations resets the timer, but a
-  reported host must be seen busy before another alert.
+  An offline host is not idle. If a configured `agent-coord` probe fails,
+  a process probe can still show work but cannot establish that the host is idle.
+  Loss of observations resets the timer, but a reported host must be seen busy
+  before another alert.
   Set `idle_alert = false` in a host entry to suppress its alerts without
   hiding the dashboard's “idle since” marker.
 - **GitHub:** `github.repo`, `owner`, `tracked_authors`, `base_branch`, `remote`.

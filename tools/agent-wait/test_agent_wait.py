@@ -59,8 +59,8 @@ class WaitTest(unittest.TestCase):
                 proc.kill()
         proc.communicate(timeout=3)
 
-    def until(self, predicate):
-        deadline = time.monotonic() + 5
+    def until(self, predicate, *, timeout=5):
+        deadline = time.monotonic() + timeout
         while not predicate():
             if time.monotonic() >= deadline:
                 self.fail("condition did not occur")
@@ -267,6 +267,37 @@ seen.touch()
         self.assertIsNone(proc.poll())
         self.coord("release", lease)
         self.result(proc, 0, "ended")
+
+    @unittest.skipUnless(LINUX, "agent-coord ships on Linux")
+    def test_watcher_reaping_does_not_remove_restarted_pidfile_lease(self):
+        argv = [sys.executable, "-c", "import time; time.sleep(30)"]
+        driver, replacement = self.spawn(argv), self.spawn(argv)
+        watch, owner = self.spawn(argv), self.spawn(argv)
+        pidfile = self.root / "driver.pid"
+        pidfile.write_text(str(driver.pid))
+        lease = self.coord("--as", "driver", "hold", "--io", "--label", "driver",
+                           "--pidfile", str(pidfile)).strip()
+        self.coord("--as", "driver", "phase", lease, "--exclusive-lock", "gpu")
+        self.coord("hold", "--label", "watch:orphan", "--expect", "25s",
+                   "--pid", str(watch.pid), "--owner-pid", str(owner.pid))
+        owner.kill()
+        self.assertEqual(watch.wait(timeout=8), -signal.SIGTERM)
+        driver.kill()
+        driver.wait(timeout=5)
+        next_pidfile = pidfile.with_suffix(".new")
+        next_pidfile.write_text(str(replacement.pid))
+        next_pidfile.replace(pidfile)
+
+        def reattached():
+            snapshot = json.loads(self.coord("status", "--json"))
+            return (not snapshot["watchers"] and any(
+                row["id"] == lease and row["pid"] == replacement.pid
+                and "gpu" not in row["locks"] for row in snapshot["leases"]
+            ))
+
+        self.until(reattached, timeout=12)
+        self.coord("--as", "driver", "phase", lease, "--exclusive-lock", "gpu")
+        self.coord("--as", "driver", "phase", lease, "--release", "gpu")
 
     @unittest.skipUnless(LINUX, "agent-coord ships on Linux")
     def test_coordinator_reaps_an_expired_watcher_that_ignores_term(self):
