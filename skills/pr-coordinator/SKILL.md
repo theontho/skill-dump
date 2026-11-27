@@ -25,8 +25,20 @@ every machine staffed with implementer or long-run work suited to its hardware.
   never the whole queue. Ask once, park those items, and move on.
 - A machine with no agent, no lease and no long run is a defect, not a resting
   state. When `events` reports an idle host, dispatch the next suitable item.
-- Before ending a turn, check that unblocked work remains assigned on every
-  machine; if not, assign it.
+- At the start of every supervisor turn, run `pr-coord --project PROJECT
+  agent supervisor heartbeat`. If the owner had to prompt you to continue
+  or ask for status after a long gap, use `heartbeat --owner-resume` instead
+  on that turn. Treat the gap as an incident: record it, check what stalled,
+  and reactivate the watcher and dispatch.
+- End a turn only when every managed host has an agent, a lease, or a
+  registered unattended run with a failure alert, or when the queue is
+  verifiably empty of eligible work. If empty, report what you checked:
+  queue sources and filters, and why remaining items can't be dispatched.
+  An empty PR list, an unchecked source or a failed query isn't an empty
+  queue.
+- "Waiting on X" means hand X to a watcher with a concrete wake trigger,
+  then take the next item. Don't use a wait as a reason to leave hosts idle
+  with work still available.
 - Landing continues in the background: implementers hand drafts to
   `finish-draft`, and the train lands them.
 
@@ -43,13 +55,13 @@ every machine staffed with implementer or long-run work suited to its hardware.
    train and runner yield/stale cancellation. Run it in a managed foreground
    session and monitor exits. The server defaults to loopback and has no access
    control of its own.
-4. Use `pr-coord --project <project> events --wait` for the next batch of main
-   failures, queue drops, questions or idle hosts. Run it again after handling
-   the batch. The `run` service collects events even with no waiter, and the
-   dashboard shows recent events, the pending count and when the supervisor
-   last read a batch. Reuse the default `supervisor` cursor on handoff. Keep
-   the configuration and run commands in the handoff so another coordinator
-   can resume.
+4. Keep `pr-coord --project <project> events --wait` armed as a background
+   watcher. It delivers main failures, queue drops, questions, idle hosts and
+   `SUPERVISOR-IDLE` alerts. Handle each batch and rearm the watcher. The `run`
+   service collects events even with no waiter; the dashboard shows recent
+   events, pending counts, supervisor heartbeats and owner-resume incidents.
+   Reuse the default `supervisor` cursor on handoff. Keep the configuration
+   and run commands in the handoff so another coordinator can resume.
 5. Start implementers on another machine with `pr-coord --project <project>
    remote-agent <host> <name> <prompt-file>` (tmux on POSIX hosts). On a
    Windows host (`windows = true`) the agent runs detached under the host's

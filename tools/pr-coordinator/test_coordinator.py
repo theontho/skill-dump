@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
@@ -259,6 +260,7 @@ esac
         known = self.data / "events_known.json"
         seen.write_text('["main:sha:already seen"]')
         known.write_text('["known check"]')
+        self.command("agent", "supervisor", "heartbeat")
         self.command("event-collect", "--once")
         # With no reader, writing the batch must fail without consuming it.
         reader, writer = os.pipe()
@@ -279,6 +281,137 @@ esac
         self.assertNotIn("'already seen'", result.stdout)
         self.assertEqual(json.loads(seen.read_text()), ["main:sha:already seen"])
         self.assertEqual(json.loads(known.read_text()), ["known check"])
+
+    def age_supervisor_heartbeat(self, *, minutes):
+        path = self.data / "events_journal.json"
+        journal = json.loads(path.read_text())
+        journal["supervisor"]["last_heartbeat"] = (
+            datetime.now(UTC) - timedelta(minutes=minutes)
+        ).isoformat(timespec="seconds")
+        path.write_text(json.dumps(journal))
+
+    def test_supervisor_idle_waiter_and_dashboard_alert_once_until_heartbeat(self):
+        import dashboard
+
+        self.checkout.mkdir()
+        self.env["GIT_CEILING_DIRECTORIES"] = str(self.root)
+        with self.config.open("a") as config:
+            config.write("""
+[events]
+interval = 1
+supervisor_idle_minutes = 1
+queue_search = "label:efficiency"
+[hosts.worker]
+display = "Worker"
+process_probe = "printf 'load\\\\n'"
+""")
+        self.fake_gh("""
+if [ "$1" = issue ]; then
+  case " $* " in
+    *' --repo example/gadgets '*' --search label:efficiency '*)
+      printf '[{"number":42,"state":"OPEN","labels":[]}]\\n' ;;
+    *) exit 1 ;;
+  esac
+fi
+""")
+        self.command("agent", "supervisor", "heartbeat")
+        self.age_supervisor_heartbeat(minutes=2)
+        self.command("hosts")
+        self.background("run", "--port", "0")
+        (alert,) = json.loads(
+            self.command("events", "--wait", "--json", timeout=10).stdout
+        )
+        self.assertIn("SUPERVISOR-IDLE:", alert["message"])
+        self.assertIn("Worker", alert["message"])
+        self.assertIn("#42", alert["message"])
+
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        with mock.patch.object(dashboard, "P", project):
+            self.assertIn("SUPERVISOR-IDLE:", dashboard.events_panel())
+        # Reading the alert isn't a heartbeat; intervening batches have no repeat.
+        self.command("ask", "another event", "--machine", "worker")
+        (other,) = json.loads(
+            self.command("events", "--wait", "--json", timeout=10).stdout
+        )
+        self.assertIn("another event", other["message"])
+
+    def test_supervisor_idle_requires_threshold_reachable_capacity_and_eligible_issue(
+        self,
+    ):
+        from runtime import save
+
+        self.idle_project()
+        self.command("agent", "supervisor", "heartbeat")
+        state = {
+            "hosts_observed_at": time.time(),
+            "hosts": {"worker": {"reachable": True}},
+        }
+        save(self.data / "state.json", state)
+        self.fake_gh("""
+if [ "$1" = issue ]; then
+  printf '[{"number":42,"state":"OPEN","labels":[]}]\\n'
+fi
+""")
+
+        def collect_messages():
+            self.command("event-collect", "--once")
+            return [
+                row["message"]
+                for row in json.loads((self.data / "events_journal.json").read_text())[
+                    "events"
+                ]
+            ]
+
+        self.age_supervisor_heartbeat(minutes=29)
+        self.assertEqual(collect_messages(), [])
+        self.age_supervisor_heartbeat(minutes=30)
+        state["hosts"]["worker"]["leases"] = [{"state": "held"}]
+        save(self.data / "state.json", state)
+        self.assertEqual(collect_messages(), [])
+        state["hosts"]["worker"]["leases"] = []
+        state["hosts"]["worker"]["reachable"] = False
+        save(self.data / "state.json", state)
+        self.assertEqual(collect_messages(), [])
+        state["hosts"]["worker"]["reachable"] = True
+        save(self.data / "state.json", state)
+        self.fake_gh("""
+if [ "$1" = issue ]; then
+  printf '[{"number":1,"state":"OPEN","labels":[{"name":"check-later"}]},
+    {"number":2,"state":"OPEN","labels":[{"name":"research-done"}]},
+    {"number":3,"state":"OPEN","labels":[{"name":"hands-off"}]},
+    {"number":4,"state":"OPEN","labels":[{"name":"Machine-Other"}]},
+    {"number":5,"state":"CLOSED","labels":[]}]\\n'
+fi
+""")
+        self.assertEqual(collect_messages(), [])
+        self.fake_gh("exit 1\n")
+        self.assertEqual(collect_messages(), [])
+        self.fake_gh("""
+if [ "$1" = issue ]; then
+  printf '[{"number":42,"state":"OPEN","labels":[]}]\\n'
+fi
+""")
+        self.assertIn("#42", collect_messages()[0])
+        self.command("agent", "supervisor", "heartbeat")
+        self.assertEqual(len(collect_messages()), 1)
+        self.age_supervisor_heartbeat(minutes=31)
+        self.assertEqual(len(collect_messages()), 2)
+
+    def test_owner_resume_records_long_gap_without_reading_chat(self):
+        import dashboard
+
+        self.command("agent", "supervisor", "heartbeat", "--owner-resume")
+        self.age_supervisor_heartbeat(minutes=31)
+        self.command("agent", "supervisor", "heartbeat", "--owner-resume")
+        self.command("agent", "supervisor", "heartbeat", "--owner-resume")
+        (incident,) = json.loads(
+            self.command("events", "--wait", "--json", timeout=5).stdout
+        )
+        self.assertIn("OWNER-RESUME:", incident["message"])
+        self.assertIn("31 min", incident["message"])
+        project = Project("gadgets", config_file=self.config, data_dir=self.data)
+        with mock.patch.object(dashboard, "P", project):
+            self.assertIn("Owner-resume incidents: 1", dashboard.events_panel())
 
     def idle_project(self, *, threshold_override=None):
         with self.config.open("a") as config:

@@ -51,6 +51,28 @@ not consume the batch. Stdout and the on-disk cursor cannot commit together:
 if the process dies after output but before saving the cursor, it can replay
 that batch. Use `--json` and deduplicate by `id` if automating batch handling.
 
+At the start of every supervisor turn, run `pr-coord --project PROJECT agent
+supervisor heartbeat`. A blocked waiter (or reading a batch) is not a
+heartbeat. After `[events] supervisor_idle_minutes` (default `30`) without a
+heartbeat, the collector emits one `SUPERVISOR-IDLE` event per gap if it
+observes a fresh, reachable idle host with idle alerts enabled and finds an
+eligible issue. Until the first heartbeat, the clock starts on the first
+collection with this feature. Detection runs on the collection interval.
+
+The default queue check queries the first 1,000 open issues in `[github] repo`,
+requesting only metadata. It excludes `check-later`, `research-done`,
+`hands-off`, and labels starting with `[labels] machine_prefix` (`machine-`
+by default). Set `[events] queue_search` to an
+additional GitHub issue search to narrow the queue (for example,
+`'label:efficiency'`). This is a dispatch signal, not proof the real queue is
+empty or permission to take an issue; the supervisor still checks policy.
+A failed GitHub query does not count as evidence of eligible work.
+
+If an owner prompt such as “continue” or “status” ends a long gap, use the
+same heartbeat with `--owner-resume`. The coordinator cannot read chat; the
+flag records an `OWNER-RESUME` incident after the configured threshold, with
+no chat content saved. Alerts and incident counts appear on the dashboard.
+
 To upgrade an existing installation, stop any old `events` process, then
 stop the running `run` with SIGTERM (or use your service manager) and relaunch
 `pr-coord --project PROJECT run` with the same options as before. This one-time

@@ -66,6 +66,9 @@ required_statuses = ["local-ci/generic", "local-ci/linux-x64"]
 [events]
 interval = 90
 idle_minutes = 45
+supervisor_idle_minutes = 30
+# Optional additional GitHub issue search, e.g. 'label:efficiency'.
+queue_search = ""
 ignored_check_prefixes = ["local-ci/", "rerun"]
 
 [loops]

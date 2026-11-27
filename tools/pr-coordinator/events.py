@@ -19,6 +19,7 @@ KNOWN_FILE = HERE / "events_known.json"
 JOURNAL = "events_journal.json"
 DEFAULT_CONSUMER = "supervisor"
 PRODUCER_LOCK = "event-collect.lock"
+PARKED_LABELS = {"check-later", "research-done", "hands-off"}
 
 
 def empty_journal():
@@ -132,26 +133,30 @@ def agent_questions():
     ]
 
 
-def idle_hosts(state, project, *, now):
-    threshold = project.get("events", "idle_minutes", 45)
-    observed_at = state.get("hosts_observed_at")
-    if observed_at is None or not 0 <= now - observed_at <= probe_window(project):
+def reachable_idle_hosts(state, project, *, now):
+    observed = state.get("hosts_observed_at")
+    if observed is None or not 0 <= now - observed <= probe_window(project):
         return []
     busy = busy_hosts(state, project.hosts)
-    live = state.get("hosts", {})
+    return [
+        key
+        for key, spec in project.hosts.items()
+        if spec.get("idle_alert", True)
+        and key not in busy
+        and state.get("hosts", {}).get(key, {}).get("reachable")
+    ]
+
+
+def idle_hosts(state, project, *, now):
+    threshold = project.get("events", "idle_minutes", 45)
     events = []
-    for key, spec in project.hosts.items():
-        if (
-            not spec.get("idle_alert", True)
-            or key in busy
-            or not live.get(key, {}).get("reachable")
-        ):
-            continue
+    for key in reachable_idle_hosts(state, project, now=now):
+        observed_at = state["hosts_observed_at"]
         episode = state.get("host_idle", {}).get(key, {})
         since = episode.get("since")
         if since is not None and observed_at - since >= threshold * 60:
             minutes = int((observed_at - since) // 60)
-            host = spec.get("display", key)
+            host = project.hosts[key].get("display", key)
             events.append(
                 (
                     f"idle:{key}:{episode['id']}",
@@ -159,6 +164,70 @@ def idle_hosts(state, project, *, now):
                 )
             )
     return events
+
+
+def eligible_issue():
+    args = [
+        "issue",
+        "list",
+        "--repo",
+        REPO,
+        "--state",
+        "open",
+        "--limit",
+        "1000",
+        "--json",
+        "number,state,labels",
+    ]
+    if search := P.get("events", "queue_search", ""):
+        args += ["--search", search]
+    out = gh(*args)
+    if not out:
+        return None
+    machine_prefix = P.get("labels", "machine_prefix", "machine-").casefold()
+    for issue in json.loads(out):
+        if issue["state"] != "OPEN":
+            continue
+        labels = {label["name"].casefold() for label in issue["labels"]}
+        if not labels & PARKED_LABELS and not any(
+            label.startswith(machine_prefix) for label in labels
+        ):
+            return issue["number"]
+    return None
+
+
+def inactive_minutes(since, at):
+    return int(
+        (datetime.fromisoformat(at) - datetime.fromisoformat(since)).total_seconds()
+        // 60
+    )
+
+
+def activity_since(supervisor):
+    return supervisor.get("last_heartbeat") or supervisor.get("monitoring_since")
+
+
+def heartbeat(*, owner_resume=False):
+    with locked("events-journal.lock"):
+        journal = read_journal()
+        if not (HERE / JOURNAL).exists():
+            # Let the first collector still import legacy seen IDs.
+            journal["collection_pending"] = True
+        supervisor = journal.setdefault("supervisor", {})
+        at = timestamp()
+        since = activity_since(supervisor)
+        if owner_resume and since:
+            minutes = inactive_minutes(since, at)
+            if minutes >= P.get("events", "supervisor_idle_minutes", 30):
+                journal["events"].append(
+                    {
+                        "id": f"owner-resume:{since}",
+                        "at": at,
+                        "message": f"OWNER-RESUME: owner prompted the supervisor after {minutes} min without a heartbeat",
+                    }
+                )
+        supervisor["last_heartbeat"] = at
+        save(HERE / JOURNAL, journal)
 
 
 def collect(*, legacy_baseline=False):
@@ -177,8 +246,8 @@ def collect(*, legacy_baseline=False):
     events += idle_hosts(load(HERE / "state.json", {}), P, now=time.time())
     with locked("events-journal.lock"):
         path = HERE / JOURNAL
-        first = not path.exists()
         journal = read_journal()
+        first = not path.exists() or journal.pop("collection_pending", False)
         if first:
             seen_path = HERE / "events_seen.json"
             try:
@@ -192,6 +261,11 @@ def collect(*, legacy_baseline=False):
         seen = set(journal["legacy_seen"]) | {row["id"] for row in journal["events"]}
         at = timestamp()
         changed = first
+        supervisor = journal.setdefault("supervisor", {})
+        since = activity_since(supervisor)
+        if since is None:
+            supervisor["monitoring_since"] = since = at
+            changed = True
         for key, message in events:
             if key not in seen:
                 journal["events"].append({"id": key, "at": at, "message": message})
@@ -199,6 +273,53 @@ def collect(*, legacy_baseline=False):
                 changed = True
         if changed:
             save(path, journal)
+
+    key = f"supervisor-idle:{since}"
+    if key not in seen and inactive_minutes(since, at) >= P.get(
+        "events", "supervisor_idle_minutes", 30
+    ):
+        collect_supervisor_idle(key, since)
+
+
+def collect_supervisor_idle(key, since):
+    def idle_now():
+        return reachable_idle_hosts(load(HERE / "state.json", {}), P, now=time.time())
+
+    if not idle_now():
+        return
+    try:
+        issue = eligible_issue()
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        print(f"events: issue queue: {exc}", file=sys.stderr, flush=True)
+        return
+    if issue is None:
+        return
+    with locked("events-journal.lock"):
+        journal = read_journal()
+        # A heartbeat or host update may have arrived during the GitHub query.
+        if activity_since(journal["supervisor"]) != since:
+            return
+        if hosts := idle_now():
+            names = ", ".join(P.hosts[host].get("display", host) for host in hosts)
+            at = timestamp()
+            minutes = inactive_minutes(since, at)
+            journal["events"].append(
+                {
+                    "id": key,
+                    "at": at,
+                    "message": (
+                        f"SUPERVISOR-IDLE: no heartbeat for {minutes} min; idle hosts: "
+                        f"{names}; eligible queue item: #{issue}"
+                    ),
+                }
+            )
+            save(HERE / JOURNAL, journal)
 
 
 def collect_main():

@@ -102,7 +102,19 @@ def main():
     )
     p.add_argument("--target")
     p.add_argument("--sha")
+    p.add_argument(
+        "--owner-resume",
+        action="store_true",
+        help="record a long gap ended by an owner nudge (agent supervisor heartbeat)",
+    )
     a = p.parse_args()
+    if a.cmd == "agent" and a.args == ["supervisor", "heartbeat"]:
+        from events import heartbeat
+
+        heartbeat(owner_resume=a.owner_resume)
+        return
+    if a.owner_resume:
+        p.error("--owner-resume requires agent supervisor heartbeat")
     lock = open(HERE / "state.lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
     s = load(STATE, {"prs": [], "machines": [], "log": []})

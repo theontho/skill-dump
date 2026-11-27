@@ -294,7 +294,13 @@ def events_panel():
         f"<li><small>{esc(row['at'])}</small> {esc(row['message'])}</li>"
         for row in reversed(events[-20:])
     )
-    return f"<ul>{statuses}</ul>" + (f"<ul>{recent}</ul>" if recent else "")
+    supervisor = journal.get("supervisor", {})
+    resumed = sum(row["id"].startswith("owner-resume:") for row in events)
+    heartbeat = esc(supervisor.get("last_heartbeat", "never"))
+    return (
+        f"<p>Last supervisor heartbeat: {heartbeat} · Owner-resume incidents: {resumed}</p>"
+        f"<ul>{statuses}</ul>" + (f"<ul>{recent}</ul>" if recent else "")
+    )
 
 
 def page():
