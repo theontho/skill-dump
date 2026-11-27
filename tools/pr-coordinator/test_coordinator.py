@@ -572,6 +572,7 @@ idle_alert = false
         cases = [
             ("idle", {}, {"reachable": True}, True),
             ("unreachable", {}, {"reachable": False}, False),
+            ("activity probe failed", {}, {"reachable": True, "activity_known": False}, False),
             ("missing observation", {}, {}, False),
             (
                 "agent key",
@@ -690,6 +691,30 @@ idle_alert = false
             snapshot = leases(None)
         self.assertTrue(snapshot["reachable"])
         self.assertEqual([(row["state"], row["label"]) for row in snapshot["leases"]], [("held", "dev: download")])
+
+    def test_registered_detached_driver_prevents_idle_even_without_cpu_use(self):
+        from collect_hosts import leases
+        from events import idle_hosts
+        from host_activity import update_idle
+
+        driver = {"id": "L8", "agent": "driver", "label": "unattended",
+                  "run_unit": "driver.service", "cores": 1, "mem": 512 * 1024**2}
+        project = self.idle_project(threshold_override=1)
+        for field, details in [("leases", {"missing_since": 123}), ("queue", {})]:
+            with self.subTest(field=field):
+                with mock.patch("collect_hosts.run", return_value=json.dumps({
+                    "leases": [], "queue": [], field: [{**driver, **details}],
+                    "busy_cores": 0,
+                })):
+                    observation = leases(["ssh", "worker-alias"])
+                state = {"hosts": {"worker": observation}}
+                for now in (0, 60, 120):
+                    update_idle(state, project, observed_at=now)
+                    self.assertFalse(idle_hosts(state, project, now=now))
+                state["hosts"]["worker"] = {"reachable": True}
+                update_idle(state, project, observed_at=180)
+                update_idle(state, project, observed_at=240)
+                self.assertTrue(idle_hosts(state, project, now=240))
 
     def test_certification_waits_when_the_controller_finds_the_host_busy(self):
         import contextlib

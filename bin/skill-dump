@@ -42,6 +42,19 @@ Installed from: $SD_HOME
 EOF
 }
 
+os_name() { # uname -s, with MSYS2/Git Bash/Cygwin on Windows reported as Windows
+  case $(uname -s) in
+    MINGW* | MSYS* | CYGWIN* | UCRT* | CLANG*) echo Windows ;;
+    *) uname -s ;;
+  esac
+}
+OS_NAME=$(os_name)
+if [[ $OS_NAME == Windows ]]; then
+  # Real (native) symlinks: MSYS otherwise silently deep-copies on ln -s.
+  # Needs Developer Mode or an elevated shell.
+  export MSYS=winsymlinks:nativestrict CYGWIN=winsymlinks:nativestrict
+fi
+
 log() { printf 'skill-dump: %s\n' "$*"; }
 warn() { printf 'skill-dump: warning: %s\n' "$*" >&2; }
 die() { printf 'skill-dump: error: %s\n' "$*" >&2; exit 1; }
@@ -53,6 +66,28 @@ sha() {
 have_systemd_user() {
   [[ $(uname -s) == Linux ]] && command -v systemctl >/dev/null 2>&1 &&
     systemctl --user show-environment >/dev/null 2>&1
+}
+
+PYTHON=""
+python_ok() { # python_ok CMD... -> prints the base interpreter if CMD is Python 3.10+
+  "$@" -c 'import sys; assert sys.version_info >= (3, 10); print(getattr(sys, "_base_executable", "") or sys.executable)' 2>/dev/null | tr -d '\r'
+}
+find_python() { # sets PYTHON to a Python 3.10+ interpreter; exit 1 if none
+  [[ -n $PYTHON ]] && return 0
+  local exe="" found c
+  [[ -z ${SKILL_DUMP_PYTHON-} ]] || exe=$(python_ok "$SKILL_DUMP_PYTHON")
+  if [[ -z $exe && $OS_NAME == Windows ]]; then
+    # python3/python may be the Microsoft Store stub; prefer real installs.
+    if command -v uv >/dev/null 2>&1 && found=$(cd "$SD_HOME" && VIRTUAL_ENV='' uv python find 2>/dev/null); then
+      exe=$(python_ok "${found%$'\r'}")
+    fi
+    [[ -n $exe ]] || ! command -v py >/dev/null 2>&1 || exe=$(python_ok py -3)
+  fi
+  for c in python3 python; do
+    [[ -z $exe ]] || break
+    command -v "$c" >/dev/null 2>&1 && exe=$(python_ok "$c")
+  done
+  [[ -n $exe ]] && PYTHON=$exe
 }
 
 in_list() { # in_list WORD "a,b c" -> exit 0 if WORD is in the comma/space list
@@ -148,6 +183,56 @@ ensure_link() { # ensure_link TARGET LINK
   log "linked $link -> $target"
 }
 
+write_managed() { # write_managed DEST CONTENT (CONTENT carries the marker)
+  local dest=$1 tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp="$dest.new.$$"
+  (umask 077; set -C; printf '%s' "$2" >"$tmp") || return 1
+  if [[ -f $dest && ! -L $dest ]] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    NEW_MANIFEST+=("$dest")
+    return 0
+  fi
+  if ! make_room "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$dest"
+  mv "$tmp" "$dest"
+  chmod 755 "$dest"
+  NEW_MANIFEST+=("$dest")
+  log "wrote $dest"
+}
+
+# Windows: native programs can't exec a symlinked script, and python3 on PATH
+# may be the Store stub. Each command gets a sh launcher (MSYS2/Git Bash) and a
+# .cmd launcher (PowerShell, cmd) that name the interpreter explicitly.
+crlf_lines() { local line; for line in "$@"; do printf '%s\r\n' "$line"; done; }
+
+install_windows_bin() { # install_windows_bin SCRIPT NAME
+  local src=$1 name=$2 head="rem $MARKER; edits are overwritten." interp winterp script winscript bindir
+  script=$(cygpath -m "$src")
+  winscript=$(cygpath -w "$src")
+  if [[ $src == *.py ]] || head -n1 "$src" | grep -q python; then
+    find_python || { warn "no Python 3.10+ for $name; set SKILL_DUMP_PYTHON"; return 0; }
+    interp=$(cygpath -m "$PYTHON")
+    winterp=$(cygpath -w "$PYTHON")
+    write_managed "$BIN_DIR/$name" "$(printf '#!/bin/sh\n# %s; edits are overwritten.\nexec "%s" "%s" "$@"' "$MARKER" "$interp" "$script")
+" || true
+    write_managed "$BIN_DIR/$name.cmd" "$(crlf_lines '@echo off' "$head" "\"$winterp\" \"$winscript\" %*")
+" || true
+  else
+    ensure_link "$src" "$BIN_DIR/$name"
+    interp=$(command -v bash)
+    winterp=$(cygpath -w "$interp")
+    bindir=$(cygpath -w "$(dirname "$interp")")
+    # bash started from cmd lacks MSYS's /usr/bin on PATH.
+    write_managed "$BIN_DIR/$name.cmd" "$(crlf_lines '@echo off' "$head" setlocal \
+      "set \"PATH=$bindir;%PATH%\"" "\"$winterp\" \"$script\" %*")
+" || true
+  fi
+}
+
 short_host() { local h; h=$(uname -n); echo "${h%%.*}"; }
 
 render() { # render FILE -> stdout with {{PLACEHOLDERS}} filled in
@@ -215,20 +300,28 @@ tool_dirs() {
 }
 
 load_tool() { # sets tool.conf fields (schedules may be installed without activation)
-  DESCRIPTION="" BINS="" UNITS="" PLISTS="" INSTALL_ONLY=no RESTART_ON_CHANGE="" REQUIRES="" OS=""
+  DESCRIPTION="" BINS="" UNITS="" PLISTS="" INSTALL_ONLY=no RESTART_ON_CHANGE="" REQUIRES="" OS="" WINDOWS_SERVICE=""
   # shellcheck source=/dev/null
   . "$SD_HOME/tools/$1/tool.conf"
 }
 
 missing_requirement() { # prints the first unmet requirement of the loaded tool
   local req
-  if [[ -n $OS ]] && ! in_list "$(uname -s)" "$OS"; then
+  if [[ -n $OS ]] && ! in_list "$OS_NAME" "$OS"; then
     echo "runs on $OS only"
+    return
+  fi
+  if [[ $OS_NAME == Windows && -z $OS ]]; then # Windows support must be declared
+    echo "runs on Linux/macOS only"
     return
   fi
   for req in $REQUIRES; do
     case $req in
-      systemctl) have_systemd_user || { echo "needs a systemd user session"; return; } ;;
+      systemctl)
+        # On Windows a tool declaring WINDOWS_SERVICE manages its own service.
+        [[ $OS_NAME == Windows && -n $WINDOWS_SERVICE ]] && continue
+        have_systemd_user || { echo "needs a systemd user session"; return; } ;;
+      python3) find_python || { echo "needs Python 3.10+"; return; } ;;
       *) command -v "$req" >/dev/null 2>&1 || { echo "needs $req"; return; } ;;
     esac
   done
@@ -247,6 +340,8 @@ stored() { # stored FILE KEY -> value
 INSTALLED_TOOLS=()
 ENABLE_UNITS=()
 RESTART_UNITS=()
+WIN_SERVICES=()
+WIN_RESTART=()
 
 install_tools() {
   local tool reason pair name file unit old_hash new_hash
@@ -276,11 +371,22 @@ install_tools() {
     for pair in $BINS; do
       name=${pair%%=*} file=${pair#*=}
       [[ -x $SD_HOME/tools/$tool/$file ]] || chmod +x "$SD_HOME/tools/$tool/$file"
-      ensure_link "$SD_HOME/tools/$tool/$file" "$BIN_DIR/$name"
+      if [[ $OS_NAME == Windows ]]; then
+        install_windows_bin "$SD_HOME/tools/$tool/$file" "$name"
+      else
+        ensure_link "$SD_HOME/tools/$tool/$file" "$BIN_DIR/$name"
+      fi
     done
     old_hash=$(stored "$STATE_DIR/hashes" "$tool")
     new_hash=$(tool_hash "$tool")
     echo "$tool $new_hash" >>"$STATE_DIR/hashes.new"
+    if [[ $OS_NAME == Windows ]]; then # no systemd or launchd units here
+      if [[ -n $WINDOWS_SERVICE && $INSTALL_ONLY != yes ]]; then
+        WIN_SERVICES+=("$WINDOWS_SERVICE")
+        [[ -z $old_hash || $old_hash == "$new_hash" || -z $RESTART_ON_CHANGE ]] || WIN_RESTART+=("$WINDOWS_SERVICE")
+      fi
+      continue
+    fi
     for unit in $UNITS; do
       write_rendered "$SD_HOME/tools/$tool/$unit" "$UNIT_DIR/$unit" "#" || continue
       [[ $INSTALL_ONLY == yes ]] || ENABLE_UNITS+=("$unit")
@@ -293,6 +399,30 @@ install_tools() {
       write_rendered "$SD_HOME/tools/$tool/$file" "$LAUNCH_DIR/$file" || continue
     done
   done
+}
+
+# Windows services: each WINDOWS_SERVICE command takes "service install"
+# (start at logon and now), "service restart" and "service uninstall".
+# Call before remove_stale, which deletes the launchers of removed tools.
+apply_windows_services() {
+  [[ $OS_NAME == Windows ]] || return 0
+  local list=$STATE_DIR/windows-services svc
+  if [[ -f $list ]]; then
+    while IFS= read -r svc; do
+      [[ -n $svc ]] || continue
+      in_list "$svc" "${WIN_SERVICES[*]-}" && continue
+      if [[ -f $BIN_DIR/$svc ]]; then
+        "$BIN_DIR/$svc" service uninstall || warn "could not uninstall the $svc service"
+      fi
+    done <"$list"
+  fi
+  for svc in "${WIN_SERVICES[@]+"${WIN_SERVICES[@]}"}"; do
+    if in_list "$svc" "${WIN_RESTART[*]-}"; then
+      if "$BIN_DIR/$svc" service restart; then log "restarted $svc"; else warn "could not restart $svc"; fi
+    fi
+    "$BIN_DIR/$svc" service install >/dev/null || warn "could not install the $svc service"
+  done
+  printf '%s\n' "${WIN_SERVICES[@]+"${WIN_SERVICES[@]}"}" >"$list"
 }
 
 git_hooks_path() { git -C "$SD_HOME" config --local --get core.hooksPath 2>/dev/null || true; }
@@ -444,9 +574,14 @@ cmd_install() {
   [[ $from_update == yes ]] || save_config
 
   install_tools
-  ensure_link "$SD_HOME/bin/skill-dump" "$BIN_DIR/skill-dump"
+  if [[ $OS_NAME == Windows ]]; then
+    install_windows_bin "$SD_HOME/bin/skill-dump" skill-dump
+  else
+    ensure_link "$SD_HOME/bin/skill-dump" "$BIN_DIR/skill-dump"
+  fi
   install_skills
   install_git_hooks
+  apply_windows_services
   remove_stale
   apply_units
   install_agent_instructions
@@ -528,6 +663,8 @@ cmd_list() {
 cmd_uninstall() {
   acquire_lock
   NEW_MANIFEST=()
+  WIN_SERVICES=()
+  apply_windows_services
   remove_stale
   INSTALLED_TOOLS=()
   AGENT_INSTRUCTIONS=no
@@ -535,7 +672,7 @@ cmd_uninstall() {
   GIT_HOOKS=no
   install_git_hooks
   have_systemd_user && systemctl --user daemon-reload
-  rm -f "$MANIFEST" "$STATE_DIR/hashes" "$STATE_DIR/installed" "$STATE_DIR/last-update"
+  rm -f "$MANIFEST" "$STATE_DIR/windows-services" "$STATE_DIR/hashes" "$STATE_DIR/installed" "$STATE_DIR/last-update"
   log "uninstalled; this checkout ($SD_HOME) and $CONFIG were kept"
 }
 

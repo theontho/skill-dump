@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -1084,7 +1085,7 @@ class CoordinatorTest(unittest.TestCase):
                                 "cores": 1, "mem": GIB, "label": "y",
                                 "disk": {"/": 50 * GIB}})  # fmt: skip
         self.assertEqual(second["state"], "waiting")
-        self.assertIn("of disk free on /", second["reason"])
+        self.assertIn(f"of disk free on {ac.mount_of('/')}", second["reason"])
 
     def test_named_locks(self):
         self.assertIn("locked", self.c.handle(
@@ -1116,6 +1117,109 @@ class CoordinatorTest(unittest.TestCase):
     def test_a_dead_holder_frees_its_lease(self):
         self.ask(8, pid=dead_pid())
         self.assertEqual(self.ask(8, agent="b")["state"], "granted")
+
+    def test_pidfile_hold_survives_driver_restart_but_expires_without_replacement(self):
+        pidfile = Path(self.tmp.name, "driver.pid")
+        pidfile.write_text(str(os.getpid()))
+        lease = self.ask(1, running=True, pidfile=str(pidfile))
+        self.c.tick()
+        pidfile.unlink()
+        clock = time.time()
+        with patch.object(ac.time, "monotonic", return_value=time.monotonic() + 10):
+            self.c.tick()
+        reply = self.c.handle({"op": "poll", "id": lease["id"]})
+        self.assertEqual(reply, {"state": "granted", "restarting": True})
+        self.c = self.make()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            pidfile.write_text(str(proc.pid))
+            self.c.tick()
+            status = self.c.handle({"op": "status"})
+            self.assertEqual([(x["id"], x["pid"]) for x in status["leases"]],
+                             [(lease["id"], proc.pid)])
+            self.assertEqual(self.poll(lease), "granted")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+        with patch.object(ac.time, "monotonic", return_value=time.monotonic() + 10):
+            self.c.tick()
+        with patch.object(ac.time, "time", return_value=clock + ac.RESTART_GRACE + 5):
+            self.assertEqual(self.poll(lease), "gone")
+        events = [x for x in self.history() if x["event"] == "ended"]
+        self.assertEqual([x["why"] for x in events], ["registration inactive"])
+
+    def test_unit_hold_switches_pid_and_accepts_pidfile_fallback(self):
+        pidfile = Path(self.tmp.name, "driver.pid")
+        pidfile.write_text(str(os.getpid()))
+        lease = self.ask(1, running=True, unit="driver.service", pidfile=str(pidfile))
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with patch.object(ac, "unit_pid", return_value=proc.pid):
+                self.c.tick()
+            self.assertEqual(self.c.handle({"op": "status"})["leases"][0]["pid"], proc.pid)
+            with (patch.object(ac, "unit_pid", return_value=0),
+                  patch.object(ac.time, "monotonic", return_value=time.monotonic() + 10)):
+                self.c.tick()
+            self.assertEqual(self.c.handle({"op": "status"})["leases"][0]["pid"], os.getpid())
+            self.assertEqual(self.poll(lease), "granted")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_phase_releases_gpu_without_releasing_driver_lease(self):
+        driver = self.ask(3, agent="driver")
+        phase = {"op": "phase", "id": driver["id"], "name": "gpu", "agent": "driver"}
+        self.assertIn("error", self.c.handle({**phase, "agent": "other"}))
+        self.assertEqual(self.c.handle(phase)["locked"], "gpu")
+        competing = self.ask(2, agent="gpu", locks=["gpu"])
+        cpu = self.ask(1, agent="cpu")
+        self.assertEqual(self.poll(competing), "waiting")
+        self.assertEqual(self.poll(cpu), "granted")
+        self.assertEqual(self.c.handle({**phase, "release": True})["released"], "gpu")
+        self.assertEqual(self.poll(competing), "granted")
+        self.assertEqual(self.poll(driver), "granted")
+        event = next(x for x in self.history() if x["event"] == "exclusive-ended")
+        self.assertEqual(event["resource"], "gpu")
+        self.assertEqual(event["observed_seconds"], 0)
+
+    def test_exclusive_idle_and_overrun_warn_and_allow_only_unrelated_small_work(self):
+        lease = self.ask(8, mem=0, exclusive_locks=["gpu"], expect=600)
+        stamp = time.time()
+        for seconds in range(0, 901, 30):
+            with (patch.object(ac.time, "monotonic", return_value=seconds),
+                  patch.object(ac.time, "time", return_value=stamp + seconds)):
+                self.c.gpu_sample = lambda: 0
+                self.c.tick()
+                if seconds == 870:
+                    self.assertFalse(self.c.handle({"op": "check", "cores": 1, "mem": GIB})["ok"])
+        with patch.object(ac.time, "time", return_value=stamp + 900):
+            status = self.c.handle({"op": "status"})
+            self.assertEqual(set(status["leases"][0]["exclusive_warnings"]), {"overrun", "idle:gpu"})
+            inbox = self.c.handle({"op": "inbox", "agent": "a"})["messages"]
+            self.assertEqual(len(inbox), 2)
+            self.assertFalse(self.c.handle({"op": "check", "cores": 1, "mem": GIB,
+                                            "locks": ["gpu"]})["ok"])
+            self.assertFalse(self.c.handle({"op": "check", "cores": 3, "mem": GIB})["ok"])
+            self.assertEqual(self.poll(self.ask(1, agent="small")), "granted")
+        self.c.gpu_sample = lambda: None
+        with (patch.object(ac.time, "monotonic", return_value=930),
+              patch.object(ac.time, "time", return_value=stamp + 930)):
+            self.c.tick()
+            self.assertFalse(self.c.handle({"op": "check", "cores": 1, "mem": GIB})["ok"])
+            self.release(lease)
+        event = next(x for x in self.history() if x["event"] == "exclusive-ended")
+        self.assertEqual(event["observed_seconds"], 900)
+        self.assertEqual(event["active_seconds"], 0)
+
+    def test_detached_unit_recovers_same_lease_after_wrapper_exit(self):
+        unit = "test-driver.service"
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        lease = self.ask(1, agent="driver", pid=proc.pid, run_unit=unit, headroom=1)
+        proc.wait(timeout=5)
+        self.assertEqual(self.c.handle({"op": "poll", "id": lease["id"]}).get("restarting"), True)
+        self.assertIn("error", self.ask(2, agent="driver", run_unit=unit))
+        resumed = self.ask(1, agent="driver", run_unit=unit, headroom=1)
+        self.assertEqual(resumed, {"id": lease["id"], "state": "granted"})
 
     def test_too_big_is_refused_not_queued(self):
         reply = self.ask(16)
@@ -1282,6 +1386,7 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(len(self.c.handle({"op": "inbox", "agent": "b"})["messages"]), 1)
 
 
+@unittest.skipIf(ac.WINDOWS, "the comparison baseline is Linux-only")
 class SameAsMainWithoutExclusiveLeasesTest(unittest.TestCase):
     """Without exclusive-lock leases, admission decides exactly as main's
     code (the merge base with origin/main) on the same random workloads."""
@@ -1743,7 +1848,7 @@ class FootprintTest(unittest.TestCase):
     def test_tree_footprint_of_a_dead_pid_is_zero(self):
         self.assertEqual(ac.tree_footprint(dead_pid()), 0)
 
-    def test_tree_cpu_counts_child_cpu_even_after_reaping(self):
+    def test_tree_cpu_counts_live_children_and_reaped_children_where_supported(self):
         pid = os.getpid()
         before = ac.tree_cpu_seconds(pid)
         code = ("import time; start = time.process_time()\n"
@@ -1756,7 +1861,10 @@ class FootprintTest(unittest.TestCase):
             child.communicate("\n", timeout=5)
         reaped = ac.tree_cpu_seconds(pid)
         self.assertGreater(active - before, 0.07)
-        self.assertGreaterEqual(reaped + 1e-6, active)  # sums in another order
+        if ac.DARWIN or ac.WINDOWS:
+            self.assertLess(reaped, active)
+        else:
+            self.assertGreaterEqual(reaped + 1e-6, active)  # sums in another order
 
 
 class ArchiveTest(unittest.TestCase):
@@ -1775,12 +1883,42 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(ac.archive_writes(["ls"], "/mnt/nasty", self.M), [])
 
 
+class LaunchdTest(unittest.TestCase):
+    def test_bootstraps_a_private_named_job_and_can_resolve_its_pid(self):
+        with tempfile.TemporaryDirectory() as root:
+            launch = {}
+            overrides = {"AGENT_COORD_RUNTIME_DIR": str(Path(root, "runtime")),
+                         "AGENT_COORD_STATE_DIR": str(Path(root, "state"))}
+
+            def bootstrap(argv, **kwargs):
+                with Path(argv[-1]).open("rb") as f:
+                    launch.update(plistlib.load(f))
+
+            with (patch.object(ac.sys, "platform", "darwin"),
+                  patch.object(ac.os, "getuid", return_value=501, create=True),
+                  patch.dict(os.environ, {**overrides, "UNRELATED_ENV": "do not forward"}),
+                  patch.object(ac, "STATE_FILE", Path(root, "state.json")),
+                  patch.object(ac.subprocess, "run", side_effect=bootstrap),
+                  patch.object(ac.subprocess, "check_output", return_value="state = running\npid = 42\n")):
+                self.assertEqual(ac.main(["--as", "driver", "run", "--io", "--label=-label",
+                                          "--detach", "--unit", "bench", "--allow-archive",
+                                          "--", "driver", "text with spaces"]), 0)
+                self.assertEqual(ac.unit_pid("bench"), 42)
+            self.assertEqual(launch["Label"], "bench")
+            self.assertEqual(launch["ProgramArguments"][-2:], ["driver", "text with spaces"])
+            self.assertIn("--label=-label", launch["ProgramArguments"])
+            self.assertEqual(launch["WorkingDirectory"], os.getcwd())
+            self.assertEqual(launch["EnvironmentVariables"], overrides)
+            self.assertEqual(Path(launch["StandardOutPath"]), Path(root, "units", "bench.log"))
+            self.assertFalse(list(Path(root, "units").glob("*.plist")))
+
+
 class ServiceTest(unittest.TestCase):
     """The CLI against a real service on a temporary socket."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.sock = Path(self.tmp.name, "sock")
+        self.sock = Path(self.tmp.name, ac.SOCKET.name)
         self.server = subprocess.Popen(
             [sys.executable, "-c",
              ("import agent_coord as ac, pathlib, sys; "
@@ -1818,6 +1956,23 @@ class ServiceTest(unittest.TestCase):
         status = json.loads(self.cli("status", "--json").stdout)
         self.assertEqual(status["leases"], [])
 
+    def test_phase_cli_finds_enclosing_driver_after_directory_change(self):
+        cli = str(Path(ac.__file__).resolve())
+        worker = (
+            "import os, subprocess, sys; "
+            "os.chdir(sys.argv[2]); "
+            "subprocess.run([sys.executable, sys.argv[1], 'phase', '--exclusive-lock', 'gpu'], check=True); "
+            "subprocess.run([sys.executable, sys.argv[1], 'phase', '--release', 'gpu'], check=True)"
+        )
+        with patch.dict(os.environ, {"AGENT_COORD_RUNTIME_DIR": str(self.sock.parent)}):
+            result = self.cli("--as", "driver", "run", "--cores", "1", "--mem", "128M",
+                              "--label", "phases", "--", sys.executable, "-c",
+                              worker, cli, str(self.sock.parent))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in self.cli("history", "--json").stdout.splitlines()]
+        self.assertEqual([e["event"] for e in events if e.get("resource") == "gpu"],
+                         ["exclusive-started", "exclusive-ended"])
+
     def test_io_defaults_and_history_round_trip(self):
         self.assertEqual(self.cli("check", "--io").returncode, 0)
         self.assertNotEqual(self.cli("check", "--mem", "512M").returncode, 0)
@@ -1836,7 +1991,7 @@ class ServiceTest(unittest.TestCase):
 
     def test_run_returns_the_commands_exit_code(self):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "x",
-                          "--", "sh", "-c", "exit 3")  # fmt: skip
+                          "--", sys.executable, "-c", "raise SystemExit(3)")  # fmt: skip
         self.assertEqual(result.returncode, 3)
         history = self.cli("history", "--json")
         events = [json.loads(line) for line in history.stdout.splitlines()]
@@ -1846,7 +2001,7 @@ class ServiceTest(unittest.TestCase):
 
     def test_expect_cli_round_trip(self):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "short",
-                          "--expect", "10m", "--", "true")
+                          "--expect", "10m", "--", sys.executable, "-c", "pass")
         self.assertEqual(result.returncode, 0, result.stderr)
         events = [json.loads(line) for line in self.cli("history", "--json").stdout.splitlines()]
         self.assertTrue(all(e["expect"] == 600 for e in events))
@@ -1858,12 +2013,13 @@ class ServiceTest(unittest.TestCase):
     def test_run_with_exclusive_lock_and_headroom(self):
         result = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "timed",
                           "--exclusive-lock", "gpu", "--headroom", "2",
-                          "--", "true")  # fmt: skip
+                          "--", sys.executable, "-c", "pass")  # fmt: skip
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.cli("check", "--cores", "1", "--mem", "64M",
                                   "--exclusive-lock", "gpu").returncode, 0)  # fmt: skip
         both = self.cli("run", "--cores", "1", "--mem", "64M", "--label", "x",
-                        "--exclusive", "--exclusive-lock", "gpu", "--", "true")  # fmt: skip
+                        "--exclusive", "--exclusive-lock", "gpu", "--",
+                        sys.executable, "-c", "pass")  # fmt: skip
         self.assertNotEqual(both.returncode, 0)
 
     def test_messages_round_trip(self):
@@ -1876,7 +2032,130 @@ class ServiceTest(unittest.TestCase):
         self.server.wait(10)
         result = self.cli("status")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("systemctl --user start agent-coord", result.stderr)
+        self.assertIn(ac.START_HINT, result.stderr)
+
+
+@unittest.skipUnless(ac.WINDOWS, "Windows backend")
+class WindowsTest(unittest.TestCase):
+    def test_alive_checks_without_killing(self):
+        # os.kill(pid, 0) would TerminateProcess the target on Windows.
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE)  # fmt: skip
+        try:
+            self.assertTrue(ac.alive(child.pid))
+            self.assertTrue(ac.alive(child.pid))
+            self.assertIsNone(child.poll())
+        finally:
+            child.stdin.close()
+            child.wait(10)
+        self.assertFalse(ac.alive(child.pid))
+        self.assertFalse(ac.alive(0))
+
+    def test_measurements(self):
+        sample = ac.measure(0.2)
+        self.assertGreater(sample["available"], 0)
+        self.assertGreater(ac.mem_total(), sample["available"] // 2)
+        self.assertGreaterEqual(sample["busy"], 0)
+        self.assertIsNotNone(ac._cpu_seconds(os.getpid()))
+        self.assertTrue(ac.mount_of(__file__).endswith("\\"))
+        self.assertGreater(ac.disk_free(ac.mount_of(__file__)), 0)
+
+    def test_tick_counts_cpu_from_a_live_leased_child(self):
+        with tempfile.TemporaryDirectory() as root:
+            coord = ac.Coordinator(
+                Path(root, "state.json"),
+                measure=lambda: {"vms": [], "busy": 0.0, "available": 64 * GIB},
+            )
+            lease = coord.handle({"op": "acquire", "pid": os.getpid(), "label": "sample",
+                                  "io": True, "running": True})["id"]
+            worker = ("import time; input(); end = time.process_time() + .35\n"
+                      "while time.process_time() < end: pass\n"
+                      "print('ready', flush=True); input()")
+            with subprocess.Popen(
+                [sys.executable, "-c", worker],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            ) as child:
+                try:
+                    coord.tick()
+                    child.stdin.write("\n")
+                    child.stdin.flush()
+                    self.assertEqual(child.stdout.readline().strip(), "ready")
+                    coord.tick()
+                    status = coord.handle({"op": "status"})
+                    self.assertEqual(status["leases"][0]["id"], lease)
+                    self.assertGreater(status["leases"][0]["measured_cores"], .05)
+                finally:
+                    child.terminate()
+
+    def test_job_object_caps_memory_and_reports_cores(self):
+        code = ("import os, sys\n"
+                "assert os.environ['COMPUTE_LEASE_CORES'] == '1'\n"
+                "try:\n    x = bytearray(int(sys.argv[1]))\nexcept MemoryError:\n    sys.exit(7)\n")
+        env = dict(os.environ, COMPUTE_LEASE_CORES="1")
+        for size, expected in ((16 * 1024**2, 0), (512 * 1024**2, 7)):
+            child, job = ac.spawn_limited([sys.executable, "-c", code, str(size)], 1, 128 * 1024**2, env)
+            self.assertIsNotNone(job)
+            self.assertEqual(child.wait(30), expected)
+
+    def test_archive_paths_from_the_environment(self):
+        with tempfile.TemporaryDirectory() as nas, patch.dict(os.environ, {"AGENT_COORD_ARCHIVE": nas}):
+            mounts = ac.archive_mounts()
+            self.assertEqual(len(ac.archive_writes(["x", "-o", os.path.join(nas, "out")], "C:\\", mounts)), 1)
+            self.assertEqual(ac.archive_writes(["x", "-o", nas + "ty"], "C:\\", mounts), [])
+
+
+@unittest.skipUnless(ac.WINDOWS, "Windows backend")
+class WindowsServiceTest(ServiceTest):
+    def test_named_detach_survives_launcher_exit(self):
+        stop = Path(self.tmp.name, "stop")
+        worker = (
+            "from pathlib import Path; import sys, time; "
+            "print('driver started', flush=True); "
+            "print('driver stderr', file=sys.stderr, flush=True); "
+            "deadline = time.monotonic() + 10\n"
+            "while time.monotonic() < deadline and not Path(sys.argv[1]).exists(): time.sleep(.1)"
+        )
+        with patch.dict(os.environ, {"AGENT_COORD_RUNTIME_DIR": self.tmp.name,
+                                     "AGENT_COORD_STATE_DIR": self.tmp.name}):
+            result = self.cli("--as", "driver", "run", "--detach", "--unit", "test-driver",
+                              "--cores", "1", "--mem", "128M", "--label", "detached",
+                              "--", sys.executable, "-c", worker, str(stop))
+        try:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for _ in range(50):
+                status = json.loads(self.cli("status", "--json").stdout)
+                if any(x.get("run_unit") == "test-driver" for x in status["leases"]):
+                    break
+                time.sleep(.1)
+            else:
+                self.fail("detached wrapper left no lease")
+        finally:
+            stop.touch()
+        for _ in range(50):
+            if not json.loads(self.cli("status", "--json").stdout)["leases"]:
+                break
+            time.sleep(.1)
+        else:
+            self.fail("detached lease was not released on exit")
+        log = Path(self.tmp.name, "units", "test-driver.log")
+        self.assertIn("driver started", log.read_text())
+        self.assertIn("driver stderr", log.read_text())
+
+    def test_one_server_per_endpoint(self):
+        second = subprocess.run(
+            [sys.executable, "-c", "import agent_coord as ac, pathlib, sys; ac.serve(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]))",
+             str(self.sock), str(Path(self.tmp.name, "other.json"))],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=30)  # fmt: skip
+        self.assertIn("already serving", second.stdout)
+        self.assertEqual(self.cli("status").returncode, 0)
+
+    def test_requests_need_the_token(self):
+        endpoint = json.loads(self.sock.read_text())
+        bad = Path(self.tmp.name, "bad.json")
+        bad.write_text(json.dumps({**endpoint, "token": "wrong"}))
+        with self.assertRaises(SystemExit) as caught:
+            ac.call({"op": "status"}, bad)
+        self.assertIn("bad token", str(caught.exception))
 
 
 if __name__ == "__main__":

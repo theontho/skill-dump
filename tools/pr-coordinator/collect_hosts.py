@@ -1,6 +1,7 @@
 """Collect live work on every host (agent-coord leases; heavy processes on the MacBook) into state.json."""
 
 import fcntl
+import json
 import re
 import subprocess
 import time
@@ -29,10 +30,38 @@ def run(cmd, timeout=40):
 
 
 def leases(prefix):
-    cmd = (
-        ["agent-coord", "status"] if prefix is None else [*prefix, "agent-coord status"]
-    )
-    out = run(cmd)
+    cmd = ["agent-coord", "status", "--json"] if prefix is None else [
+        *prefix, "agent-coord status --json"
+    ]
+    out = run(cmd, timeout=30)
+    try:
+        snapshot = json.loads(out)
+    except ValueError:
+        snapshot = None
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("leases"), list):
+        now = time.time()
+        rows = [
+            {
+                "id": x["id"], "state": state, "cores": x["cores"],
+                "mem": f"{x.get('claimed_mem', x['mem']) / 1024**3:.1f}G",
+                "minutes": max(0, round((now - x.get("granted", x.get("asked", now))) / 60)),
+                "label": f"{x['agent']}: {x['label']}",
+                "unit": x.get("unit") or x.get("run_unit"),
+                "detached": bool(x.get("run_unit")),
+                "restarting": "missing_since" in x,
+                "warnings": list(x.get("exclusive_warnings", {}).values()),
+            }
+            for key, state in (("leases", "held"), ("queue", "waiting"))
+            for x in snapshot.get(key, [])
+        ]
+        busy = snapshot.get("busy_cores")
+        return {"leases": rows, "summary": f"cores busy now (measured): {busy:g}"
+                if busy is not None else "", "reachable": True}
+    # Old hosts may not accept --json. If they returned text anyway, use it;
+    # otherwise retry the legacy command with only a short probe.
+    if not out:
+        cmd = ["agent-coord", "status"] if prefix is None else [*prefix, "agent-coord status"]
+        out = run(cmd, timeout=5)
     rows, summary = [], ""
     for line in out.splitlines():
         if "cores busy now" in line:
@@ -54,10 +83,10 @@ def leases(prefix):
     return {"leases": rows, "summary": summary, "reachable": bool(out)}
 
 
-def process_probe(host, probe):
+def process_probe(host, probe, *, timeout=40):
     alias = P.hosts[host].get("process_probe_ssh")
     ssh = [*P.ssh(host)[:-1], alias] if alias and P.ssh(host) else P.ssh(host)
-    out = run([*ssh, probe] if ssh else ["sh", "-c", probe])
+    out = run([*ssh, probe] if ssh else ["sh", "-c", probe], timeout=timeout)
     rows = []
     lines = out.splitlines()
     for line in lines[:-1]:
@@ -94,6 +123,9 @@ def main():
     for key, host in P.hosts.items():
         if host.get("agent_coord"):
             hosts[key] = leases(P.ssh(key) or None)
+            if not hosts[key]["reachable"] and host.get("process_probe"):
+                hosts[key] = process_probe(key, host["process_probe"], timeout=5)
+                hosts[key]["activity_known"] = False
         elif host.get("process_probe"):
             hosts[key] = process_probe(key, host["process_probe"])
         else:
