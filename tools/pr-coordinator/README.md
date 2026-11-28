@@ -237,10 +237,17 @@ Spot, honor the approved spending cap, and verify resource deletion afterwards.
   pinned base/head and eligible layers from the project's ready router.
   Routed certification uses immediately available native slots. After admission,
   optional `local_checkout_prepare` and `remote_checkout_prepare` hooks set up
-  the exact head and link existing inputs without installing environments or
-  downloading missing inputs. A host may override them with
-  `cert_checkout_prepare`. The matching cleanup runs even if checkout preparation
-  fails. Without a checkout hook, routed runs still skip preparation and cleanup.
+  the exact head, install the locked `{envs}` selected by
+  `certification.environments`, and link existing inputs without downloading
+  missing test inputs. The selector runs in the controller worktree before its
+  environments exist. A host may override preparation with `cert_checkout_prepare`.
+  The matching cleanup runs even if checkout preparation fails. Without a
+  checkout hook, routed runs still skip preparation and cleanup. Full provisioning
+  (`controller_prepare`, `local_prepare`, `remote_prepare`) remains non-routed only.
+  Set `local_admission`, `remote_admission`, or host `cert_admission` to a
+  non-blocking check that matches the runner's resource request. It must not
+  depend on the PR worktree: a nonzero exit skips the host before reservation
+  or, if capacity changes during preparation, before invoking the certifier.
   Hooks that share a per-head checkout on a host should configure one slot on
   that host. Unavailable hosts/inputs fall back to hosted tests instead of
   provisioning or retrying. Failed tests still block. WGS Extract can use

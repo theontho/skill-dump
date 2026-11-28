@@ -1556,7 +1556,7 @@ slots = 2
         plan = json.loads((self.data / "cert-plans" / f"7-{head}-{base}.json").read_text())
         self.assertEqual(plan["hosted"], [])
 
-    def routed_checkout(self, *, remote, prepare_fails=False):
+    def routed_checkout(self, *, remote, prepare_fails=False, busy=None):
         _, head = self.create_git("feature.txt")
         self.git("push", "origin", "HEAD:refs/pull/7/head")
         self.git("switch", "trunk")
@@ -1590,24 +1590,36 @@ slots = 2
             "    inputs.symlink_to(sys.argv[3], target_is_directory=True)\n"
             "    if sys.argv[4] == 'fail':\n"
             "        raise SystemExit(2)\n"
+            "    for env in sys.argv[5].split():\n"
+            "        (Path(path) / '.pixi/envs' / env).mkdir(parents=True)\n"
             "elif step == 'cleanup':\n"
             "    inputs.unlink()\n"
             "else:\n"
+            "    assert all((Path(path) / '.pixi/envs' / env).is_dir() for env in ('default', 'dev'))\n"
             "    Path(sys.argv[3]).write_text((inputs / 'wheel').read_text())\n"
         )
         executable = [sys.executable, str(script)]
         worktree = "{remote_worktree}" if remote else "{worktree}"
         prepare = [
             *executable, "prepare", worktree, str(shared),
-            "fail" if prepare_fails else "pass",
+            "fail" if prepare_fails else "pass", "{envs}",
         ]
+        checkout = (
+            self.root / "worker" / "scratch" / f"certify-{head}"
+            if remote
+            else self.root / "wt-cert7"
+        )
         kind = "remote" if remote else "local"
         router = f"import json, sys; print(json.dumps({dict(layers=['generic'])!r} | dict(base=sys.argv[1], head=sys.argv[2])))"
+        selector = (
+            f"import sys; assert sys.argv[1:] == [{base!r}, {head!r}, 'generic']; "
+            "print('default dev')"
+        )
         with self.config.open("a") as config:
             config.write(f"""
 [certification]
 ready_router = {json.dumps([sys.executable, "-c", router, "{base}", "{head}"])}
-environments = ["must-not-install"]
+environments = {json.dumps([sys.executable, "-c", selector, "{base}", "{sha}", "{layer}"])}
 controller_prepare = ["must-not-install"]
 {kind}_prepare = ["must-not-install"]
 {kind}_checkout_prepare = {json.dumps(["use-host-hook"] if remote else prepare)}
@@ -1624,24 +1636,37 @@ checkout = {json.dumps(str(self.root / "worker"))}
 cert_prepare = ["must-not-install"]
 cert_checkout_prepare = {json.dumps(prepare)}
 """)
+                if busy:
+                    check = (
+                        "raise SystemExit(1)"
+                        if busy == "initial"
+                        else f"from pathlib import Path; raise SystemExit(Path({str(checkout)!r}).exists())"
+                    )
+                    config.write(
+                        f"cert_admission = {json.dumps([sys.executable, '-c', check])}\n"
+                    )
         result = self.command("cert-pr", "7", "--head", head, timeout=15)
+        if busy:
+            self.assertIn("hosted fallback for generic", result.stdout)
+            self.assertFalse(evidence.exists())
+            if busy == "initial":
+                self.assertFalse((self.root / "wt-cert7").exists())
+                self.assertFalse(checkout.exists())
+                return
         [cert] = json.loads((self.data / "state.json").read_text())["certs"]
-        if prepare_fails:
+        if busy:
+            self.assertEqual(cert["status"], "skipped")
+        elif prepare_fails:
             self.assertEqual(cert["status"], "error")
             self.assertIn("hosted fallback for generic", result.stdout)
             self.assertFalse(evidence.exists())
         else:
             self.assertEqual(cert["status"], "pass")
             self.assertEqual(evidence.read_text(), "cached wheel")
-        checkout = (
-            self.root / "worker" / "scratch" / f"certify-{head}"
-            if remote
-            else self.root / "wt-cert7"
-        )
         self.assertTrue((checkout / "out/certify").is_dir())
         self.assertFalse((checkout / "out/certify/inputs").is_symlink())
 
-    def test_issue_38_routed_local_cert_uses_existing_inputs_without_provisioning(self):
+    def test_issue_38_routed_local_cert_installs_selected_environments_and_links_inputs(self):
         self.routed_checkout(remote=False)
 
     def test_issue_38_routed_remote_cert_prepares_exact_head_with_host_override(self):
@@ -1649,6 +1674,12 @@ cert_checkout_prepare = {json.dumps(prepare)}
 
     def test_issue_38_routed_remote_cert_cleans_up_partial_preparation(self):
         self.routed_checkout(remote=True, prepare_fails=True)
+
+    def test_issue_38_busy_remote_cert_falls_back_without_running_certifier(self):
+        self.routed_checkout(remote=True, busy="initial")
+
+    def test_issue_38_remote_cert_cleans_up_if_host_becomes_busy(self):
+        self.routed_checkout(remote=True, busy="after-prepare")
 
     def test_1632_reconcile_leaves_live_routed_certification_running(self):
         project = Project("gadgets", config_file=self.config, data_dir=self.data)

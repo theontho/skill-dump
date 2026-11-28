@@ -122,6 +122,7 @@ cert_priority = "linux"
 rt_prefix = ["agent-coord", "run", "--cores", "2", "--mem", "4G", "--"]
 rt_admission = ["agent-coord", "check", "--cores", "2", "--mem", "4G"]
 # cert_prepare/cert_checkout_prepare/cert_cleanup override the shared hooks on this host.
+# cert_admission = ["agent-coord", "check", "--cores", "2", "--mem", "4G", "--lock", "project-certification"]
 # cert_worker_lock = "project-certification"  # extra lock name on this worker's agent-coord
 
 [hosts.worker.junit]
@@ -186,9 +187,11 @@ local_command = ["just", "certify"]
 # controller_prepare = ["./scripts/provision"]
 # local_prepare = ["./scripts/prepare-cert", "{envs}"]
 # remote_prepare = ["prepare-cert", "{sha}", "{base}", "{remote_worktree}", "{envs}"]
-# Routed runs use only these prepare hooks; link preexisting inputs, do not install or download them.
-# local_checkout_prepare = ["./scripts/link-cert-inputs"]
-# remote_checkout_prepare = ["prepare-cert-checkout", "{sha}", "{base}", "{remote_worktree}"]
+# Routed runs use only these prepare hooks; install locked envs and link existing test inputs.
+# environments = ["python3", "scripts/cert-envs.py", "{base}", "{sha}", "{platform}", "{layer}"]
+# local_checkout_prepare = ["./scripts/prepare-cert-checkout", "{envs}"]
+# remote_checkout_prepare = ["prepare-cert-checkout", "{sha}", "{base}", "{remote_worktree}", "{envs}"]
+# local_admission = ["agent-coord", "check", "--cores", "4", "--mem", "8G"]
 # remote_cleanup = ["cleanup-cert", "{remote_worktree}"]
 # cancel_process_matches = ["your-cert-controller"]
 # notify = ["agent-coord", "send", "--to", "coordinator", "{message}"]

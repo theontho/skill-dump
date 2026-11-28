@@ -252,6 +252,28 @@ def cert_args(wt, pr, target, sha, base, host):
     )
 
 
+def cert_host_command(host, hook, ctx):
+    spec = P.hosts[host]
+    key = f"cert_{hook}"
+    if key in spec:
+        return P.expand(spec[key], **ctx)
+    kind = "remote" if P.ssh(host) else "local"
+    return P.command("certification", f"{kind}_{hook}", **ctx)
+
+
+def cert_capacity(host, ctx, **output):
+    admission = cert_host_command(host, "admission", ctx)
+    if not admission:
+        return True
+    try:
+        result = remote(
+            host, admission, stdin=subprocess.DEVNULL, check=False, timeout=30, **output
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def cert_reservation(snapshot, names, *, whole_host, long_hold_seconds):
     """Classify a host reservation separately from ordinary cert contention."""
     now = time.time()
@@ -431,6 +453,7 @@ def certify(wt, pr, target, sha, base, _attempt=0, *, admitted=None, on_status=N
         start = previous.st_size if previous else 0
         code = 1
         failure_class = None
+        capacity_declined = False
         with log_path.open("a", encoding="utf-8") as log:
             started = datetime.now(timezone.utc).isoformat()
             print(
@@ -442,40 +465,36 @@ def certify(wt, pr, target, sha, base, _attempt=0, *, admitted=None, on_status=N
             preparation_started = admitted is None
             try:
                 ctx["envs"] = ""
-                if admitted is None and (
+                hook = "prepare" if admitted is None else "checkout_prepare"
+                prepare = cert_host_command(host, hook, ctx)
+                if (admitted is None or prepare) and (
                     envs := P.command("certification", "environments", **ctx)
                 ):
                     ctx["envs"] = run(
                         envs, cwd=wt, stdout=subprocess.PIPE, text=True, timeout=180
                     ).stdout.strip()
-                hook = "prepare" if admitted is None else "checkout_prepare"
-                host_hook = f"cert_{hook}"
-                prepare = (
-                    P.expand(P.hosts[host][host_hook], **ctx)
-                    if host_hook in P.hosts[host]
-                    else P.command("certification", f"{kind}_{hook}", **ctx)
-                )
+                    prepare = cert_host_command(host, hook, ctx)
                 if prepare:
                     preparation_started = True
-                    timeout = 3600 if admitted is None else 180
                     if is_remote:
-                        remote(host, prepare, timeout=timeout, **output)
+                        remote(host, prepare, timeout=3600, **output)
                     else:
-                        run(prepare, cwd=wt, timeout=timeout, **output)
-                code = run(
-                    command, cwd=wt, timeout=6 * 3600, check=False, **output
-                ).returncode
+                        run(prepare, cwd=wt, timeout=3600, **output)
+                if admitted and not cert_capacity(host, ctx, **output):
+                    capacity_declined = True
+                    code = 0
+                    print(f"{host} cannot admit this certification now", file=log)
+                else:
+                    code = run(
+                        command, cwd=wt, timeout=6 * 3600, check=False, **output
+                    ).returncode
             except (OSError, subprocess.SubprocessError) as exc:
                 failure_class = error_class(exc)
                 print(exc, file=log, flush=True)
             finally:
                 if preparation_started:
                     try:
-                        cleanup = (
-                            P.expand(P.hosts[host]["cert_cleanup"], **ctx)
-                            if "cert_cleanup" in P.hosts[host]
-                            else P.command("certification", f"{kind}_cleanup", **ctx)
-                        )
+                        cleanup = cert_host_command(host, "cleanup", ctx)
                         if cleanup and is_remote:
                             remote(host, cleanup, timeout=1800, **output)
                         elif cleanup:
@@ -486,6 +505,9 @@ def certify(wt, pr, target, sha, base, _attempt=0, *, admitted=None, on_status=N
                         failure_class = failure_class or f"cleanup-{error_class(exc)}"
                 ended = datetime.now(timezone.utc).isoformat()
                 print(f"\nCERT END {ended}\nEXIT {code}", file=log)
+        if capacity_declined and not code:
+            status("skipped")
+            return 0
         with log_path.open("rb") as log:
             log.seek(start)
             text = log.read().decode("utf-8", errors="replace")
@@ -698,9 +720,15 @@ def check_cert_plan(pr, sha, base, force):
         )
 
 
-def admit_cert_host(hosts, stack):
+def admit_cert_host(pr, target, sha, base, hosts, stack):
     for host, state in cert_host_states(hosts):
         if state is not None:
+            continue
+        ctx = cert_args(P.checkout, pr, target, sha, base, host)
+        if not cert_capacity(
+            host, ctx, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ):
+            print(f"PR #{pr}: {target} host {host} cannot admit certification now")
             continue
         for slot in range(P.hosts[host].get("slots", 1)):
             try:
@@ -776,7 +804,7 @@ def certify_route(pr, row, requested, slots, force, stack):
                 for host, candidate in mapping[target].items()
                 if candidate == layer
             ]
-            if hosts and (host := admit_cert_host(hosts, stack)):
+            if hosts and (host := admit_cert_host(pr, target, sha, base, hosts, stack)):
                 reserved[layer] = (target, host)
                 break
         else:
