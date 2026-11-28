@@ -295,6 +295,13 @@ on idle backfill.
   its CPU claim plus N fit with non-IO leases counted at their full size and IO
   leases at measured use. While it runs, admission keeps those N cores free
   under the same accounting. IO jobs can still burst up to their cap.
+- `--reserve` (on `run` and `hold`) marks a lease that holds capacity for a
+  later handover and uses little itself: its whole size less its measured use
+  stays reserved for its whole life (not only while it ramps up), its cores
+  count in full, and its runs never feed the label's run estimates or memory
+  ceiling (`history --peaks` skips them). Small jobs never borrow its idle
+  exclusive locks, and it gets no idle or overrun warnings. It needs
+  `--expect` and cannot be `--io`. `status` shows it as `RESERVED`.
 - A lease ends when its process exits, subject to the restart grace for
   tracked holds and detached runs.
 
