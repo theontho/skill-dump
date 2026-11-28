@@ -899,7 +899,8 @@ class Coordinator:
                  "exclusive": exclusive_mode(x), "io": bool(x.get("io"))}  # fmt: skip
         if x.get("exclusive_locks"):
             entry["exclusive_locks"] = x["exclusive_locks"]
-        for key in ("headroom", "disk", "expect", "expect_source", "backfill_reason", "backfill_head"):
+        for key in ("headroom", "disk", "expect", "expect_source", "backfill_reason", "backfill_head",
+                    "reserve"):
             if x.get(key):
                 entry[key] = x[key]
         entry.update(extra)
@@ -1130,9 +1131,12 @@ class Coordinator:
         full, then a share of the rest of its size: all of it while the lease
         is young, unsampled or still ramping up (its peak rose in the last
         MEM_RAMP), else MEM_GROWTH of it but at least MEM_GROWTH_FLOOR. Never
-        more than its size less its use: the hard cap stops it there."""
+        more than its size less its use: the hard cap stops it there. A
+        reserved lease (--reserve) holds all of that for its whole life."""
         size = self._mem_claim(x)
         use = min(self._mem_use.get(x["id"], 0), size)
+        if x.get("reserve"):
+            return size - use
         peak = min(max(self._mem_peak.get(x["id"], 0), use), size)
         left = size - peak
         expected = self._label_ceiling(x) if x["id"] in self._mem_use else None
@@ -1191,7 +1195,8 @@ class Coordinator:
     def _reserved_cpu(self, leases: list[dict]) -> float:
         warming = {x["id"] for x in self._warming()}
         return sum(x["cores"] for x in leases
-                   if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")))
+                   if not x.get("io") and (x["id"] in warming or x.get("exclusive_locks")
+                                           or x.get("reserve")))
 
     def _covered(self) -> set[str]:
         """Measured leases whose process is inside another measured lease's
@@ -1210,11 +1215,12 @@ class Coordinator:
         return covered
 
     def _counted_once(self) -> set[str]:
-        """Leases exclusive on a lock (timing runs), unless IO: reserved at
-        their full size all along, so their own measured use comes out of the
-        measured load. (Warming leases keep main's conservative double count.)"""
+        """Leases exclusive on a lock (timing runs) or reserved, unless IO:
+        reserved at their full size all along, so their own measured use comes
+        out of the measured load. (Warming leases keep main's conservative
+        double count.)"""
         return {x["id"] for x in self.state["leases"]
-                if not x.get("io") and x.get("exclusive_locks")}
+                if not x.get("io") and (x.get("exclusive_locks") or x.get("reserve"))}
 
     def _net_busy(self, released: set[str] | None = None) -> float:
         """Measured busy cores, less the own use of exclusive-lock leases, so
@@ -1536,7 +1542,7 @@ class Coordinator:
     def _remember(self, entry: dict) -> None:
         run = entry.get("run")
         if (entry.get("event") != "ended" or type(entry.get("code")) is not int
-                or entry["code"] != 0 or entry.get("held") or entry.get("why")
+                or entry["code"] != 0 or entry.get("held") or entry.get("why") or entry.get("reserve")
                 or type(run) not in (int, float) or not math.isfinite(run) or run <= 0):
             return
         for key in ((entry.get("agent"), entry.get("label")), (None, entry.get("label"))):
@@ -1962,6 +1968,8 @@ class Coordinator:
             lease["exclusive_locks"] = scoped
         if req.get("io"):
             lease["io"] = True
+        if req.get("reserve"):
+            lease["reserve"] = True
         if headroom:
             lease["headroom"] = headroom
         for key in ("pidfile", "unit", "run_unit"):
@@ -2706,7 +2714,7 @@ def _lease_request(args: argparse.Namespace, pid: int) -> dict:
             "cores": args.cores, "mem": args.mem, "label": args.label, "io": args.io,
             "exclusive": args.exclusive, "locks": args.lock or [],
             "exclusive_locks": args.exclusive_lock or [], "headroom": args.headroom,
-            "expect": args.expect, "disk": dict(args.disk or [])}  # fmt: skip
+            "expect": args.expect, "disk": dict(args.disk or []), "reserve": args.reserve}  # fmt: skip
 
 
 def detached_run(args: argparse.Namespace, command: list[str]) -> int:
@@ -2714,7 +2722,7 @@ def detached_run(args: argparse.Namespace, command: list[str]) -> int:
     worker = [sys.executable, str(Path(__file__).resolve()), f"--as={args.agent}", "run",
               f"--label={args.label}", f"--cores={args.cores}", f"--mem={args.mem}",
               f"--headroom={args.headroom}", f"--managed-unit={unit}"]
-    for name in ("io", "exclusive", "allow_archive"):
+    for name in ("io", "exclusive", "allow_archive", "reserve"):
         if getattr(args, name):
             worker.append("--" + name.replace("_", "-"))
     for name in ("expect", "max_wait"):
@@ -2913,6 +2921,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             flag += f" EXCLUSIVE-ON {','.join(x['exclusive_locks'])}"
         if x.get("headroom"):
             flag += f" headroom {x['headroom']:g} cores"
+        if x.get("reserve"):
+            flag += " RESERVED"
         if x.get("locks"):
             flag += f" locks {','.join(x['locks'])}"
         if x.get("disk"):
@@ -2992,7 +3002,8 @@ def peaks(events: list[dict], prefix: str = "", last: int = 10) -> dict[str, dic
     the largest of those memory peaks plus PEAK_SIZING_MARGIN."""
     runs: dict[str, list[dict]] = {}
     for e in events:
-        if e.get("event") == "ended" and "mem_peak" in e and str(e.get("label", "")).startswith(prefix):
+        if (e.get("event") == "ended" and "mem_peak" in e and not e.get("reserve")
+                and str(e.get("label", "")).startswith(prefix)):
             runs.setdefault(e["label"], []).append(e)
     out = {}
     for label, ended in sorted(runs.items()):
@@ -3042,6 +3053,8 @@ def cmd_history(args: argparse.Namespace) -> int:
             flag += f" locks {','.join(e['locks'])}"
         if e.get("io"):
             flag += " io"
+        if e.get("reserve"):
+            flag += " reserved"
         times = []
         for key in ("wait", "waited", "run"):
             if key in e:
@@ -3137,6 +3150,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         sub.add_argument("--label", required=True)
         sub.add_argument("--max-wait", type=parse_duration)
+        sub.add_argument("--reserve", action="store_true",
+                         help="hold capacity for a handover: count the full size, never set a label ceiling")
         if name == "hold":
             sub.add_argument("--pid", type=int)
             sub.add_argument("--owner-pid", type=int, help="register a watch: label with a hard --expect expiry")

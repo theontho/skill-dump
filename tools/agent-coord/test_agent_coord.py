@@ -776,6 +776,20 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(3, agent="c")["state"], "granted")
         self.assertEqual(self.ask(1, agent="d")["state"], "waiting")  # c warms up
 
+    def test_reserved_lease_cores_count_in_full(self):
+        reserved = self.ask(4, agent="handover", reserve=True)
+        plain = self.ask(2, agent="plain")
+        for lease in (reserved, plain):
+            self.age(lease, ac.WARMUP + 1, key="granted")
+        self.assertEqual(self.c._reserved_cpu(self.c.state["leases"]), 4)
+        self.assertEqual(self.c._counted_once(), {reserved["id"]})
+        self.busy = self.c.busy = 0.0  # neither uses any CPU
+        # 0 measured + 4 reserved: 4 cores left, not 8.
+        self.assertEqual(self.ask(4, agent="c")["state"], "granted")
+        self.assertEqual(self.ask(1, agent="d")["state"], "waiting")
+        status = self.c.handle({"op": "status"})
+        self.assertEqual([x["id"] for x in status["leases"] if x.get("reserve")], [reserved["id"]])
+
     def measure_leases(self, usage, busy=None, trees=None):
         """Tick until the smoothed measurements settle, with each lease pid
         using usage[pid] cores and the host busy (default: their sum). No
@@ -1672,6 +1686,33 @@ class MeasuredMemoryTest(unittest.TestCase):
         self.assertEqual(found["gate: tests"]["suggest_mem"], math.ceil(9 * GIB * 1.15))
         self.assertEqual(found["gate: tests"]["runs"], 3)
         self.assertEqual(ac.peaks(ac.read_history(0, self.c.history_file), "other"), {})
+
+    def test_reserved_memory_still_counts_after_ramp(self):
+        self.ask(0, 16 * GIB, held=True, reserve=True)
+        self.ask(1, 16 * GIB, held=True)
+        for n in (0, 1):
+            self.env["use"][self.pid(n)] = GIB
+        self.advance(ac.MEM_RAMP + 60)
+        reserved, plain = self.c.state["leases"]
+        now = self.env["now"]
+        self.assertEqual(self.c._growth(reserved, now), 15 * GIB)  # all of its size less its use
+        self.assertLess(self.c._growth(plain, now), 15 * GIB)  # settled: only a share
+
+    def test_reserved_lease_never_sets_a_label_ceiling(self):
+        for _ in range(ac.MEM_HISTORY_RUNS + 1):
+            lease = self.ask(0, 16 * GIB, label="handover", reserve=True)
+            self.env["use"][self.pid(0)] = GIB // 8
+            self.advance(60)
+            self.c.handle({"op": "release", "id": lease["id"], "code": 0})
+            self.env["use"].clear()
+        ended = [e for e in ac.read_history(0, self.c.history_file) if e["event"] == "ended"]
+        self.assertTrue(ended and all(e.get("reserve") and "mem_peak" in e for e in ended))
+        self.assertEqual(ac.peaks(ac.read_history(0, self.c.history_file), "handover"), {})
+        fresh = self.make()  # reloads the history from disk
+        probe = {"agent": "a0", "label": "handover"}
+        self.assertIsNone(fresh._label_ceiling(probe))
+        self.assertIsNone(self.c._label_ceiling(probe))
+        self.assertEqual(fresh._runs("a0", "handover"), [])
 
     def test_scope_memory_reads_unreclaimable_use(self):
         with tempfile.TemporaryDirectory() as root:
