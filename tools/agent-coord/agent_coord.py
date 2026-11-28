@@ -1288,7 +1288,7 @@ class Coordinator:
         changed = False
         for x in self.state["leases"]:
             resources = self._exclusive_resources(x)
-            if not resources:
+            if not resources or x.get("reserve"):  # idle by design: no "release it" warnings
                 continue
             warnings = x.setdefault("exclusive_warnings", {})
             if (x.get("expect_source") == "explicit"
@@ -1377,7 +1377,7 @@ class Coordinator:
         if small:
             for x in leases:
                 locks = x.get("exclusive_locks", ())
-                if (not x.get("io") and not x.get("headroom") and locks
+                if (not x.get("io") and not x.get("headroom") and not x.get("reserve") and locks
                         and all(self._exclusive_idle(x, name, now) for name in locks)):
                     borrow.add(x["id"])
         used_cores, used_mem = self._usage(borrow)
@@ -1950,6 +1950,10 @@ class Coordinator:
         if headroom < 0:
             return {"error": "headroom must not be negative"}
         expect = req.get("expect")
+        if req.get("reserve") and req.get("io"):
+            return {"error": "--reserve counts cores in full; drop --io"}
+        if req.get("reserve") and expect is None:
+            return {"error": "--reserve needs --expect (reserved leases never learn a run time)"}
         if expect is not None and (type(expect) not in (int, float) or not math.isfinite(expect) or expect <= 0):
             return {"error": "expect must be a positive finite duration"}
         estimate, source = ((expect, "explicit") if expect is not None
@@ -3202,7 +3206,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("watchers require --pid and cannot follow --pidfile or --unit")
         if (args.cores is not None or args.mem is not None or args.io or args.exclusive
                 or args.lock or args.exclusive_lock or args.disk or args.headroom
-                or args.max_wait is not None):
+                or args.max_wait is not None or args.reserve):
             parser.error("watchers do not take compute lease options")
     elif args.action in ("run", "hold", "check"):
         if not args.io and (args.cores is None or args.mem is None):
@@ -3214,6 +3218,10 @@ def main(argv: list[str] | None = None) -> int:
     args.agent = args.agent or default_agent()
     if getattr(args, "exclusive", False) and getattr(args, "exclusive_lock", None):
         parser.error("--exclusive already excludes everything; drop --exclusive-lock")
+    if getattr(args, "reserve", False) and args.io:
+        parser.error("--reserve counts cores in full; drop --io")
+    if getattr(args, "reserve", False) and args.expect is None:
+        parser.error("--reserve needs --expect (reserved leases never learn a run time)")
     if args.action == "hold" and not (args.pid or args.pidfile or args.unit):
         parser.error("hold requires --pid, --pidfile or --unit")
     if args.action == "run" and args.detach != bool(args.unit):

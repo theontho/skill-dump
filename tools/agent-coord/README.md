@@ -299,7 +299,9 @@ on idle backfill.
   later handover and uses little itself: its whole size less its measured use
   stays reserved for its whole life (not only while it ramps up), its cores
   count in full, and its runs never feed the label's run estimates or memory
-  ceiling (`history --peaks` skips them). `status` shows it as `RESERVED`.
+  ceiling (`history --peaks` skips them). Small jobs never borrow its idle
+  exclusive locks, and it gets no idle or overrun warnings. It needs
+  `--expect` and cannot be `--io`. `status` shows it as `RESERVED`.
 - A lease ends when its process exits, subject to the restart grace for
   tracked holds and detached runs.
 

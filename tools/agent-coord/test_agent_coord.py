@@ -777,7 +777,7 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(1, agent="d")["state"], "waiting")  # c warms up
 
     def test_reserved_lease_cores_count_in_full(self):
-        reserved = self.ask(4, agent="handover", reserve=True)
+        reserved = self.ask(4, agent="handover", reserve=True, expect=600)
         plain = self.ask(2, agent="plain")
         for lease in (reserved, plain):
             self.age(lease, ac.WARMUP + 1, key="granted")
@@ -789,6 +789,35 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(self.ask(1, agent="d")["state"], "waiting")
         status = self.c.handle({"op": "status"})
         self.assertEqual([x["id"] for x in status["leases"] if x.get("reserve")], [reserved["id"]])
+
+    def test_idle_reserved_exclusive_lock_is_never_borrowed(self):
+        self.configure(cores=8, mem=16)
+        reserved = self.ask(6, agent="handover", exclusive_locks=["gpu"], reserve=True, expect=600)
+        self.age(reserved, ac.WARMUP + 1, key="granted")
+        with patch.object(self.c, "_exclusive_idle", return_value=True):
+            # An ordinary idle exclusive-lock lease of 6 cores would lend them.
+            self.assertEqual(self.ask(2, agent="small1")["state"], "granted")
+            self.assertEqual(self.ask(1, agent="small2")["state"], "waiting")
+        lease = self.c.state["leases"][0]
+        lease["exclusive_usage"] = {"gpu": {"sample_at": 0, "idle_since": 0,
+                                            "observed": 0, "active": 0, "busy": False}}
+        lease["granted"] = 0
+        with patch.object(self.c, "_post") as post:
+            self.c._monitor_exclusive(ac.EXCLUSIVE_IDLE_AFTER + 1e6, 0.0)
+        post.assert_not_called()
+        self.assertFalse(lease.get("exclusive_warnings"))
+
+    def test_reserve_needs_expect_and_refuses_io(self):
+        self.assertIn("--expect", self.ask(1, reserve=True)["error"])
+        self.assertIn("--io", self.ask(1, reserve=True, io=True, expect=60)["error"])
+        for argv in (["run", "--reserve", "--cores=1", "--mem=1G", "--label=x", "--", "true"],
+                     ["hold", "--reserve", "--io", "--expect=1m", "--label=x", "--pid=1"],
+                     ["hold", "--reserve", "--expect=1m", "--label=x", "--pid=1",
+                      "--owner-pid=1"]):
+            with patch.object(ac, "call") as call, patch("sys.stderr"), \
+                    self.assertRaises(SystemExit):
+                ac.main(["--as", "a", *argv])
+            call.assert_not_called()
 
     def measure_leases(self, usage, busy=None, trees=None):
         """Tick until the smoothed measurements settle, with each lease pid
