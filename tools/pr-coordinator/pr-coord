@@ -74,7 +74,7 @@ LOCAL = {
     "capacity": "wait for priority holds and run the project's CI capacity gate",
     "release-hold": "wait for a PR to merge, then remove the manual hold",
     "host-back": "wait for a configured SSH host to become reachable",
-    "answer": "record an answer to an owner question",
+    "answer": "record an answer to an owner or agent question",
     "agent-questions": "list or answer queued implementer questions",
     "handoff": "submit an owner PR using its local branch worktree",
     "watch-draft": "wait for exact-head draft review and certification",
@@ -304,9 +304,12 @@ def extra(command, args):
                         answered_at=time.strftime("%Y-%m-%d %H:%M"),
                     )
                     return rows
-            raise ValueError(f"unknown question {options.id}")
+            return None
 
-        runtime.questions(update, agent=agent)
+        if not agent and runtime.questions(update) is not None:
+            return
+        if runtime.questions(update, agent=True) is None:
+            raise ValueError(f"unknown question {options.id}")
 
 
 def main():

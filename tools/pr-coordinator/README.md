@@ -90,9 +90,13 @@ results and candidates for less frequent execution. The HTTP server has no
 authentication. Keep it on loopback and use an SSH tunnel, or put it behind an
 authenticated proxy on a trusted network. Turn on `dashboard.allow_answers` to
 enable owner answers from the UI; otherwise use `pr-coord answer ID TEXT`.
-Agent questions are separate from owner questions. Read or answer them with
-`pr-coord agent-questions [ID ANSWER]`; `dashboard.show_agent_questions` exposes
-that queue to dashboard readers but does not put it in the owner answer form.
+Agent questions are separate from owner questions. List them with
+`pr-coord agent-questions` and answer them with `pr-coord answer ID TEXT` or
+`pr-coord agent-questions ID TEXT`. The lifecycle collector automatically
+resolves agent questions for PRs it sees as merged or closed, and older train
+questions when a newer train question for the same PR exists.
+`dashboard.show_agent_questions` exposes the agent queue to dashboard readers
+but does not put it in the owner answer form.
 Both queues show open question age, the suggested `--default` (not automatically
 applied) and the action parked with `--blocks`.
 

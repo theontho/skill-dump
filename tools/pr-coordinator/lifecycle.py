@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from lifecycle_model import build, review_rounds, stamp, summarize, weekly_reviews
-from runtime import P, gh_argv
+from runtime import P, gh_argv, questions
 
 HERE = P.data
 REPO = P.repo
@@ -190,6 +190,39 @@ CHECK = "id name started_at completed_at details_url conclusion status"
 STATUS = "context state created_at target_url description"
 
 
+def resolve_agent_questions(prs):
+    terminal = {
+        n: pr["state"].lower()
+        for n, pr in prs.items()
+        if pr and pr["state"] in {"MERGED", "CLOSED"}
+    }
+
+    def update(rows):
+        changed = False
+        newer_train = set()
+        answered_at = time.strftime("%Y-%m-%d %H:%M")
+        # Train questions are appended under the queue lock, even within one second.
+        for row in reversed(rows):
+            number = str(row.get("pr", "")).strip().removeprefix("#")
+            if not number.isdecimal():
+                continue
+            n = int(number)
+            reason = f"PR #{n} {terminal[n]}" if n in terminal else None
+            if str(row["id"]).startswith("train-"):
+                if reason is None and n in newer_train:
+                    reason = f"superseded by a newer train question for PR #{n}"
+                newer_train.add(n)
+            if reason and not row.get("answer"):
+                row.update(
+                    answer=f"(coordinator) auto-resolved: {reason}",
+                    answered_at=answered_at,
+                )
+                changed = True
+        return rows if changed else None
+
+    questions(update, agent=True)
+
+
 def collect():
     now = int(time.time())
     cache = Cache(now)
@@ -214,6 +247,7 @@ def collect():
                 holders[int(parts[0])] = int(parts[1])
     tracked = {pr["number"]: pr for pr in state.get("prs", [])}
     prs = cache.timelines(sorted(tracked.keys() | triage.keys()))
+    resolve_agent_questions(prs)
     reviewer = re.compile(
         P.get(
             "drafts",

@@ -271,9 +271,11 @@ def locked(name, *, wait=True, data=None):
 
 
 def questions(update, *, agent=False):
+    """Update a question queue under lock; returning None leaves it unchanged."""
     name = "agent_questions.json" if agent else "questions.json"
     with locked(name + ".lock"):
         path = P.data / name
         data = update(load(path, []))
-        save(path, data)
+        if data is not None:
+            save(path, data)
         return data

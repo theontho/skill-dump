@@ -176,7 +176,7 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
         self.assertFalse(question.get("answer"))
         self.assertTrue(question["asked"])
         id_ = question["id"]
-        self.command("agent-questions", id_, "resolved")
+        self.command("answer", id_, "resolved")
         self.command("ask", "--owner", "owner question")
         self.command("answer", "1", "yes")
         self.assertEqual(
@@ -186,6 +186,80 @@ quick_gate = ["{sys.executable}", "-c", "raise SystemExit(90)"]
             json.loads((self.data / "agent_questions.json").read_text())[0]["answer"],
             "resolved",
         )
+        self.command("agent-questions", id_, "updated")
+        self.assertEqual(
+            json.loads(self.command("agent-questions").stdout)[0]["answer"], "updated"
+        )
+        unknown = self.command("answer", "missing", "no", check=False)
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("unknown question missing", unknown.stderr)
+
+    def test_lifecycle_clears_stale_agent_questions_without_touching_live_ones(self):
+        self.command("status")
+        (self.data / "state.json").write_text(
+            json.dumps({"prs": [{"number": n} for n in (1, 2, 3)]})
+        )
+        timeline = {"nodes": [], "pageInfo": {"hasNextPage": False}}
+        closed_at = "2024-01-02T00:00:00Z"
+        graphql = {
+            "data": {
+                "repository": {
+                    f"p{n}": {
+                        "state": state,
+                        "closedAt": closed_at if state != "OPEN" else None,
+                        "mergedAt": closed_at if state == "MERGED" else None,
+                        "createdAt": "2024-01-01T00:00:00Z",
+                        "headRefName": "fixture",
+                        "headRefOid": "fixture-head",
+                        "isDraft": False,
+                        "title": f"Fixture PR {n}",
+                        "timelineItems": timeline,
+                    }
+                    for n, state in ((1, "MERGED"), (2, "CLOSED"), (3, "OPEN"))
+                }
+            }
+        }
+        self.fake_gh(
+            f"""case "$*" in
+*graphql*) printf '%s\\n' '{json.dumps(graphql)}' ;;
+*actions/runs*) printf '%s\\n' '[{{"workflow_runs":[]}}]' ;;
+*check-runs*) printf '%s\\n' '[{{"check_runs":[]}}]' ;;
+*statuses*) printf '%s\\n' '[[]]' ;;
+*) exit 1 ;;
+esac"""
+        )
+        agent = self.data / "agent_questions.json"
+        owner = self.data / "questions.json"
+        rows = [
+            {"id": "merged", "pr": "#1"},
+            {"id": "closed", "pr": "2"},
+            {"id": "train-3-1", "pr": "#3"},
+            {"id": "train-4-1", "pr": "#4"},
+            {"id": "train-3-2", "pr": "#3"},
+            {"id": "live", "pr": "#3"},
+            {"id": "unknown", "pr": "#99"},
+            {"id": "unscoped", "pr": ""},
+            {"id": "already-answered", "pr": "#1", "answer": "manual answer"},
+        ]
+        agent.write_text(json.dumps(rows))
+        owner.write_text(json.dumps([{"id": 1, "pr": "#1"}]))
+
+        collected = self.command("lifecycle", check=False)
+        self.assertEqual(collected.returncode, 0, collected.stderr)
+        results = json.loads(agent.read_text())
+        self.assertFalse(
+            json.loads((self.data / "lifecycle.json").read_text())["warnings"]
+        )
+        for row, reason in zip(
+            results, ("PR #1 merged", "PR #2 closed", "superseded"), strict=False
+        ):
+            self.assertTrue(row["answer"].startswith("(coordinator) auto-resolved: "))
+            self.assertIn(reason, row["answer"])
+            self.assertTrue(row["answered_at"])
+        self.assertEqual(results[3:], rows[3:])
+        self.assertEqual(json.loads(owner.read_text()), [{"id": 1, "pr": "#1"}])
+        self.command("lifecycle")
+        self.assertEqual(json.loads(agent.read_text()), results)
 
     def test_nearest_tests_uses_the_worktree_and_relays_selector_errors(self):
         missing = self.command("nearest-tests", "file.py", check=False)
